@@ -65,9 +65,10 @@ impl Tool for MoveCursorTool {
                 Ok(point) => point,
                 Err(error) => return error,
             };
-            let result =
-                tokio::task::spawn_blocking(move || crate::input::mouse::move_cursor_desktop(x, y))
-                    .await;
+            let result = cua_driver_core::operation::spawn_blocking(move || {
+                crate::input::mouse::move_cursor_desktop(x, y)
+            })
+            .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "Moved the real desktop pointer to ({x:.1}, {y:.1})."

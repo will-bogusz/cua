@@ -8,6 +8,7 @@ use crate::{DriverActivityEvent, DriverActivityKind, DriverActivityObserver};
 use cua_driver_core::{
     authorization::PermissionMode,
     protocol::ToolResult as CoreToolResult,
+    server::CALL_ID_ARG,
     session_authorization::{
         AuthenticatedActionConnection, DelegatedSessionRequest, EffectiveAuthorizationContext,
         SessionAuthorizationError, SessionAuthorizationRegistry, SessionModeCeiling,
@@ -18,6 +19,7 @@ use cua_driver_core::{
 };
 use cursor_overlay::CursorConfig;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -190,7 +192,11 @@ pub(crate) struct DriverRuntime {
     /// admission. Therefore shutdown is idempotent and does not return while a
     /// previously admitted operation is still executing.
     lifecycle: Arc<tokio::sync::RwLock<()>>,
-    operations: Mutex<Vec<std::sync::Weak<cua_driver_core::operation::Cancellation>>>,
+    /// Live operations by call id. A caller that named its call can cancel it
+    /// by that name; unnamed calls still get a runtime-minted id so shutdown
+    /// and diagnostics see every admitted operation.
+    operations: Mutex<HashMap<String, std::sync::Weak<cua_driver_core::operation::Cancellation>>>,
+    next_call_id: AtomicU64,
     lifecycle_maintenance: Mutex<Option<LifecycleMaintenance>>,
     activity_observer: Option<Arc<dyn DriverActivityObserver>>,
 }
@@ -233,9 +239,10 @@ impl DriverRuntime {
             shutdown: AtomicBool::new(false),
             last_activity: AtomicU64::new(now_unix_secs()),
             lifecycle: Arc::new(tokio::sync::RwLock::new(())),
-            operations: Mutex::new(Vec::new()),
+            operations: Mutex::new(HashMap::new()),
             lifecycle_maintenance: Mutex::new(None),
             activity_observer: options.activity_observer.clone(),
+            next_call_id: AtomicU64::new(1),
         });
         *runtime.lifecycle_maintenance.lock().unwrap() =
             Some(spawn_lifecycle_maintenance(&runtime));
@@ -268,11 +275,35 @@ impl DriverRuntime {
             .operations
             .lock()
             .unwrap()
-            .iter()
+            .values()
             .filter_map(std::sync::Weak::upgrade)
         {
             operation.cancel();
         }
+    }
+
+    /// Cancel one admitted operation by call id. Returns whether a live
+    /// operation carried that id; a completed or unknown id is not an error,
+    /// because a cancel always races the call it targets.
+    pub(crate) fn cancel_operation(&self, call_id: &str) -> bool {
+        self.operations
+            .lock()
+            .unwrap()
+            .get(call_id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|operation| {
+                operation.cancel();
+                true
+            })
+    }
+
+    /// Name a call the caller did not name. Process-local uniqueness is all a
+    /// cancel needs, and a counter keeps the id readable in logs.
+    fn mint_call_id(&self) -> String {
+        format!(
+            "cua-call-{}",
+            self.next_call_id.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     fn stop_lifecycle_maintenance(&self) {
@@ -293,8 +324,24 @@ impl DriverRuntime {
     }
 
     pub(crate) async fn invoke(&self, name: &str, args: Value) -> Option<CoreToolResult> {
-        self.invoke_with_context(name, args, self.compatibility_context.clone())
-            .await
+        self.invoke_with_call_id(name, args, None).await
+    }
+
+    /// Host ingress that names the call so it can be cancelled by id later.
+    pub(crate) async fn invoke_with_call_id(
+        &self,
+        name: &str,
+        args: Value,
+        call_id: Option<String>,
+    ) -> Option<CoreToolResult> {
+        self.invoke_with_context_and_evidence(
+            name,
+            args,
+            self.compatibility_context.clone(),
+            cua_driver_core::tool::TrustedInvocationEvidence::default(),
+            call_id,
+        )
+        .await
     }
 
     pub(crate) async fn invoke_from_trusted_adapter(
@@ -302,6 +349,13 @@ impl DriverRuntime {
         name: &str,
         mut args: Value,
     ) -> Option<CoreToolResult> {
+        // The call id is transport identity, not a tool argument: take it out
+        // before evidence extraction sanitizes the reserved namespace.
+        let call_id = args
+            .as_object_mut()
+            .and_then(|arguments| arguments.remove(CALL_ID_ARG))
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .filter(|value| !value.is_empty());
         let evidence =
             cua_driver_core::tool::TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
         self.invoke_with_context_and_evidence(
@@ -309,6 +363,7 @@ impl DriverRuntime {
             args,
             self.compatibility_context.clone(),
             evidence,
+            call_id,
         )
         .await
     }
@@ -324,6 +379,7 @@ impl DriverRuntime {
             args,
             context,
             cua_driver_core::tool::TrustedInvocationEvidence::default(),
+            None,
         )
         .await
     }
@@ -334,6 +390,7 @@ impl DriverRuntime {
         args: Value,
         context: Arc<EffectiveAuthorizationContext>,
         evidence: cua_driver_core::tool::TrustedInvocationEvidence,
+        call_id: Option<String>,
     ) -> Option<CoreToolResult> {
         if !self.is_running() {
             return None;
@@ -344,15 +401,22 @@ impl DriverRuntime {
             return None;
         }
         let cancellation = Arc::new(cua_driver_core::operation::Cancellation::default());
+        let mut call_id = call_id.unwrap_or_else(|| self.mint_call_id());
         {
             let mut operations = self.operations.lock().unwrap();
-            operations.retain(|operation| operation.strong_count() > 0);
-            operations.push(Arc::downgrade(&cancellation));
+            operations.retain(|_, operation| operation.strong_count() > 0);
+            // A caller reusing an in-flight id would otherwise make the older
+            // call uncancellable. The newcomer takes a minted id instead.
+            if operations.contains_key(&call_id) {
+                call_id = self.mint_call_id();
+            }
+            operations.insert(call_id.clone(), Arc::downgrade(&cancellation));
         }
         if !self.is_running() {
             cancellation.cancel();
         }
         let _cancel_on_drop = cua_driver_core::operation::CancelOnDrop(cancellation.clone());
+        let observed = cancellation.clone();
         let registry = self.registry.clone();
         let activity_observer = self.activity_observer.clone();
         let name = name.to_owned();
@@ -452,9 +516,19 @@ impl DriverRuntime {
                 result
             },
         ));
-        Some(match work.await {
+        let result = match work.await {
             Ok(result) => result,
             Err(error) => CoreToolResult::error(format!("native operation failed: {error}")),
+        };
+        self.operations.lock().unwrap().remove(&call_id);
+        // A cancelled call never reports success. Input already delivered has
+        // to be reconciled by the caller, and a tool that finished its last
+        // step just as the cancel landed is indistinguishable from one that
+        // stopped halfway — so both report the typed cancelled outcome.
+        Some(if observed.is_cancelled() {
+            cua_driver_core::operation::cancelled_result(Some(&call_id))
+        } else {
+            result
         })
     }
 

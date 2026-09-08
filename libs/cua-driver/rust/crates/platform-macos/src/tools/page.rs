@@ -287,10 +287,11 @@ async fn execute_js(js: &str, bundle_id: &str, pid: i32, window_id: u64) -> anyh
 async fn ax_text_fallback(pid: i32, window_id: u64) -> anyhow::Result<String> {
     let window_id = u32::try_from(window_id)
         .map_err(|_| anyhow::anyhow!("macOS window_id {window_id} is out of u32 range"))?;
-    let result =
-        tokio::task::spawn_blocking(move || crate::ax::tree::walk_tree(pid, Some(window_id), None))
-            .await
-            .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
+    let result = cua_driver_core::operation::spawn_blocking(move || {
+        crate::ax::tree::walk_tree(pid, Some(window_id), None)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
     Ok(AXPageReader::extract_text(&result.tree_markdown))
 }
 
@@ -303,10 +304,11 @@ async fn ax_query_fallback(
     let window_id = u32::try_from(window_id)
         .map_err(|_| anyhow::anyhow!("macOS window_id {window_id} is out of u32 range"))?;
     let sel = selector.to_owned();
-    let result =
-        tokio::task::spawn_blocking(move || crate::ax::tree::walk_tree(pid, Some(window_id), None))
-            .await
-            .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
+    let result = cua_driver_core::operation::spawn_blocking(move || {
+        crate::ax::tree::walk_tree(pid, Some(window_id), None)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
     Ok(AXPageReader::query(&sel, &result.tree_markdown))
 }
 

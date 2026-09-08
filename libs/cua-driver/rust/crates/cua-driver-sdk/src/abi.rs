@@ -31,7 +31,7 @@ use std::time::Duration;
 use tokio::sync::{oneshot, Notify};
 
 pub const CUA_DRIVER_ABI_MAJOR: u16 = 1;
-pub const CUA_DRIVER_ABI_MINOR: u16 = 1;
+pub const CUA_DRIVER_ABI_MINOR: u16 = 2;
 pub const CUA_DRIVER_ABI_PATCH: u16 = 0;
 
 #[repr(C)]
@@ -719,64 +719,173 @@ pub unsafe extern "C" fn cua_driver_invoke_v1(
     out_error: *mut CuaDriverBuffer,
 ) -> CuaDriverStatus {
     with_ffi_guard(out_error, || {
-        let driver = required_handle(handle)?;
-        let callback = callback.ok_or_else(|| {
-            AbiFailure::new(
-                CuaDriverStatus::NullPointer,
-                "completion callback must not be null",
-            )
-        })?;
-        let out_operation = out_operation.as_mut().ok_or_else(|| {
-            AbiFailure::new(
-                CuaDriverStatus::NullPointer,
-                "out_operation must not be null",
-            )
-        })?;
-        *out_operation = ptr::null_mut();
-        let name = std::str::from_utf8(input_bytes(name, name_len)?)
+        invoke_named_call(
+            handle,
+            None,
+            name,
+            name_len,
+            arguments_json,
+            arguments_len,
+            callback,
+            context,
+            out_operation,
+        )
+    })
+}
+
+#[no_mangle]
+/// Invoke a named tool under a caller-chosen call id.
+///
+/// The operation token cancels one call the caller still holds. A call id
+/// cancels a call the caller can only name — from another thread, another
+/// binding, or after the token was released — through
+/// `cua_driver_cancel_call_v1`. An empty id behaves like `cua_driver_invoke_v1`.
+pub unsafe extern "C" fn cua_driver_invoke_call_v1(
+    handle: *mut CuaDriverHandle,
+    call_id: *const u8,
+    call_id_len: usize,
+    name: *const u8,
+    name_len: usize,
+    arguments_json: *const u8,
+    arguments_len: usize,
+    callback: Option<CuaDriverCompletionV1>,
+    context: *mut c_void,
+    out_operation: *mut *mut CuaDriverOperation,
+    out_error: *mut CuaDriverBuffer,
+) -> CuaDriverStatus {
+    with_ffi_guard(out_error, || {
+        let call_id = std::str::from_utf8(input_bytes(call_id, call_id_len)?)
             .map_err(|error| {
                 AbiFailure::new(
                     CuaDriverStatus::InvalidArgument,
-                    format!("tool name must be UTF-8: {error}"),
+                    format!("call id must be UTF-8: {error}"),
                 )
             })?
             .to_owned();
-        if name.is_empty() {
-            return Err(AbiFailure::new(
+        invoke_named_call(
+            handle,
+            Some(call_id).filter(|value| !value.is_empty()),
+            name,
+            name_len,
+            arguments_json,
+            arguments_len,
+            callback,
+            context,
+            out_operation,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn invoke_named_call(
+    handle: *mut CuaDriverHandle,
+    call_id: Option<String>,
+    name: *const u8,
+    name_len: usize,
+    arguments_json: *const u8,
+    arguments_len: usize,
+    callback: Option<CuaDriverCompletionV1>,
+    context: *mut c_void,
+    out_operation: *mut *mut CuaDriverOperation,
+) -> Result<(), AbiFailure> {
+    let driver = required_handle(handle)?;
+    let callback = callback.ok_or_else(|| {
+        AbiFailure::new(
+            CuaDriverStatus::NullPointer,
+            "completion callback must not be null",
+        )
+    })?;
+    let out_operation = out_operation.as_mut().ok_or_else(|| {
+        AbiFailure::new(
+            CuaDriverStatus::NullPointer,
+            "out_operation must not be null",
+        )
+    })?;
+    *out_operation = ptr::null_mut();
+    let name = std::str::from_utf8(input_bytes(name, name_len)?)
+        .map_err(|error| {
+            AbiFailure::new(
                 CuaDriverStatus::InvalidArgument,
-                "tool name must not be empty",
-            ));
-        }
-        let arguments: Value = serde_json::from_slice(input_bytes(arguments_json, arguments_len)?)
-            .map_err(|error| {
-                AbiFailure::new(
-                    CuaDriverStatus::InvalidArgument,
-                    format!("invalid tool arguments JSON: {error}"),
-                )
-            })?;
-        if !arguments.is_object() {
-            return Err(AbiFailure::new(
+                format!("tool name must be UTF-8: {error}"),
+            )
+        })?
+        .to_owned();
+    if name.is_empty() {
+        return Err(AbiFailure::new(
+            CuaDriverStatus::InvalidArgument,
+            "tool name must not be empty",
+        ));
+    }
+    let arguments: Value = serde_json::from_slice(input_bytes(arguments_json, arguments_len)?)
+        .map_err(|error| {
+            AbiFailure::new(
                 CuaDriverStatus::InvalidArgument,
-                "tool arguments must be a JSON object",
-            ));
-        }
-        let runtime = driver.runtime.clone();
-        let executor = abi_executor()?.handle().clone();
-        *out_operation = spawn_completion(
-            executor,
-            async move {
-                let result = runtime.invoke(&name, arguments).await.ok_or_else(|| {
+                format!("invalid tool arguments JSON: {error}"),
+            )
+        })?;
+    if !arguments.is_object() {
+        return Err(AbiFailure::new(
+            CuaDriverStatus::InvalidArgument,
+            "tool arguments must be a JSON object",
+        ));
+    }
+    let runtime = driver.runtime.clone();
+    let executor = abi_executor()?.handle().clone();
+    *out_operation = spawn_completion(
+        executor,
+        async move {
+            let result = runtime
+                .invoke_with_call_id(&name, arguments, call_id)
+                .await
+                .ok_or_else(|| {
                     AbiFailure::new(
                         CuaDriverStatus::Shutdown,
                         "the Cua Driver SDK has been shut down",
                     )
                 })?;
-                serde_json::to_string(&result)
-                    .map_err(|error| AbiFailure::new(CuaDriverStatus::Internal, error.to_string()))
-            },
-            callback,
-            context,
-        )?;
+            serde_json::to_string(&result)
+                .map_err(|error| AbiFailure::new(CuaDriverStatus::Internal, error.to_string()))
+        },
+        callback,
+        context,
+    )?;
+    Ok(())
+}
+
+#[no_mangle]
+/// Request cooperative cancellation of one in-flight call by its call id.
+///
+/// `out_cancelled` reports whether a live operation carried that id. An
+/// unknown id is not an error: a cancel always races the call it targets.
+pub unsafe extern "C" fn cua_driver_cancel_call_v1(
+    handle: *mut CuaDriverHandle,
+    call_id: *const u8,
+    call_id_len: usize,
+    out_cancelled: *mut bool,
+    out_error: *mut CuaDriverBuffer,
+) -> CuaDriverStatus {
+    with_ffi_guard(out_error, || {
+        let driver = required_handle(handle)?;
+        let out_cancelled = out_cancelled.as_mut().ok_or_else(|| {
+            AbiFailure::new(
+                CuaDriverStatus::NullPointer,
+                "out_cancelled must not be null",
+            )
+        })?;
+        *out_cancelled = false;
+        let call_id = std::str::from_utf8(input_bytes(call_id, call_id_len)?).map_err(|error| {
+            AbiFailure::new(
+                CuaDriverStatus::InvalidArgument,
+                format!("call id must be UTF-8: {error}"),
+            )
+        })?;
+        if call_id.is_empty() {
+            return Err(AbiFailure::new(
+                CuaDriverStatus::InvalidArgument,
+                "call id must not be empty",
+            ));
+        }
+        *out_cancelled = driver.runtime.cancel_operation(call_id);
         Ok(())
     })
 }
@@ -1134,6 +1243,14 @@ mod ffi {
         ) -> CuaDriverStatus;
         #[link_name = "cua_driver_operation_cancel_v1"]
         pub(super) fn operation_cancel(operation: *mut Operation);
+        #[link_name = "cua_driver_cancel_call_v1"]
+        pub(super) fn cancel_call(
+            handle: *mut Handle,
+            call_id: *const u8,
+            call_id_len: usize,
+            out_cancelled: *mut bool,
+            out_error: *mut CuaDriverBuffer,
+        ) -> CuaDriverStatus;
         #[link_name = "cua_driver_operation_release_v1"]
         pub(super) fn operation_release(operation: *mut *mut Operation);
     }
@@ -1311,6 +1428,28 @@ impl NativeAbiDriver {
                 .as_ref()
                 .and_then(|handle| handle.runtime.history())
         }
+    }
+
+    /// Cancel one in-flight call through the exported ABI, so the embedded
+    /// path and an external C host cancel the same way.
+    pub(crate) fn cancel_call(&self, call_id: &str) -> Result<bool, DriverError> {
+        let handle = self.raw_handle();
+        if handle.is_null() {
+            return Err(DriverError::Shutdown);
+        }
+        let mut cancelled = false;
+        let mut error = CuaDriverBuffer::empty();
+        let status = unsafe {
+            ffi::cancel_call(
+                handle,
+                call_id.as_ptr(),
+                call_id.len(),
+                &mut cancelled,
+                &mut error,
+            )
+        };
+        status_result(status, &mut error, "cancel call")?;
+        Ok(cancelled)
     }
 
     pub(crate) fn is_available(&self) -> bool {
@@ -1616,7 +1755,8 @@ mod tests {
         assert_eq!(CuaDriverStatus::RuntimeConflict as i32, 8);
         assert!(cua_driver_abi_is_compatible_v1(1, 0));
         assert!(cua_driver_abi_is_compatible_v1(1, 1));
-        assert!(!cua_driver_abi_is_compatible_v1(1, 2));
+        assert!(cua_driver_abi_is_compatible_v1(1, 2));
+        assert!(!cua_driver_abi_is_compatible_v1(1, 3));
         assert!(!cua_driver_abi_is_compatible_v1(2, 0));
     }
 
@@ -1626,7 +1766,7 @@ mod tests {
         assert!(header.contains("Do not edit"));
         for declaration in [
             "#define CUA_DRIVER_ABI_MAJOR 1",
-            "#define CUA_DRIVER_ABI_MINOR 1",
+            "#define CUA_DRIVER_ABI_MINOR 2",
             "#define CUA_DRIVER_ABI_PATCH 0",
             "CUA_DRIVER_STATUS_OK = 0",
             "CUA_DRIVER_STATUS_INVALID_ARGUMENT = 1",
@@ -1646,6 +1786,8 @@ mod tests {
             "cua_driver_metadata_json_v1",
             "cua_driver_list_tools_json_v1",
             "cua_driver_invoke_v1",
+            "cua_driver_invoke_call_v1",
+            "cua_driver_cancel_call_v1",
             "cua_driver_session_create_v1",
             "cua_driver_session_destroy_v1",
             "cua_driver_session_invoke_v1",

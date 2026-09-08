@@ -1620,6 +1620,25 @@ impl CuaDriver {
         self.invoke(name, arguments).await
     }
 
+    /// Request cancellation of one in-flight call by its call id.
+    ///
+    /// The id is the one a trusted adapter stamped on the call (`_call_id`),
+    /// or the id this runtime minted for it. Returns whether a live operation
+    /// carried that id — a cancel always races the call it targets, so an
+    /// unknown id means "already finished", not "failed".
+    ///
+    /// Only an embedded runtime owns the operations it can cancel; daemon,
+    /// remote, and private-worker backends must cancel through their own
+    /// transport and report an error here rather than a silent no-op.
+    pub fn cancel_call(&self, call_id: &str) -> Result<bool, DriverError> {
+        match &self.backend {
+            DriverBackend::Embedded(runtime) => runtime.cancel_call(call_id),
+            _ => Err(DriverError::Protocol {
+                reason: "cancel_call requires a directly owned embedded runtime".into(),
+            }),
+        }
+    }
+
     async fn invoke_typed<T: Serialize>(
         &self,
         name: &str,
@@ -2001,6 +2020,98 @@ mod tests {
 
     fn register_slow_host_tool(registry: &mut cua_driver_core::tool::ToolRegistry) {
         registry.register(Box::new(SlowHostTool));
+    }
+
+    /// A tool that paces itself the way the long macOS tools do: it never
+    /// blocks for its whole duration, it waits in slices that a cancel can
+    /// interrupt.
+    struct CancellableHostTool;
+
+    static CANCELLABLE_HOST_TOOL_DEF: std::sync::LazyLock<cua_driver_core::tool::ToolDef> =
+        std::sync::LazyLock::new(|| cua_driver_core::tool::ToolDef {
+            // Replaces a reviewed R0 operation so the test exercises
+            // cancellation rather than the unknown-tool refusal path.
+            name: "health_report".into(),
+            description: "test-only cancellable pacing probe".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        });
+    static CANCELLABLE_HOST_TOOL_STARTED: std::sync::LazyLock<tokio::sync::Notify> =
+        std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+    #[async_trait::async_trait]
+    impl cua_driver_core::tool::Tool for CancellableHostTool {
+        fn def(&self) -> &cua_driver_core::tool::ToolDef {
+            &CANCELLABLE_HOST_TOOL_DEF
+        }
+
+        async fn invoke(&self, _args: Value) -> cua_driver_core::protocol::ToolResult {
+            CANCELLABLE_HOST_TOOL_STARTED.notify_one();
+            for _ in 0..200 {
+                if cua_driver_core::operation::sleep_async(std::time::Duration::from_millis(25))
+                    .await
+                    .is_err()
+                {
+                    return cua_driver_core::protocol::ToolResult::text("stopped early");
+                }
+            }
+            cua_driver_core::protocol::ToolResult::text("ran to completion")
+        }
+    }
+
+    fn register_cancellable_host_tool(registry: &mut cua_driver_core::tool::ToolRegistry) {
+        registry.register(Box::new(CancellableHostTool));
+    }
+
+    #[tokio::test]
+    async fn a_named_call_is_cancelled_by_id_and_reports_the_typed_cancelled_outcome() {
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().unwrap();
+        let driver = CuaDriver::try_create_for_host(DriverHostOptions {
+            cursor: cursor_overlay::CursorConfig {
+                enabled: false,
+                ..cursor_overlay::CursorConfig::default()
+            },
+            host_owns_permission_ux: false,
+            host_bundle_id: None,
+            claude_code_compatibility: false,
+            prepare_desktop_environment: false,
+            register_host_tools: Some(register_cancellable_host_tool),
+            authorization_host: None,
+            activity_observer: None,
+        })
+        .unwrap();
+        let caller = driver.clone();
+        let call = tokio::spawn(async move {
+            caller
+                .call_tool_from_trusted_adapter(
+                    "health_report",
+                    serde_json::json!({"_call_id": "probe-1"}),
+                )
+                .await
+        });
+        CANCELLABLE_HOST_TOOL_STARTED.notified().await;
+
+        let started = std::time::Instant::now();
+        assert!(driver.cancel_call("probe-1").unwrap(), "no live call named");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), call)
+            .await
+            .expect("cancelled call answered within a second")
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(result.is_error, "a cancelled call must not report success");
+        let structured: Value =
+            serde_json::from_str(result.structured_json.as_deref().unwrap()).unwrap();
+        assert_eq!(structured["code"], "cancelled");
+        assert_eq!(structured["call_id"], "probe-1");
+        assert!(
+            !driver.cancel_call("probe-1").unwrap(),
+            "a finished call must not stay cancellable"
+        );
+        driver.shutdown().await.unwrap();
     }
 
     #[cfg(not(target_os = "windows"))]

@@ -19,6 +19,7 @@ thread_local! {
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum StopReason {
     Deadline,
+    Cancelled,
     NativeRequestFailed { code: AXError },
     TimeoutConfigurationFailed { code: AXError },
 }
@@ -61,8 +62,18 @@ pub fn exhausted() -> bool {
     stop_reason().is_some()
 }
 
+/// A traversal stops for a deadline, a native failure, or a cancelled
+/// operation. Every gate in the walk — each subtree, each child batch, each
+/// native request — already consults this, so cancellation lands at the same
+/// points as the budget instead of needing its own checks.
 pub fn stop_reason() -> Option<StopReason> {
+    if DEADLINE.with(Cell::get).is_none() {
+        return None;
+    }
     FAILURE.with(Cell::get).or_else(|| {
+        if cua_driver_core::operation::check().is_err() {
+            return Some(StopReason::Cancelled);
+        }
         DEADLINE.with(|slot| {
             slot.get()
                 .filter(|deadline| Instant::now() >= *deadline)
