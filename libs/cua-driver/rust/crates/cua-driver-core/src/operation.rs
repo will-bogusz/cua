@@ -116,12 +116,35 @@ pub async fn sleep_async(duration: Duration) -> Result<(), Cancelled> {
     }
 }
 /// The one cancelled outcome every transport reports. A cancelled call is
-/// never `Ok`: input already delivered has to be reconciled by the caller, so
-/// the result carries a machine-readable code instead of a partial success.
-pub fn cancelled_result(call_id: Option<&str>) -> crate::protocol::ToolResult {
+/// never `Ok`: input already delivered has to be reconciled by the caller.
+///
+/// `partial` carries whatever the interrupted tool had already established —
+/// the delivered-character count, the samples taken — because "cancelled" on
+/// its own does not tell the caller what to reconcile.
+pub fn cancelled_result(
+    call_id: Option<&str>,
+    partial: Option<serde_json::Value>,
+) -> crate::protocol::ToolResult {
     let mut structured = serde_json::json!({"code": CANCELLED_CODE});
-    if let (Some(call_id), Some(object)) = (call_id, structured.as_object_mut()) {
-        object.insert("call_id".to_owned(), serde_json::Value::String(call_id.to_owned()));
+    let object = structured
+        .as_object_mut()
+        .expect("cancelled structure is an object");
+    if let Some(call_id) = call_id {
+        object.insert(
+            "call_id".to_owned(),
+            serde_json::Value::String(call_id.to_owned()),
+        );
+    }
+    // A tool that already reported the cancelled outcome itself carries its
+    // own `partial`; keep one envelope rather than nesting two.
+    if let Some(partial) = partial {
+        let partial = match partial.get("code").and_then(serde_json::Value::as_str) {
+            Some(CANCELLED_CODE) => partial.get("partial").cloned(),
+            _ => Some(partial),
+        };
+        if let Some(partial) = partial {
+            object.insert("partial".to_owned(), partial);
+        }
     }
     crate::protocol::ToolResult::error(Cancelled.to_string()).with_structured(structured)
 }

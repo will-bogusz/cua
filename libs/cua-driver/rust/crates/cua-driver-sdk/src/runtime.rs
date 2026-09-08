@@ -526,7 +526,10 @@ impl DriverRuntime {
         // step just as the cancel landed is indistinguishable from one that
         // stopped halfway — so both report the typed cancelled outcome.
         Some(if observed.is_cancelled() {
-            cua_driver_core::operation::cancelled_result(Some(&call_id))
+            cua_driver_core::operation::cancelled_result(
+                Some(&call_id),
+                result.structured_content.clone(),
+            )
         } else {
             result
         })
