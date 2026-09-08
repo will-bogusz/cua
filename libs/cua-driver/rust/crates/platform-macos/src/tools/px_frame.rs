@@ -45,6 +45,11 @@ pub enum PxFrameError {
     /// The current capture could not be obtained or decoded, so its pixel
     /// coordinate system cannot be proven against the WindowServer frame.
     CaptureUnavailable { window_id: u32, reason: String },
+    /// The platform's capture stack accepted the request and never answered:
+    /// the bounded wait in the rendering lease expired. Distinct from
+    /// `CaptureUnavailable` because nothing failed — the frame is simply not
+    /// coming, and the next call gets a freshly built stream.
+    CaptureTimeout { window_id: u32, waited_ms: u64 },
     /// The capture dimensions are not a coherent 1×/2× representation of the
     /// requested WindowServer frame. Dispatching with this transform would
     /// recreate #2237's wrong-surface misclick.
@@ -140,6 +145,14 @@ pub fn refusal(error: &PxFrameError) -> ToolResult {
                  pixel coordinate frame cannot be verified. Refusing to dispatch."
         ))
         .with_structured(error_structured(error)),
+        PxFrameError::CaptureTimeout {
+            window_id,
+            waited_ms,
+        } => ToolResult::error(format!(
+            "window_id {window_id}'s capture did not complete within {waited_ms} ms, so its \
+             pixel coordinate frame cannot be verified. Refusing to dispatch."
+        ))
+        .with_structured(error_structured(error)),
         PxFrameError::FrameMismatch {
             window_id,
             bounds_width,
@@ -175,6 +188,17 @@ pub fn error_structured(error: &PxFrameError) -> serde_json::Value {
             "window_id": window_id,
             "reason": reason,
             "suggestion": "re-snapshot the window after capture permission/state recovers"
+        }),
+        PxFrameError::CaptureTimeout {
+            window_id,
+            waited_ms,
+        } => serde_json::json!({
+            "code": "capture_timeout",
+            "window_id": window_id,
+            "waited_ms": waited_ms,
+            "suggestion": "the screenshot is omitted; the accessibility tree is still \
+                           authoritative. Retry get_window_state — the wedged capture stream \
+                           was discarded and the next call builds a fresh one"
         }),
         PxFrameError::FrameMismatch {
             window_id,

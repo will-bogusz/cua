@@ -29,6 +29,67 @@ use crate::tools::get_screen_size::{display_geometry, MainScreenGeometry};
 
 const MAX_SESSION_LEASES: usize = 16;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+/// Deadline for `SCStream::start_capture`. Apple's completion handler is
+/// awaited by the pinned binding on an unbounded condvar, and a wedged
+/// per-executable capture stack never calls it back: every capture in the
+/// process then hangs forever behind the lease registry lock. Bound the wait
+/// and report the timeout instead — a screenshot is worth 5 s, not a turn.
+const CAPTURE_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a rendering-lease capture could not be delivered.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LeaseError {
+    /// The native capture start did not complete within `CAPTURE_START_TIMEOUT`.
+    /// The lease is discarded without touching the wedged stream, so the next
+    /// capture builds a fresh one.
+    StartTimeout { waited_ms: u64 },
+    /// Any other lease failure, already described by its own message.
+    Failed(String),
+}
+
+impl std::fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StartTimeout { waited_ms } => write!(
+                f,
+                "rendering lease capture start did not complete within {waited_ms} ms"
+            ),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for LeaseError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
+impl From<&str> for LeaseError {
+    fn from(reason: &str) -> Self {
+        Self::Failed(reason.into())
+    }
+}
+
+/// Run `work` on a throwaway thread and give up on it after `timeout`.
+///
+/// Used for native calls that can block forever inside Apple's completion
+/// plumbing. On timeout the thread is abandoned still holding whatever it
+/// borrowed (an `Arc<SCStream>` here), so the abandoned work stays sound; it
+/// simply never rejoins.
+fn bounded<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    timeout: Duration,
+) -> Result<T, LeaseError> {
+    let (done, finished) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    finished.recv_timeout(timeout).map_err(|_| {
+        let waited_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        LeaseError::StartTimeout { waited_ms }
+    })
+}
 
 // The pinned 6.0.1 Swift bridge casts NSNumber to SCFrameStatus and reports
 // None for every native frame. Version 9 fixes the NSNumber conversion. Keep
@@ -149,8 +210,8 @@ impl<L: ManagedLease> LeaseRegistry<L> {
         ended: impl Fn() -> bool,
         matches: impl Fn(&L) -> bool,
         start: impl FnOnce() -> Result<L, String>,
-        capture: impl FnOnce(&mut L) -> Result<T, String>,
-    ) -> Result<T, String> {
+        capture: impl FnOnce(&mut L) -> Result<T, LeaseError>,
+    ) -> Result<T, LeaseError> {
         let mut state = self
             .state
             .lock()
@@ -178,7 +239,14 @@ impl<L: ManagedLease> LeaseRegistry<L> {
             Self::remove(&mut state, session)?;
             return Err("rendering lease session ended during setup".into());
         }
-        capture(state.leases.get_mut(session).expect("lease inserted above"))
+        let outcome = capture(state.leases.get_mut(session).expect("lease inserted above"));
+        if matches!(outcome, Err(LeaseError::StartTimeout { .. })) {
+            // The stream is owned by an abandoned start thread; asking it to
+            // stop would block on the same wedged stack. Drop our handle so the
+            // next capture builds a fresh lease.
+            state.leases.remove(session);
+        }
+        outcome
     }
 
     fn remove(state: &mut LeaseState<L>, session: &str) -> Result<(), String> {
@@ -275,11 +343,16 @@ impl LeaseIdentity {
 
 struct WindowLease {
     identity: LeaseIdentity,
-    stream: Option<SCStream>,
+    /// Shared so a bounded start can hand the stream to a worker thread and
+    /// still abandon that thread without dangling the native object.
+    stream: Option<Arc<SCStream>>,
     output_id: usize,
     failed: Arc<Mutex<Option<String>>>,
     ready: Option<mpsc::Receiver<Result<(), String>>>,
     start_attempted: bool,
+    /// A native start blew `CAPTURE_START_TIMEOUT`. Its thread still owns the
+    /// stream, so this lease must never issue another blocking native call.
+    start_timed_out: bool,
     active: bool,
     native_stopped: Arc<AtomicBool>,
     observations: Arc<Mutex<FrameObservations>>,
@@ -366,6 +439,7 @@ impl WindowLease {
                 failed: Arc::new(Mutex::new(None)),
                 ready: None,
                 start_attempted: false,
+                start_timed_out: false,
                 active: false,
                 native_stopped: Arc::new(AtomicBool::new(true)),
                 observations: Arc::new(Mutex::new(FrameObservations::default())),
@@ -414,40 +488,52 @@ impl WindowLease {
             .ok_or("rendering lease output handler unavailable")?;
         Ok(Self {
             identity,
-            stream: Some(stream),
+            stream: Some(Arc::new(stream)),
             output_id,
             failed,
             ready: Some(receiver),
             start_attempted: false,
+            start_timed_out: false,
             active: false,
             native_stopped,
             observations,
         })
     }
 
-    fn prepare(&mut self, pid: i32, window_id: u32) -> Result<(), String> {
+    fn prepare(&mut self, pid: i32, window_id: u32) -> Result<(), LeaseError> {
         if !self.identity.on_screen {
             self.active = true;
-            return self.validate(pid, window_id);
+            return Ok(self.validate(pid, window_id)?);
         }
         if self.active {
-            return self.validate(pid, window_id);
+            return Ok(self.validate(pid, window_id)?);
         }
         let receiver = self
             .ready
             .take()
             .ok_or("rendering lease setup previously failed")?;
-        // The pinned native binding waits for Apple's completion. It cannot be
-        // cancelled by dropping a future. Keep ownership through completion;
-        // an isolated worker PROCESS deadline is the hard-stop boundary if Apple
-        // never calls back. Only the subsequent first-frame wait is timed here.
+        // The pinned native binding waits for Apple's completion on an
+        // unbounded condvar and cannot be cancelled by dropping a future, so
+        // run it on a thread we are willing to abandon. The thread keeps its
+        // own `Arc<SCStream>`, which is what makes abandoning it sound.
         self.start_attempted = true;
-        let setup = self
-            .stream
-            .as_ref()
-            .unwrap()
-            .start_capture()
-            .map_err(|e| e.to_string())
+        let stream = self.stream.clone().ok_or("rendering lease has no stream")?;
+        let started = bounded(
+            move || stream.start_capture().map_err(|e| e.to_string()),
+            CAPTURE_START_TIMEOUT,
+        );
+        let started = match started {
+            Ok(result) => result,
+            Err(timeout) => {
+                // Nothing here may touch the stream again: the abandoned
+                // thread is still inside Apple's start path.
+                self.start_timed_out = true;
+                self.active = false;
+                *self.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(timeout.to_string());
+                return Err(timeout);
+            }
+        };
+        let setup = started
             .and_then(|()| {
                 receiver.recv_timeout(FIRST_FRAME_TIMEOUT).map_err(|e| {
                     format!(
@@ -463,13 +549,13 @@ impl WindowLease {
                 self.active = true;
                 self.validate(pid, window_id)
             });
-        if let Err(ref error) = setup {
+        if let Err(error) = &setup {
             self.active = false;
             *self.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
         }
         // The registry already owns this lease, including failed start/stop
         // attempts. Session end can retry cleanup instead of losing ownership.
-        setup
+        Ok(setup?)
     }
 
     fn validate(&self, pid: i32, window_id: u32) -> Result<(), String> {
@@ -534,6 +620,14 @@ fn intersection_area(a: [f64; 4], b: [f64; 4]) -> f64 {
 
 impl ManagedLease for WindowLease {
     fn stop(&mut self) -> Result<(), String> {
+        if self.start_timed_out {
+            // The start thread is still parked inside Apple's completion
+            // plumbing and owns the stream; `stop_capture` would park here too.
+            // Release our handle and let that thread's own drop finish the job.
+            self.stream.take();
+            self.active = false;
+            return Ok(());
+        }
         if let Some(stream) = self.stream.as_mut() {
             if self.start_attempted && !self.native_stopped.load(Ordering::Acquire) {
                 stream
@@ -543,7 +637,9 @@ impl ManagedLease for WindowLease {
             }
             // Removing the handler takes the native binding's handler write
             // lock, draining any callback that still holds its read lock.
-            if !stream.remove_output_handler(self.output_id, SCStreamOutputType::Screen) {
+            let drained = Arc::get_mut(stream)
+                .is_some_and(|s| s.remove_output_handler(self.output_id, SCStreamOutputType::Screen));
+            if !drained {
                 return Err("rendering lease output callback could not be drained".into());
             }
             self.stream.take();
@@ -571,7 +667,7 @@ impl WindowRenderingLeases {
         pid: i32,
         window_id: u32,
         capture: impl FnOnce() -> Result<T, String>,
-    ) -> Result<(T, serde_json::Value), String> {
+    ) -> Result<(T, serde_json::Value), LeaseError> {
         let operation = |lease: &mut WindowLease| {
             lease.prepare(pid, window_id)?;
             if session.is_some_and(cua_driver_core::session::is_session_ended) {
@@ -634,6 +730,50 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    /// Stands in for Apple's start-capture completion handler: a caller parks
+    /// on it exactly like `SyncCompletion::wait`, and this one never fires.
+    struct NeverFiringCompletion {
+        entered: Arc<AtomicBool>,
+    }
+
+    impl NeverFiringCompletion {
+        fn wait(&self) -> Result<(), String> {
+            self.entered.store(true, Ordering::SeqCst);
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    #[test]
+    fn a_completion_that_never_fires_times_out_instead_of_parking_the_caller() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let completion = NeverFiringCompletion {
+            entered: entered.clone(),
+        };
+        let started = std::time::Instant::now();
+        let outcome = bounded(move || completion.wait(), Duration::from_millis(150));
+        let waited = started.elapsed();
+        assert_eq!(outcome, Err(LeaseError::StartTimeout { waited_ms: 150 }));
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the abandoned thread must actually have reached the wait"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "the caller must return at its own deadline, not the completion's: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_completion_that_fires_delivers_its_result() {
+        assert_eq!(
+            bounded(|| Err::<(), String>("native refused".into()), CAPTURE_START_TIMEOUT),
+            Ok(Err("native refused".into()))
+        );
+        assert_eq!(bounded(|| 7u8, CAPTURE_START_TIMEOUT), Ok(7));
     }
 
     fn fake(
@@ -732,7 +872,7 @@ mod tests {
                 |_| Err::<(), _>("first frame failed".into()),
             )
             .unwrap_err();
-        assert_eq!(error, "first frame failed");
+        assert_eq!(error, LeaseError::Failed("first frame failed".into()));
         assert_eq!(registry.state.lock().unwrap().leases.len(), 1);
         registry.end("session").unwrap();
         assert_eq!(*events.lock().unwrap(), ["start:1", "stop:1"]);
@@ -744,7 +884,7 @@ mod tests {
         let events = Arc::new(Mutex::new(vec![]));
         let failed = Arc::new(AtomicBool::new(false));
         let ended = AtomicBool::new(false);
-        let result: Result<(), String> = registry.with_lease(
+        let result: Result<(), LeaseError> = registry.with_lease(
             "session",
             || ended.load(Ordering::SeqCst),
             |_| true,

@@ -412,10 +412,15 @@ impl Tool for GetWindowStateTool {
                 let (capture, lease_metadata) = rendering_leases.capture(
                     session_id.as_deref(), pid, window_id,
                     || crate::capture::capture_window_image(window_id).map_err(|e| e.to_string()),
-                ).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
+                ).map_err(|e| match e {
+                    crate::capture_lease::LeaseError::StartTimeout { waited_ms } => {
+                        super::px_frame::PxFrameError::CaptureTimeout {
+                            window_id,
+                            waited_ms,
+                        }
+                    }
+                    crate::capture_lease::LeaseError::Failed(reason) => {
+                        super::px_frame::PxFrameError::CaptureUnavailable { window_id, reason }
                     }
                 })?;
                 let after = crate::windows::window_info_by_id(window_id)
