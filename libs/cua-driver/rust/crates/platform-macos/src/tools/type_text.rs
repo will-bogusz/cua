@@ -1086,10 +1086,13 @@ fn await_typed_delivery(
                 best_partial.get_or_insert(0);
             }
         }
-        if std::time::Instant::now() >= deadline {
+        // A cancelled caller stops the drain and keeps whatever partial
+        // delivery was observed: the characters already posted are real.
+        if std::time::Instant::now() >= deadline
+            || cua_driver_core::operation::sleep(DELIVERY_DRAIN_POLL_INTERVAL).is_err()
+        {
             return (false, best_partial);
         }
-        std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
     }
 }
 

@@ -303,7 +303,7 @@ impl Tool for GetWindowStateTool {
             // The walk shares one deadline across native requests. Await its
             // actual completion: dropping a timed-out blocking JoinHandle would
             // leave AX work running after the tool reported that it had stopped.
-            let walk_future = tokio::task::spawn_blocking(move || {
+            let walk_future = cua_driver_core::operation::spawn_blocking(move || {
                 crate::ax::tree::walk_tree_bounded(
                     pid,
                     Some(window_id),
