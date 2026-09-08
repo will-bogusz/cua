@@ -42,6 +42,12 @@ pub enum ElementAncestry {
     /// The live element ascends to an AX window whose CGWindowID is the
     /// requested one.
     ProvenDescendant,
+    /// The live element ascends to the requested process's own `AXMenuBar`.
+    /// A menu bar is process-scoped: it has no CGWindowID and no window
+    /// ancestor, so window ancestry is unprovable for it by construction.
+    /// The exact owning application is proven instead, which is the scope a
+    /// menu command actually acts in.
+    ProvenAppMenu,
     /// The live element ascends to a different window of the same process.
     OutsideTargetWindow,
     /// Ancestry could not be resolved (dead element, SPI failure). An address
@@ -174,7 +180,9 @@ fn refuse(
 /// - a target absent from fresh `AXWindows` (off-Space or AX-unresolved) is
 ///   observation-only;
 /// - an addressed element must prove ancestry to the requested window for
-///   every route, including semantic AX;
+///   every route, including semantic AX, except that the process's own menu
+///   bar — which has no window ancestor at all — is addressable by semantic
+///   AX action;
 /// - semantic AX actions remain available for minimized/hidden targets;
 /// - the routed pointer requires a visible (possibly occluded) target; and
 /// - process-scoped keyboard additionally requires that the target is the
@@ -213,7 +221,15 @@ pub fn decide_background_input(
 
     match facts.element {
         ElementAncestry::NotAddressed | ElementAncestry::ProvenDescendant => {}
-        ElementAncestry::OutsideTargetWindow | ElementAncestry::Unproven => {
+        // An application menu is owned by the process, not by a window, so a
+        // semantic AX action on it is exactly addressed even though no window
+        // ancestry exists. Window-aimed routes still require that ancestry: a
+        // stamped pointer event or a process-scoped keystroke would land
+        // somewhere other than the row that was addressed.
+        ElementAncestry::ProvenAppMenu if matches!(action, BackgroundAction::AxSemantic) => {}
+        ElementAncestry::OutsideTargetWindow
+        | ElementAncestry::Unproven
+        | ElementAncestry::ProvenAppMenu => {
             return refuse(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
                 format!(
@@ -594,6 +610,30 @@ mod tests {
             ..matched_facts()
         };
         assert!(decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute());
+    }
+
+    /// A menu bar has no window ancestor, so requiring one would refuse every
+    /// menu command by construction. Semantic AX is admitted on the proven
+    /// application menu; the window-aimed routes still are not, because they
+    /// cannot be aimed at a row that lives outside every window.
+    #[test]
+    fn proven_app_menu_ancestry_admits_only_semantic_ax() {
+        let facts = BackgroundTargetFacts {
+            element: ElementAncestry::ProvenAppMenu,
+            ..matched_facts()
+        };
+        assert!(decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute());
+        for action in [
+            BackgroundAction::WindowPointer,
+            BackgroundAction::InsertText,
+            BackgroundAction::GenericKey,
+        ] {
+            assert_eq!(
+                code_of(decide_background_input(TARGET, &facts, action)),
+                refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
+                "{action:?} on an application menu row"
+            );
+        }
     }
 
     /// Refusal precedence: exactness failures are reported before state or
