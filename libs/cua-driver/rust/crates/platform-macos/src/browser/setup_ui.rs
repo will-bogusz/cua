@@ -1752,6 +1752,8 @@ mod tests {
             timed_out: false,
             stop_reason: None,
             window_scope: Some(crate::ax::WindowScope::Matched),
+            document: None,
+            document_edited: None,
         }
     }
 
@@ -1884,6 +1886,8 @@ mod tests {
             timed_out: false,
             stop_reason: None,
             window_scope: Some(crate::ax::WindowScope::Matched),
+            document: None,
+            document_edited: None,
         };
         assert!(
             exact_pixel_setup_checkbox(0, &truncated, 0, chrome(), false)
