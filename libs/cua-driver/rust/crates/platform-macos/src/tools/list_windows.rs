@@ -23,7 +23,10 @@ fn def() -> &'static ToolDef {
             WindowServer's main/global active Space and can differ from a record's \
             current_space_id when displays use independent Spaces. To select a frontmost candidate, take the \
             maximum integer z_index; if every value is null, use an explicit fallback instead of \
-            relying on array order.".into(),
+            relying on array order. With pid and include_accessibility_metadata, also return \
+            accessibility_windows: the application's AXWindows mapped to exact window IDs, \
+            with complete=false when enumeration or any mapping is unavailable. This metadata \
+            does not activate the app, exclude minimized windows, or remove WindowServer rows.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -34,6 +37,10 @@ fn def() -> &'static ToolDef {
                 "on_screen_only": {
                     "type": "boolean",
                     "description": "When true, drop windows not on the current Space. Default false."
+                },
+                "include_accessibility_metadata": {
+                    "type": "boolean",
+                    "description": "macOS only. With an explicit pid, include the application's accessibility window identities without walking their contents. Default false."
                 }
             },
             "additionalProperties": false
@@ -53,8 +60,18 @@ impl Tool for ListWindowsTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        let pid_filter: Option<i32> = args.opt_i64("pid").map(|v| v as i32);
+        let pid_filter = match args.opt_i64("pid") {
+            Some(value) => match i32::try_from(value) {
+                Ok(pid) if pid > 0 => Some(pid),
+                _ => return ToolResult::error("pid must be a positive 32-bit integer"),
+            },
+            None => None,
+        };
         let on_screen_only = args.bool_or("on_screen_only", false);
+        let include_accessibility = args.bool_or("include_accessibility_metadata", false);
+        if include_accessibility && !pid_filter.is_some_and(|pid| pid > 0) {
+            return ToolResult::error("include_accessibility_metadata requires a positive pid");
+        }
 
         let enumeration = if on_screen_only {
             crate::windows::visible_windows_with_space_snapshot()
@@ -70,12 +87,59 @@ impl Tool for ListWindowsTool {
 
         let windows_json: Vec<Value> = windows.iter().map(window_record_json).collect();
 
-        ToolResult::text(format!("Found {} window(s).", windows_json.len())).with_structured(
-            serde_json::json!({
-                "windows": windows_json,
-                "current_space_id": current_space_id
-            }),
-        )
+        let mut data = serde_json::json!({
+            "windows": windows_json,
+            "current_space_id": current_space_id
+        });
+        if include_accessibility {
+            data["accessibility_windows"] = accessibility_windows(pid_filter.unwrap());
+        }
+        ToolResult::text(format!("Found {} window(s).", windows_json.len())).with_structured(data)
+    }
+}
+
+fn accessibility_windows(pid: i32) -> Value {
+    use crate::ax::bindings::*;
+    use core_foundation::base::{CFRelease, CFTypeRef};
+
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return serde_json::json!({"pid": pid, "complete": false, "windows": [], "error": "No application accessibility element"});
+        }
+        AXUIElementSetMessagingTimeout(app, 0.25);
+        let copied = copy_ax_windows_checked(app);
+        CFRelease(app as CFTypeRef);
+        let windows = match copied {
+            Ok(windows) => windows,
+            Err(error) => {
+                return serde_json::json!({"pid": pid, "complete": false, "windows": [], "error": format!("AXWindows unavailable ({error})")})
+            }
+        };
+        let mut complete = windows.len() <= 128;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut records = Vec::new();
+        for (index, window) in windows.into_iter().enumerate() {
+            if index < 128 && std::time::Instant::now() < deadline {
+                AXUIElementSetMessagingTimeout(window, 0.25);
+                match (ax_get_window_id(window), copy_string_attr(window, "AXRole")) {
+                    (Some(window_id), Some(role)) if role == "AXWindow" => {
+                        records.push(serde_json::json!({
+                            "window_id": window_id,
+                            "role": role,
+                            "subrole": copy_string_attr(window, "AXSubrole"),
+                            "minimized": copy_bool_attr(window, "AXMinimized"),
+                            "main": copy_bool_attr(window, "AXMain"),
+                        }))
+                    }
+                    _ => complete = false,
+                }
+            } else {
+                complete = false;
+            }
+            CFRelease(window as CFTypeRef);
+        }
+        serde_json::json!({"pid": pid, "complete": complete, "windows": records})
     }
 }
 
@@ -103,6 +167,18 @@ pub(super) fn window_record_json(w: &crate::windows::WindowInfo) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accessibility_metadata_requires_an_exact_valid_process() {
+        for args in [
+            serde_json::json!({"include_accessibility_metadata": true}),
+            serde_json::json!({"pid": 0, "include_accessibility_metadata": true}),
+            serde_json::json!({"pid": 4294967297_i64, "include_accessibility_metadata": true}),
+        ] {
+            let result = ListWindowsTool.invoke(args).await;
+            assert_eq!(result.is_error, Some(true));
+        }
+    }
 
     #[test]
     fn window_record_includes_observed_z_index() {

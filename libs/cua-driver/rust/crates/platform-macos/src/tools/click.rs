@@ -58,12 +58,59 @@ enum PixelActivationPolicy {
     ForegroundAssist,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct SelectionPixelTarget {
     screen_x: f64,
     screen_y: f64,
     window_x: f64,
     window_y: f64,
+}
+
+/// Element gestures use live AX geometry in logical screen points, not a
+/// cached screenshot transform. Refuse clipped/off-window centers rather than
+/// clamping them to a different control.
+fn element_click_point(
+    rect: [f64; 4],
+    window: &crate::windows::WindowBounds,
+) -> anyhow::Result<SelectionPixelTarget> {
+    let [x, y, width, height] = rect;
+    let cx = x + width / 2.0;
+    let cy = y + height / 2.0;
+    anyhow::ensure!(
+        rect.iter().all(|v| v.is_finite()) && width > 0.0 && height > 0.0
+            && [window.x, window.y, window.width, window.height].iter().all(|v| v.is_finite())
+            && window.width > 0.0 && window.height > 0.0
+            && cx >= window.x && cy >= window.y
+            && cx < window.x + window.width && cy < window.y + window.height,
+        "Element center is unavailable or outside the exact window; observe fresh state before retrying"
+    );
+    Ok(SelectionPixelTarget {
+        screen_x: cx,
+        screen_y: cy,
+        window_x: cx - window.x,
+        window_y: cy - window.y,
+    })
+}
+
+fn live_element_click_point(pointer: usize, wid: u32) -> anyhow::Result<SelectionPixelTarget> {
+    let element = pointer as AXUIElementRef;
+    unsafe {
+        anyhow::ensure!(
+            crate::ax::exact_target::element_window_id(element) == Some(wid),
+            "Element no longer belongs to the exact window; click was not dispatched"
+        );
+        anyhow::ensure!(
+            crate::ax::bindings::copy_bool_attr(element, "AXEnabled") != Some(false),
+            "Element is disabled; click was not dispatched"
+        );
+        let rect = element_screen_rect(element).ok_or_else(|| {
+            anyhow::anyhow!("Element has no live geometry; click was not dispatched")
+        })?;
+        let window = crate::windows::window_bounds_by_id(wid).ok_or_else(|| {
+            anyhow::anyhow!("Exact window no longer exists; click was not dispatched")
+        })?;
+        element_click_point(rect, &window)
+    }
 }
 
 fn selection_readback_confirms(
@@ -83,6 +130,48 @@ const SELECTION_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const SELECTION_READBACK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 const SELECTION_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 const SELECTION_READBACK_STABILITY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A reply error cannot establish that the receiver did nothing. In particular,
+/// a system file panel can commit the save and disappear before replying.
+#[derive(Debug, thiserror::Error)]
+#[error("AXUIElementPerformAction({action}) returned {code}")]
+struct AxActionReplyError {
+    action: &'static str,
+    code: crate::ax::bindings::AXError,
+}
+
+fn dispatch_ax_action(
+    action: &'static str,
+    dispatch: impl FnOnce() -> crate::ax::bindings::AXError,
+) -> Result<(), AxActionReplyError> {
+    let code = dispatch();
+    if code == kAXErrorSuccess {
+        Ok(())
+    } else {
+        Err(AxActionReplyError { action, code })
+    }
+}
+
+fn ax_action_error(error: anyhow::Error) -> ToolResult {
+    if let Some(reply) = error.downcast_ref::<AxActionReplyError>() {
+        ToolResult::error(format!(
+            "AX action outcome is unknown: {error}. The action was attempted and may \
+             already have taken effect. Inspect fresh state or the saved result before \
+             deciding whether to retry; do not repeat the action solely because of this reply."
+        ))
+        .with_structured(serde_json::json!({
+            "error": "ActionOutcomeUnknown",
+            "path": "ax",
+            "effect": "unverifiable",
+            "dispatch": "attempted",
+            "action": reply.action,
+            "ax_error": reply.code,
+            "retry": "reconcile_first"
+        }))
+    } else {
+        ToolResult::error(format!("AX action failed: {error}"))
+    }
+}
 
 fn pixel_activation_policy(
     button: &str,
@@ -173,7 +262,7 @@ fn def() -> &'static ToolDef {
                     "enum": ["left", "right", "middle"],
                     "description": "Mouse button. Default: \"left\" — omit for legacy left-click behaviour. Pixel path uses the matching CGEvent primitive; AX path maps \"right\" to AXShowMenu and falls back to a pixel middle-click at the element's center for \"middle\"."
                 },
-                "count":         { "type": "integer", "description": "Click count (pixel path only). Default 1." },
+                "count":         { "type": "integer", "description": "Click count. Default 1. An element token supports a left-button double-click (count 2) at its live bounding-box center; other counted semantic actions are refused." },
                 "modifier": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -251,37 +340,10 @@ impl Tool for ClickTool {
             };
             let sx_shot = input.x;
             let sy_shot = input.y;
-            // ── Desktop-screenshot pixels → logical screen points ──────────────
-            // The vision invariant: the pixel an agent reads off the screenshot it
-            // was handed is the pixel that gets clicked. `get_desktop_state`
-            // returns the display at NATIVE pixels (e.g. 3024×1964 on a 2× Retina
-            // display whose logical size is 1512×982), but everything below — the
-            // window-under-point hit test (logical CGWindow bounds), the cursor
-            // warp, and the CGEvent post — operates in LOGICAL screen points. So
-            // x,y arrive in desktop-SCREENSHOT space (what the agent reads off the
-            // PNG) and must be divided by the screenshot↔logical ratio, or a
-            // center-pixel pick warps to the corner (off by the backing scale).
-            //
-            // Derive the ratio the same way `get_desktop_state` reports it: native
-            // screenshot width / logical screen width. This is robust even when
-            // CGDisplayPixelsWide under-reports the backing scale (it returns the
-            // scaled-mode point width on some Retina configs → a bogus 1.0).
-            let desktop_ratio = tokio::task::spawn_blocking(|| {
-                let logical_w =
-                    super::get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
-                let shot_w = crate::capture::screenshot_display_bytes()
-                    .ok()
-                    .and_then(|png| crate::capture::png_dimensions(&png).ok())
-                    .map(|(w, _)| w as f64);
-                match (shot_w, logical_w) {
-                    (Some(sw), Some(lw)) if lw > 0.0 && sw > lw => sw / lw,
-                    _ => 1.0,
-                }
-            })
-            .await
-            .unwrap_or(1.0);
-            let sx = sx_shot / desktop_ratio;
-            let sy = sy_shot / desktop_ratio;
+            let (sx, sy) = match super::desktop_screenshot_point(sx_shot, sy_shot).await {
+                Ok(point) => point,
+                Err(error) => return error,
+            };
             let button = match input.button.unwrap_or(ClickButton::Left) {
                 ClickButton::Left => "left",
                 ClickButton::Right => "right",
@@ -302,22 +364,23 @@ impl Tool for ClickTool {
 
             let btn = button.clone();
             let desktop_modifiers: Vec<String> = args.str_array("modifier");
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                // Desktop scope is explicitly foreground and vision-driven: post
-                // at the global HID tap so WindowServer delivers to the window
-                // actually visible at this point. PID-posting here would silently
-                // turn the foreground contract back into background delivery.
-                let modifier_refs: Vec<&str> =
-                    desktop_modifiers.iter().map(String::as_str).collect();
-                crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                    sx,
-                    sy,
-                    count,
-                    &btn,
-                    &modifier_refs,
-                )
-            })
-            .await;
+            let result =
+                cua_driver_core::operation::spawn_blocking(move || -> anyhow::Result<()> {
+                    // Desktop scope is explicitly foreground and vision-driven: post
+                    // at the global HID tap so WindowServer delivers to the window
+                    // actually visible at this point. PID-posting here would silently
+                    // turn the foreground contract back into background delivery.
+                    let modifier_refs: Vec<&str> =
+                        desktop_modifiers.iter().map(String::as_str).collect();
+                    crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                        sx,
+                        sy,
+                        count,
+                        &btn,
+                        &modifier_refs,
+                    )
+                })
+                .await;
             let button_label = match button.as_str() {
                 "right" => "right-click",
                 "middle" => "middle-click",
@@ -421,7 +484,73 @@ impl Tool for ClickTool {
             }));
         }
 
-        if let (Some(idx), Some(wid)) = (element_index, window_id) {
+        if count == 0
+            || (element_index.is_some()
+                && count != 1
+                && (count != 2
+                    || button_str != "left"
+                    || action != "press"
+                    || !modifiers.is_empty()))
+        {
+            return ToolResult::error("Element click supports one semantic action or an unmodified left double-click (count 2); count must be positive.")
+                .with_structured(serde_json::json!({"code":"unsupported_click_gesture", "effect":"not_dispatched"}));
+        }
+        // AXPress has no click count. Keep the retained snapshot element and
+        // exact-window mutation lease while routing a double-click through the
+        // same pixel delivery and cancellation machinery as coordinate clicks.
+        let indexed_guard = if let (Some(idx), Some(wid), 2) = (element_index, window_id, count) {
+            match self.state.element_cache.get_element_retained(pid, wid, idx) {
+                Some(element) => Some(element),
+                None => return ToolResult::error(
+                    "Element is no longer cached; observe the exact window before double-clicking.",
+                ),
+            }
+        } else {
+            None
+        };
+        let indexed_lease = if let Some(element) = &indexed_guard {
+            if from_zoom || debug_image_out.is_some() {
+                return ToolResult::error("Element double-click does not use zoom coordinates or debug_image_out; click was not dispatched.");
+            }
+            match super::gate_background_window_action(
+                pid,
+                window_id.unwrap(),
+                Some(element.as_ptr()),
+                cua_driver_core::background_input::BackgroundAction::WindowPointer,
+            )
+            .await
+            {
+                Ok(lease) => Some(lease),
+                Err(refusal) => return refusal,
+            }
+        } else {
+            None
+        };
+        let indexed_point = if let Some(element) = &indexed_guard {
+            let pointer = element.as_ptr();
+            let wid = window_id.unwrap();
+            match cua_driver_core::operation::spawn_blocking(move || {
+                live_element_click_point(pointer, wid)
+            })
+            .await
+            {
+                Ok(Ok(point)) => Some(point),
+                Ok(Err(error)) => {
+                    return ToolResult::error(format!(
+                        "Element double-click refused before dispatch: {error}"
+                    ))
+                }
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "Element geometry lookup failed before dispatch: {error}"
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+
+        if let (Some(idx), Some(wid), None) = (element_index, window_id, indexed_point) {
             // ── AX element path ────────────────────────────────────────────
             // Retain the element out of the cache so it can't be freed by a
             // concurrent get_window_state on the same (pid, window_id) while
@@ -469,10 +598,27 @@ impl Tool for ClickTool {
                 action.clone()
             };
 
+            if !delivery_mode.is_foreground() && map_action(&effective_action) == "AXOpen" {
+                let panel = cua_driver_core::operation::spawn_blocking(move || {
+                    crate::ax::exact_target::is_file_panel_element(element_ptr)
+                })
+                .await;
+                match panel {
+                    Ok(false) => {},
+                    Ok(true) => return ToolResult::error(
+                        "AppKit file-panel AXOpen can activate the client application, so background delivery was refused before dispatch. Select the file with a single click, then take a fresh panel snapshot and use its enabled Import/Open button to commit the selection."
+                    ).with_structured(serde_json::json!({
+                        "code":"file_panel_open_requires_foreground", "dispatched":false,
+                        "effect":"not_dispatched", "recommended":"select_then_commit"
+                    })),
+                    Err(error) => return ToolResult::error(format!("File-panel action provenance failed before dispatch: {error}")),
+                }
+            }
+
             // Animate cursor to element center BEFORE firing AX action,
             // mirroring Swift's `performElementClick` → `animateAndWait(to:)`.
             let center_ptr = element_ptr;
-            let center = tokio::task::spawn_blocking(move || unsafe {
+            let center = cua_driver_core::operation::spawn_blocking(move || unsafe {
                 crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
             })
             .await
@@ -505,7 +651,7 @@ impl Tool for ClickTool {
 
                 let mods_owned = modifiers.clone();
                 let foreground = delivery_mode.is_foreground();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = cua_driver_core::operation::spawn_blocking(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     if foreground && !m.is_empty() {
                         crate::input::skylight::with_foreground_hid_activation(
@@ -554,7 +700,7 @@ impl Tool for ClickTool {
             // elements so perform_ax_click can cross that one failed semantic
             // rung internally and confirm the result by AX read-back.
             let selection_candidate = if effective_action == "press" {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::operation::spawn_blocking(move || {
                     crate::input::ax_actions::nearest_container_selection_state(element_ptr)
                         .is_some()
                 })
@@ -629,7 +775,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.AXPress",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::operation::spawn_blocking(move || {
                         if foreground {
                             let mut outcome = None;
                             let has_modifiers = !selection_modifiers.is_empty();
@@ -748,10 +894,13 @@ impl Tool for ClickTool {
                     }
                     ToolResult::text(msg).with_structured(structured)
                 }
-                Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
+                Ok(Err(e)) => ax_action_error(e),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
-        } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
+        } else if let Some((mut cx, mut cy)) = x
+            .zip(y)
+            .or(indexed_point.map(|point| (point.screen_x, point.screen_y)))
+        {
             // ── Pixel path ─────────────────────────────────────────────────
 
             // debug_image_out: capture fresh screenshot, overlay crosshair BEFORE
@@ -775,7 +924,7 @@ impl Tool for ClickTool {
                             &self.state.config.read().unwrap(),
                         );
                         let dbg_path_c = dbg_path.clone();
-                        let dbg_result = tokio::task::spawn_blocking(move || {
+                        let dbg_result = cua_driver_core::operation::spawn_blocking(move || {
                             let png = crate::capture::screenshot_window_bytes(wid)?;
                             let png = crate::capture::resize_png_if_needed(&png, max_dim)?;
                             crate::capture::write_crosshair_png(&png, cx, cy, &dbg_path_c)
@@ -798,7 +947,9 @@ impl Tool for ClickTool {
                 }
             }
 
-            if from_zoom {
+            if indexed_point.is_some() {
+                // Already expressed in logical screen points by fresh AX geometry.
+            } else if from_zoom {
                 match self.state.zoom_registry.get(pid) {
                     Some(ctx) => {
                         let (wx, wy) = ctx.zoom_to_window(cx, cy);
@@ -827,7 +978,15 @@ impl Tool for ClickTool {
             //
             // win_local_x/y: window-local logical-pixel coords needed for
             // CGEventSetWindowLocation in the Chromium recipe.
-            let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
+            let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(point) = indexed_point
+            {
+                (
+                    point.screen_x,
+                    point.screen_y,
+                    point.window_x,
+                    point.window_y,
+                )
+            } else if let Some(wid) = window_id {
                 match super::px_frame::resolve_or_refuse(wid).await {
                     Ok(frame) => {
                         let (sx, sy, lx, ly) = frame.to_screen(cx, cy);
@@ -867,7 +1026,10 @@ impl Tool for ClickTool {
             // BEFORE the AX hit-test backend and any cursor/dispatch work.
             // delivery_mode:"foreground" stays the explicit last resort.
             let mutation_lease_held = crate::background_mutation::held_by_current_task(pid);
-            let _mutation_lease = if !delivery_mode.is_foreground() && !mutation_lease_held {
+            let _mutation_lease = if !delivery_mode.is_foreground()
+                && !mutation_lease_held
+                && indexed_lease.is_none()
+            {
                 if let Some(wid) = window_id {
                     match super::gate_background_window_action(
                         pid,
@@ -899,7 +1061,7 @@ impl Tool for ClickTool {
             {
                 let focus_only = action == "focus";
                 let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
-                let ax_result = tokio::task::spawn_blocking(move || unsafe {
+                let ax_result = cua_driver_core::operation::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
@@ -975,6 +1137,30 @@ impl Tool for ClickTool {
                 .cursor_registry
                 .update_position(&cursor_key, screen_x, screen_y);
 
+            // Cursor animation can yield to a re-render or window move. Never
+            // apply an element gesture using the point resolved before that yield.
+            if let (Some(element), Some(lease), Some(point)) =
+                (&indexed_guard, &indexed_lease, indexed_point)
+            {
+                let wid = window_id.unwrap();
+                let pointer = element.as_ptr();
+                if let Err(refusal) = lease
+                    .gate_again(
+                        wid,
+                        Some(pointer),
+                        cua_driver_core::background_input::BackgroundAction::WindowPointer,
+                    )
+                    .await
+                {
+                    return refusal;
+                }
+                match cua_driver_core::operation::spawn_blocking(move || live_element_click_point(pointer, wid)).await {
+                    Ok(Ok(current)) if current == point => {},
+                    _ => return ToolResult::error("Element or window geometry changed before double-click; nothing was dispatched. Observe fresh state before retrying.")
+                        .with_structured(serde_json::json!({"code":"stale_element_geometry", "effect":"not_dispatched"})),
+                }
+            }
+
             // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
             // A pixel click can land on a "Sign In" button that opens a sheet
             // or a Safari link that activates a new tab — same side-effect
@@ -1001,7 +1187,7 @@ impl Tool for ClickTool {
             let focus_without_raise =
                 if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
                     let wid = window_id.expect("activation policy requires window_id");
-                    match tokio::task::spawn_blocking(move || {
+                    match cua_driver_core::operation::spawn_blocking(move || {
                         crate::input::mouse::prepare_background_pixel_click(pid, wid)
                     })
                     .await
@@ -1038,6 +1224,7 @@ impl Tool for ClickTool {
             // button != left. Left-button path stays on the existing Chromium-
             // routed `click_at_xy_with_window_local` for back-compat.
             let button_kind = button_str.clone();
+            let indexed_pointer = indexed_guard.as_ref().map(|element| element.as_ptr());
             let result = focus_guard::with_focus_suppressed(
                 if activation_policy == PixelActivationPolicy::SuppressTarget {
                     Some(pid)
@@ -1047,9 +1234,12 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.pixel",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::operation::spawn_blocking(move || {
                         let has_modifiers = !mods_owned.is_empty();
                         let do_click = move || -> anyhow::Result<()> {
+                            if let (Some(pointer), Some(point), Some(wid)) = (indexed_pointer, indexed_point, window_id) {
+                                anyhow::ensure!(live_element_click_point(pointer, wid)? == point, "Element geometry changed during click preparation; input was not dispatched");
+                            }
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             if fg && !m.is_empty() {
                                 return crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
@@ -1177,7 +1367,9 @@ impl Tool for ClickTool {
                         "path": path,
                         "verified": false,
                         "effect": "unverifiable",
-                        "focus_without_raise": focus_without_raise
+                        "focus_without_raise": focus_without_raise,
+                        "targeting": if indexed_point.is_some() { "element_center" } else { "pixel" },
+                        "count": count
                     }))
                 }
                 Ok(Err(e)) => ToolResult::error(format!("{button_label} failed: {e}")),
@@ -1344,8 +1536,11 @@ fn perform_ax_click(
         }
     }
 
-    let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
-    if err != crate::ax::bindings::kAXErrorSuccess {
+    let reply = dispatch_ax_action(ax_action, || unsafe {
+        crate::ax::bindings::perform_action(element, ax_action)
+    });
+    if let Err(reply) = reply {
+        let err = reply.code;
         // Some collection rows claim a click-like action but Finder returns
         // kAXErrorCannotComplete. Use the same verified selection fallback
         // before surfacing the dispatch error.
@@ -1365,7 +1560,7 @@ fn perform_ax_click(
                 ));
             }
         }
-        anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
+        return Err(reply.into());
     }
 
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
@@ -1490,6 +1685,39 @@ fn map_action(action: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_reply_after_receiver_effect_requires_reconciliation_without_redispatch() {
+        let mut receiver_commits = 0;
+        let failure = dispatch_ax_action("AXPress", || {
+            receiver_commits += 1;
+            crate::ax::bindings::kAXErrorAttributeUnsupported
+        })
+        .unwrap_err();
+        let result = ax_action_error(anyhow::Error::new(failure).context("save panel closed"));
+        assert_eq!(receiver_commits, 1);
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["error"], "ActionOutcomeUnknown");
+        assert_eq!(data["dispatch"], "attempted");
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["retry"], "reconcile_first");
+        assert_eq!(data["ax_error"], -25205);
+
+        // The same reply with no receiver effect is equally indeterminate.
+        // An error code alone cannot distinguish these two application states.
+        let failure = dispatch_ax_action("AXPress", || -25204).unwrap_err();
+        let result = ax_action_error(failure.into());
+        assert_eq!(result.structured_content.unwrap()["effect"], "unverifiable");
+        assert!(dispatch_ax_action("AXPress", || kAXErrorSuccess).is_ok());
+    }
+
+    #[test]
+    fn preflight_failure_does_not_claim_ax_dispatch_was_attempted() {
+        let result = ax_action_error(anyhow::anyhow!("target no longer exists"));
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
+    }
+
     /// Surface 5: schema must advertise the new `button` field with the three
     /// canonical values and default to "left". Hermes / Codex / Claude Code
     /// consumers branch on this enum being present.
@@ -1537,6 +1765,29 @@ mod tests {
     /// resolves to "left" inside invoke. We can't drive the AX path without a
     /// live macOS Window Server, but we CAN check the same arg-parsing logic
     /// the invoke uses produces "left" for empty / absent input.
+    #[test]
+    fn element_gesture_uses_live_logical_center_and_refuses_off_window_geometry() {
+        let window = crate::windows::WindowBounds {
+            x: 100.0,
+            y: 200.0,
+            width: 500.0,
+            height: 300.0,
+        };
+        let point = element_click_point([120.0, 230.0, 40.0, 60.0], &window).unwrap();
+        assert_eq!(
+            (
+                point.screen_x,
+                point.screen_y,
+                point.window_x,
+                point.window_y
+            ),
+            (140.0, 260.0, 40.0, 60.0)
+        );
+        assert!(element_click_point([700.0, 230.0, 40.0, 60.0], &window).is_err());
+        assert!(element_click_point([120.0, 230.0, 0.0, 60.0], &window).is_err());
+        assert!(element_click_point([f64::NAN, 230.0, 40.0, 60.0], &window).is_err());
+    }
+
     #[test]
     fn button_defaults_to_left_when_absent() {
         use cua_driver_core::tool_args::ArgsExt;

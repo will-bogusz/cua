@@ -1123,6 +1123,26 @@
           "display": {
             "type": "string"
           },
+          "display_identity": {
+            "properties": {
+              "native_id": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "uuid": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "uuid",
+              "native_id"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "platform": {
             "enum": [
               "macos",
@@ -1136,6 +1156,26 @@
           },
           "screen_height": {
             "type": "integer"
+          },
+          "screen_origin": {
+            "properties": {
+              "x": {
+                "format": "double",
+                "type": "number"
+              },
+              "y": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "screen_width": {
             "type": "integer"
@@ -1201,11 +1241,51 @@
       "success_output_schema": {
         "additionalProperties": true,
         "properties": {
+          "display_identity": {
+            "properties": {
+              "native_id": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "uuid": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "uuid",
+              "native_id"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "height": {
             "type": "number"
           },
           "scale_factor": {
             "type": "number"
+          },
+          "screen_origin": {
+            "properties": {
+              "x": {
+                "format": "double",
+                "type": "number"
+              },
+              "y": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "width": {
             "type": "number"

@@ -56,6 +56,8 @@ const K_ANY_TRANSACTION_ID: i32 = 0; // kAnyTransactionID
 /// override an inherited default.
 #[derive(Default, Debug, Clone)]
 pub struct OpenConfig {
+    /// Ask LaunchServices to keep a newly launched application hidden.
+    pub hides: bool,
     /// `--args` for the launched process. Passed as argv entries (no shell
     /// expansion).
     pub arguments: Vec<String>,
@@ -194,6 +196,7 @@ fn build_configuration(cfg: &OpenConfig) -> Retained<NSWorkspaceOpenConfiguratio
     let config = unsafe { NSWorkspaceOpenConfiguration::configuration() };
     unsafe {
         config.setActivates(false);
+        config.setHides(cfg.hides);
         config.setAddsToRecentItems(false);
         config.setCreatesNewApplicationInstance(cfg.creates_new_instance);
 

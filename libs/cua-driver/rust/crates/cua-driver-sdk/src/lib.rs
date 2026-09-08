@@ -1535,6 +1535,9 @@ impl CuaDriverSession {
     /// This operation is idempotent. Dropping the object performs the same
     /// cleanup, but trusted hosts should call it at their lifecycle boundary.
     pub fn close(&self) {
+        // Embedded cleanup is scheduled without blocking a language finalizer.
+        // Await end_session for reportable native drainage; shutdown also waits
+        // for scheduled cleanup. Keep exported docs stable for 0.23.2 UniFFI.
         self.backend.close();
     }
 }
@@ -2136,6 +2139,50 @@ mod tests {
             .notify_one();
         assert_eq!(action.await.unwrap().unwrap().text, "drained");
         shutdown.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_keeps_native_work_owned_until_shutdown_drains() {
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().unwrap();
+        let driver = CuaDriver::try_create_for_host(DriverHostOptions {
+            cursor: cursor_overlay::CursorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            host_owns_permission_ux: true,
+            host_bundle_id: None,
+            claude_code_compatibility: false,
+            prepare_desktop_environment: false,
+            register_host_tools: Some(register_slow_host_tool),
+            authorization_host: None,
+            activity_observer: None,
+        })
+        .unwrap();
+        let caller = driver.clone();
+        let action =
+            tokio::spawn(
+                async move { caller.call_tool("health_report".into(), "{}".into()).await },
+            );
+        SLOW_HOST_TOOL_STARTED
+            .get_or_init(tokio::sync::Notify::new)
+            .notified()
+            .await;
+        action.abort();
+        assert!(action.await.unwrap_err().is_cancelled());
+        let closing = driver.clone();
+        let mut shutdown = tokio::spawn(async move { closing.shutdown().await });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown).await;
+        // Always unblock the owned receiver before asserting, including when
+        // the lifecycle regression makes shutdown return prematurely.
+        SLOW_HOST_TOOL_RELEASE
+            .get_or_init(tokio::sync::Notify::new)
+            .notify_one();
+        assert!(
+            early.is_err(),
+            "shutdown returned while cancelled work was still admitted"
+        );
+        shutdown.await.unwrap().unwrap();
+        assert!(!driver.is_available());
     }
 
     #[cfg(target_os = "windows")]

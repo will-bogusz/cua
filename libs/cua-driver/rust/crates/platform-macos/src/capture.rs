@@ -3,8 +3,9 @@
 //! ## Window capture (primary: ScreenCaptureKit)
 //!
 //! Single-frame window capture prefers native ScreenCaptureKit via
-//! `SCScreenshotManager::capture_image` with a desktop-independent window
-//! filter, then encodes PNG in memory. No subprocess, temp file, or base64
+//! `SCScreenshotManager::capture_screenshot` on macOS 26+, with a
+//! desktop-independent window filter, then encodes PNG in memory. Earlier
+//! runtimes use `capture_image`. No subprocess, temp file, or base64
 //! on the native success path.
 //!
 //! A process-local bounded warm cache (TTL 2s, capacity 32) reuses
@@ -17,13 +18,15 @@
 //! - https://developer.apple.com/documentation/screencapturekit/sccontentfilter/init(desktopindependentwindow:)
 //! - https://docs.rs/screencapturekit/6.0.1/screencapturekit/
 //!
-//! Compatibility fallback: `screencapture -l <windowID> -x -o <file>` when
-//! the native path errors or returns empty bytes.
+//! Earlier-runtime compatibility fallback: `screencapture -l <windowID> -x -o
+//! <file>` when the legacy native path errors or returns empty bytes. A failed
+//! modern capture never falls back to the legacy API: on macOS 26 that API can
+//! ignore its shadow setting and return inset content with correct dimensions.
 //!
 //! ## Display capture
 //!
-//! `screencapture -x <file>` still captures the full main display (unchanged
-//! in this slice).
+//! `screencapture -x -m <file>` captures only the main display. Desktop tools
+//! independently validate its identity, mode and actual image dimensions.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use std::collections::HashMap;
@@ -302,8 +305,23 @@ fn checked_image_dim(value: usize, label: &str) -> anyhow::Result<u32> {
 /// Owned ScreenCaptureKit filter + stream config for one window id.
 struct WindowCapturePlan {
     filter: screencapturekit::prelude::SCContentFilter,
-    config: screencapturekit::prelude::SCStreamConfiguration,
+    config: WindowScreenshotConfiguration,
     identity: WindowCaptureIdentity,
+}
+
+enum WindowScreenshotConfiguration {
+    Modern(screencapturekit::screenshot_manager::SCScreenshotConfiguration),
+    Legacy(screencapturekit::prelude::SCStreamConfiguration),
+}
+
+fn uses_modern_window_screenshot() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| objc2::runtime::AnyClass::get("SCScreenshotConfiguration").is_some())
+}
+
+pub struct CapturedWindowImage {
+    pub png: Vec<u8>,
+    pub backend: &'static str,
 }
 
 /// Cheap WindowServer fingerprint used to reject a cached filter after a
@@ -444,13 +462,56 @@ fn lock_window_plan_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Capture exactly the window surface, with screenshot pixel (0, 0) at the
+/// WindowServer frame origin. Use the screenshot-specific configuration when
+/// available: a controlled macOS 26 comparison found `capture_image` ignored
+/// `ignoreShadowsSingleWindow`, while `capture_screenshot` honored its shadow
+/// setting. Matching output dimensions alone did not detect the legacy inset.
+/// Exclude the physical cursor: when it crosses a window edge, ScreenCaptureKit
+/// can fit the window and cursor into the requested size, changing the pixel frame.
+fn window_capture_configuration(
+    width_pts: f64,
+    height_pts: f64,
+    scale: f64,
+) -> anyhow::Result<WindowScreenshotConfiguration> {
+    let out_w = rounded_pixel_dim(width_pts * scale, "width")?;
+    let out_h = rounded_pixel_dim(height_pts * scale, "height")?;
+    if uses_modern_window_screenshot() {
+        use screencapturekit::screenshot_manager::{
+            SCScreenshotConfiguration, SCScreenshotDynamicRange,
+        };
+        // The crate's bridge has stubs when built with an older SDK. The
+        // runtime supports the modern API, so refuse such a build instead of
+        // silently falling back to the legacy API known to inset its pixels.
+        if SCScreenshotConfiguration::supported_content_types().is_empty() {
+            anyhow::bail!("modern window screenshots require bindings built with the macOS 26 SDK");
+        }
+        Ok(WindowScreenshotConfiguration::Modern(
+            SCScreenshotConfiguration::new()
+                .with_width(out_w as usize)
+                .with_height(out_h as usize)
+                .with_ignore_shadows(true)
+                .with_shows_cursor(false)
+                .with_dynamic_range(SCScreenshotDynamicRange::SDR),
+        ))
+    } else {
+        Ok(WindowScreenshotConfiguration::Legacy(
+            screencapturekit::prelude::SCStreamConfiguration::new()
+                .with_width(out_w)
+                .with_height(out_h)
+                .with_shows_cursor(false)
+                .with_ignores_shadows_single_window(true),
+        ))
+    }
+}
+
 /// Look up shareable content, build desktop-independent filter + pixel config.
 /// Runs outside the cache lock.
 fn build_window_capture_plan(
     window_id: u32,
     expected_identity: WindowCaptureIdentity,
 ) -> anyhow::Result<std::sync::Arc<WindowCapturePlan>> {
-    use screencapturekit::prelude::{SCContentFilter, SCShareableContent, SCStreamConfiguration};
+    use screencapturekit::prelude::{SCContentFilter, SCShareableContent};
 
     let content = SCShareableContent::get()
         .map_err(|e| anyhow::anyhow!("SCShareableContent::get failed: {e}"))?;
@@ -503,12 +564,7 @@ fn build_window_capture_plan(
         }
     };
 
-    let out_w = rounded_pixel_dim(width_pts * scale, "width")?;
-    let out_h = rounded_pixel_dim(height_pts * scale, "height")?;
-
-    let config = SCStreamConfiguration::new()
-        .with_width(out_w)
-        .with_height(out_h);
+    let config = window_capture_configuration(width_pts, height_pts, scale)?;
 
     Ok(std::sync::Arc::new(WindowCapturePlan {
         filter,
@@ -521,11 +577,36 @@ fn build_window_capture_plan(
 ///
 /// https://developer.apple.com/documentation/screencapturekit/scscreenshotmanager
 fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow::Result<Vec<u8>> {
-    use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
+    use screencapturekit::screenshot_manager::SCScreenshotManager;
 
-    let image = SCScreenshotManager::capture_image(&plan.filter, &plan.config).map_err(|e| {
-        anyhow::anyhow!("SCScreenshotManager::capture_image failed for window {window_id}: {e}")
-    })?;
+    let image = match &plan.config {
+        WindowScreenshotConfiguration::Modern(config) => {
+            let output =
+                SCScreenshotManager::capture_screenshot(&plan.filter, config).map_err(|e| {
+                    anyhow::anyhow!(
+                    "SCScreenshotManager::capture_screenshot failed for window {window_id}: {e}"
+                )
+                })?;
+            output.sdr_image().ok_or_else(|| anyhow::anyhow!(
+                "SCScreenshotManager::capture_screenshot returned no SDR image for window {window_id}"
+            ))?
+        }
+        WindowScreenshotConfiguration::Legacy(config) => {
+            SCScreenshotManager::capture_image(&plan.filter, config).map_err(|e| {
+                anyhow::anyhow!(
+                    "SCScreenshotManager::capture_image failed for window {window_id}: {e}"
+                )
+            })?
+        }
+    };
+    encode_captured_image(window_id, &image)
+}
+
+fn encode_captured_image(
+    window_id: u32,
+    image: &screencapturekit::screenshot_manager::CGImage,
+) -> anyhow::Result<Vec<u8>> {
+    use screencapturekit::screenshot_manager::CGImageExt;
 
     let w = checked_image_dim(image.width(), "CGImage width")?;
     let h = checked_image_dim(image.height(), "CGImage height")?;
@@ -723,11 +804,49 @@ fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<Vec<u8>> {
 /// Capture a window by its `window_id` (CGWindowID).
 /// Returns raw PNG bytes or an error.
 ///
-/// Tries ScreenCaptureKit first; falls back to the `screencapture` CLI on
-/// native error or empty output.
+/// Uses the same backend selection as `capture_window_image`.
 pub fn screenshot_window_bytes(window_id: u32) -> anyhow::Result<Vec<u8>> {
-    capture_window_with_backends(
+    Ok(capture_window_image(window_id)?.png)
+}
+
+fn capture_window_selected_backend<N, F>(
+    window_id: u32,
+    modern_available: bool,
+    native: N,
+    fallback: F,
+) -> anyhow::Result<CapturedWindowImage>
+where
+    N: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
+    F: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
+{
+    if modern_available {
+        let png = native(window_id)?;
+        if png.is_empty() {
+            anyhow::bail!("modern screenshot capture returned empty bytes for window {window_id}");
+        }
+        return Ok(CapturedWindowImage {
+            png,
+            backend: "sck_screenshot",
+        });
+    }
+    let backend = std::cell::Cell::new("sck_legacy_image");
+    let png = capture_window_with_backends(window_id, native, |window_id| {
+        backend.set("screencapture_shadowless");
+        fallback(window_id)
+    })?;
+    Ok(CapturedWindowImage {
+        png,
+        backend: backend.get(),
+    })
+}
+
+/// Captures bytes and reports the backend that actually produced them.
+/// Modern failures stay failures rather than quietly selecting a legacy
+/// capture with different coordinate semantics.
+pub fn capture_window_image(window_id: u32) -> anyhow::Result<CapturedWindowImage> {
+    capture_window_selected_backend(
         window_id,
+        uses_modern_window_screenshot(),
         screenshot_window_bytes_sck,
         screenshot_window_bytes_shell,
     )
@@ -749,7 +868,7 @@ pub fn screenshot_display_bytes() -> anyhow::Result<Vec<u8>> {
     let tmp_path = capture.file.to_string_lossy().into_owned();
 
     let output = Command::new("screencapture")
-        .args(["-x", &tmp_path])
+        .args(["-x", "-m", &tmp_path])
         .output()?;
 
     if !output.status.success() {
@@ -826,6 +945,164 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    #[test]
+    fn window_capture_configuration_preserves_unpadded_retina_and_point_geometry() {
+        for (scale, width, height) in [(1.0, 640, 292), (2.0, 1280, 584)] {
+            let config = window_capture_configuration(640.0, 292.0, scale)
+                .expect("valid native window dimensions");
+            // These getters read the actual Cocoa configuration across FFI;
+            // matching dimensions alone failed to detect the original inset.
+            match config {
+                WindowScreenshotConfiguration::Legacy(config) => {
+                    assert_eq!((config.width(), config.height()), (width, height));
+                    assert!(config.ignores_shadows_single_window());
+                }
+                WindowScreenshotConfiguration::Modern(config) => {
+                    use objc2::{msg_send, runtime::AnyObject};
+                    // The binding has no getters, so inspect the actual Cocoa
+                    // object, not a duplicate record of our intended settings.
+                    let native = unsafe { &*config.as_ptr().cast::<AnyObject>() };
+                    let native_width: isize = unsafe { msg_send![native, width] };
+                    let native_height: isize = unsafe { msg_send![native, height] };
+                    let ignores_shadows: bool = unsafe { msg_send![native, ignoreShadows] };
+                    assert_eq!(
+                        (native_width, native_height),
+                        (width as isize, height as isize)
+                    );
+                    assert!(ignores_shadows);
+                    let shows_cursor: bool = unsafe { msg_send![native, showsCursor] };
+                    assert!(!shows_cursor, "cursor expands exact-window geometry");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn modern_capture_failure_never_retries_a_legacy_backend() {
+        for empty in [false, true] {
+            let fallback_calls = Cell::new(0);
+            let result = capture_window_selected_backend(
+                42,
+                true,
+                |_| {
+                    if empty {
+                        Ok(Vec::new())
+                    } else {
+                        anyhow::bail!("modern capture failed")
+                    }
+                },
+                |_| {
+                    fallback_calls.set(fallback_calls.get() + 1);
+                    Ok(vec![1])
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(fallback_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn capture_backend_metadata_names_the_actual_producer() {
+        for (modern, native_fails, expected) in [
+            (true, false, "sck_screenshot"),
+            (false, false, "sck_legacy_image"),
+            (false, true, "screencapture_shadowless"),
+        ] {
+            let capture = capture_window_selected_backend(
+                42,
+                modern,
+                |_| {
+                    if native_fails {
+                        anyhow::bail!("native failed")
+                    }
+                    Ok(vec![1])
+                },
+                |_| Ok(vec![2]),
+            )
+            .unwrap();
+            assert_eq!(capture.backend, expected);
+            assert_eq!(capture.png, if native_fails { vec![2] } else { vec![1] });
+        }
+    }
+
+    #[test]
+    fn native_image_encoding_and_resize_preserve_content_geometry() {
+        use core_graphics::{
+            color_space::CGColorSpace, data_provider::CGDataProvider, image::CGImage,
+        };
+        use foreign_types::ForeignType;
+
+        let (width, height) = (64usize, 48usize);
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = if (24..40).contains(&x) && (16..32).contains(&y) {
+                    [0, 0, 0, 0] // Real transparent content must not be cropped.
+                } else {
+                    match (x >= width / 2, y >= height / 2) {
+                        (false, false) => [255, 0, 0, 255],
+                        (true, false) => [0, 255, 0, 255],
+                        (false, true) => [0, 0, 255, 255],
+                        (true, true) => [255, 255, 0, 255],
+                    }
+                };
+                rgba.extend_from_slice(&pixel);
+            }
+        }
+        let provider = CGDataProvider::from_buffer(Arc::new(rgba.clone()));
+        let native = CGImage::new(
+            width,
+            height,
+            8,
+            32,
+            width * 4,
+            &CGColorSpace::create_device_rgb(),
+            0x4003,
+            &provider,
+            false,
+            0,
+        );
+        // Transfer this owned CGImage reference into the same wrapper that
+        // SCScreenshotManager returns. No capture, application, or window exists.
+        let image = unsafe {
+            screencapturekit::screenshot_manager::CGImage::from_raw(native.as_ptr().cast())
+        };
+        std::mem::forget(native);
+        let png = encode_captured_image(42, &image).unwrap();
+        let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (width as u32, height as u32));
+        assert_eq!(
+            decoded.as_raw(),
+            &rgba,
+            "CGImage conversion must not scale, inset, flip, or crop content"
+        );
+
+        let resized = resize_png_if_needed(&png, 32).unwrap();
+        let decoded = image::load_from_memory(&resized).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (32, 24));
+        for (x, y, color) in [
+            (0, 0, [255, 0, 0, 255]),
+            (31, 0, [0, 255, 0, 255]),
+            (0, 23, [0, 0, 255, 255]),
+            (31, 23, [255, 255, 0, 255]),
+        ] {
+            assert_eq!(decoded.get_pixel(x, y).0, color);
+        }
+        assert_eq!(decoded.get_pixel(16, 12).0[3], 0);
+    }
+
+    #[test]
+    fn window_capture_configuration_rejects_unusable_geometry() {
+        for (width, height, scale) in [
+            (0.0, 292.0, 2.0),
+            (640.0, f64::NAN, 2.0),
+            (640.0, 292.0, 0.0),
+            (f64::from(MAX_CAPTURE_DIM), 292.0, 2.0),
+        ] {
+            assert!(window_capture_configuration(width, height, scale).is_err());
+        }
+    }
 
     #[test]
     fn native_window_capture_short_circuits_shell_fallback() {

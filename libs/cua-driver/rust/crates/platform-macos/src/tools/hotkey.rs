@@ -175,7 +175,7 @@ impl Tool for HotkeyTool {
                 );
             };
             let display = raw_keys.join("+");
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::operation::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key, &modifier_refs)
             })
@@ -329,13 +329,13 @@ impl Tool for HotkeyTool {
         // and, on the explicit foreground rung, a real click when required.
         let web_ax_focus_xy =
             if let (Some(ptr), Some(wid), Some(index)) = (element_ptr, window_id, element_index) {
-                let is_web = tokio::task::spawn_blocking(move || {
+                let is_web = cua_driver_core::operation::spawn_blocking(move || {
                     super::type_text::target_in_web_area(pid, Some((ptr, Some(index))), Some(wid))
                 })
                 .await
                 .unwrap_or(true);
                 if is_web {
-                    tokio::task::spawn_blocking(move || unsafe {
+                    cua_driver_core::operation::spawn_blocking(move || unsafe {
                         let (screen_x, screen_y) = crate::ax::bindings::element_screen_center(
                             ptr as crate::ax::bindings::AXUIElementRef,
                         )?;
@@ -405,7 +405,7 @@ impl Tool for HotkeyTool {
             prior_front,
             "hotkey.CGEvent",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::operation::spawn_blocking(move || {
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     match (fg, coordinate_focus, window_id, element_ptr) {
                         // Chrome's native omnibox and Chromium/Electron inputs

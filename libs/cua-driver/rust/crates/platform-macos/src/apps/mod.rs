@@ -58,26 +58,63 @@ fn list_running_apps_native() -> Vec<AppInfo> {
             {
                 continue;
             }
-            let Some(name) = app.localizedName().map(|value| value.to_string()) else {
-                continue;
-            };
-            let pid = app.processIdentifier();
-            if name.is_empty() || pid <= 0 {
-                continue;
+            if let Some(info) = running_app_info(&app) {
+                apps.push(info);
             }
-            apps.push(AppInfo {
-                name,
-                pid,
-                bundle_id: app.bundleIdentifier().map(|value| value.to_string()),
-                running: true,
-                active: app.isActive(),
-                launch_path: None,
-                kind: Some("desktop".to_owned()),
-                last_used: None,
-            });
         }
     }
     apps
+}
+
+fn running_app_info(app: &objc2_app_kit::NSRunningApplication) -> Option<AppInfo> {
+    unsafe {
+        if app.isTerminated() {
+            return None;
+        }
+        let bundle_id = app.bundleIdentifier().map(|value| value.to_string());
+        let name = app
+            .localizedName()
+            .map(|value| value.to_string())
+            .or_else(|| bundle_id.clone())?;
+        let pid = app.processIdentifier();
+        if name.is_empty() || pid <= 0 {
+            return None;
+        }
+        Some(AppInfo {
+            name,
+            pid,
+            bundle_id,
+            running: true,
+            active: app.isActive(),
+            launch_path: app
+                .bundleURL()
+                .and_then(|url| url.path())
+                .map(|value| value.to_string()),
+            kind: Some("desktop".to_owned()),
+            last_used: None,
+        })
+    }
+}
+
+/// Launch identity must include accessory apps and use their live bundle URL,
+/// not an installed-app scan or the UI inventory's Regular-policy filter.
+pub(crate) fn running_apps_for_bundle(bundle_id: &str) -> Vec<AppInfo> {
+    unsafe {
+        let apps = objc2_app_kit::NSRunningApplication::runningApplicationsWithBundleIdentifier(
+            &objc2_foundation::NSString::from_str(bundle_id),
+        );
+        (0..apps.count())
+            .filter_map(|index| running_app_info(&apps.objectAtIndex(index)))
+            .collect()
+    }
+}
+
+pub(crate) fn running_app_by_pid(pid: i32) -> Option<AppInfo> {
+    unsafe {
+        let app =
+            objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
+        running_app_info(&app)
+    }
 }
 
 /// Launch an app by bundle ID via NSWorkspace, background only (no focus
@@ -159,6 +196,7 @@ pub fn launch_with_urls_by_bundle(
     // openURLs:withApplicationAtURL: to bail with "application not
     // found" for Cryptex-installed apps (Safari). Verified empirically.
     let cfg = nsworkspace::OpenConfig {
+        hides: false,
         arguments: additional_args.to_vec(),
         environment: env.clone(),
         creates_new_instance,
@@ -203,6 +241,7 @@ pub fn launch_with_urls_by_name(
     // See `launch_with_urls_by_bundle` — skip `oapp` AppleEvent on
     // the URL-handoff path.
     let cfg = nsworkspace::OpenConfig {
+        hides: false,
         arguments: additional_args.to_vec(),
         environment: env.clone(),
         creates_new_instance,
@@ -371,6 +410,26 @@ pub(crate) fn resolve_bundle_id_to_locator(bundle_id: &str) -> Option<AppLocator
 ///    integration tests; can be added if we hit a non-English-name app
 ///    in the wild.
 pub(crate) fn locate_by_name(name: &str) -> Option<AppLocator> {
+    // Explicit bundle paths are exact targets, not names to append to every
+    // search root or reinterpret as a bundle ID. Keep the selected path even
+    // if a different installation declares the same bundle identifier.
+    if name.starts_with('/') || name.starts_with("~/") {
+        let path = if let Some(relative) = name.strip_prefix("~/") {
+            std::path::PathBuf::from(std::env::var_os("HOME")?).join(relative)
+        } else {
+            std::path::PathBuf::from(name)
+        };
+        let path_text = path.to_str()?;
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+            && path.is_dir()
+            && bundle_id_for_app_path(path_text).is_some()
+        {
+            return Some(AppLocator::Path(path_text.to_owned()));
+        }
+        return None;
+    }
     let app_name = if name.ends_with(".app") {
         name.to_owned()
     } else {
@@ -716,7 +775,23 @@ pub fn format_app_list(apps: &[AppInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{finder_folder_handoff, unix_secs_to_rfc3339};
+    use super::{finder_folder_handoff, locate_by_name, unix_secs_to_rfc3339, AppLocator};
+
+    #[test]
+    fn explicit_app_paths_resolve_exactly_without_name_or_bundle_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("An App With Spaces.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        let text = app.to_str().unwrap();
+        assert!(locate_by_name(text).is_none());
+        std::fs::write(app.join("Contents/Info.plist"), r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>dev.omp.path-fixture</string></dict></plist>"#).unwrap();
+        assert!(matches!(locate_by_name(text), Some(AppLocator::Path(path)) if path == text));
+        let (selected, bundle) = locate_by_name(text).unwrap().app_ref_and_bundle_id();
+        assert_eq!(selected, text);
+        assert_eq!(bundle.as_deref(), Some("dev.omp.path-fixture"));
+        assert!(locate_by_name(root.path().join("Missing.app").to_str().unwrap()).is_none());
+        assert!(locate_by_name(root.path().to_str().unwrap()).is_none());
+    }
 
     #[test]
     fn finder_folder_handoff_is_narrowly_selected() {

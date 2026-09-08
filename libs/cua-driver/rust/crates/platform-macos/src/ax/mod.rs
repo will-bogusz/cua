@@ -17,6 +17,7 @@
 //! - 2-space indent per depth level
 
 pub mod bindings;
+pub(crate) mod budget;
 pub mod cache;
 pub mod enablement;
 pub mod exact_target;

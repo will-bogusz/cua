@@ -50,7 +50,8 @@ pub const kAXValueIllegalType: AXValueType = 1_000;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
-    pub fn AXUIElementCopyAttributeValue(
+    #[link_name = "AXUIElementCopyAttributeValue"]
+    fn AXUIElementCopyAttributeValue_native(
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: *mut CFTypeRef,
@@ -59,7 +60,11 @@ extern "C" {
         element: AXUIElementRef,
         names: *mut CFArrayRef,
     ) -> AXError;
-    pub fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
+    #[link_name = "AXUIElementCopyActionNames"]
+    fn AXUIElementCopyActionNames_native(
+        element: AXUIElementRef,
+        names: *mut CFArrayRef,
+    ) -> AXError;
     pub fn AXUIElementCopyElementAtPosition(
         application: AXUIElementRef,
         x: f32,
@@ -67,12 +72,14 @@ extern "C" {
         element: *mut AXUIElementRef,
     ) -> AXError;
     pub fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
-    pub fn AXUIElementSetAttributeValue(
+    #[link_name = "AXUIElementSetAttributeValue"]
+    fn AXUIElementSetAttributeValue_native(
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> AXError;
-    pub fn AXUIElementIsAttributeSettable(
+    #[link_name = "AXUIElementIsAttributeSettable"]
+    fn AXUIElementIsAttributeSettable_native(
         element: AXUIElementRef,
         attribute: CFStringRef,
         settable: *mut u8,
@@ -93,7 +100,95 @@ extern "C" {
 
     /// Private SPI: maps an AX window element to its CGWindowID.
     /// Stable since macOS 10.9; used by yabai, Hammerspoon, Accessibility Inspector.
-    pub fn _AXUIElementGetWindow(element: AXUIElementRef, window_id: *mut u32) -> AXError;
+    #[link_name = "_AXUIElementGetWindow"]
+    fn _AXUIElementGetWindow_native(element: AXUIElementRef, window_id: *mut u32) -> AXError;
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn AXUIElementCopyAttributeValue(
+    element: AXUIElementRef,
+    attribute: CFStringRef,
+    value: *mut CFTypeRef,
+) -> AXError {
+    super::budget::request(element, || {
+        AXUIElementCopyAttributeValue_native(element, attribute, value)
+    })
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn AXUIElementCopyActionNames(
+    element: AXUIElementRef,
+    names: *mut CFArrayRef,
+) -> AXError {
+    super::budget::request(element, || {
+        AXUIElementCopyActionNames_native(element, names)
+    })
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn AXUIElementSetAttributeValue(
+    element: AXUIElementRef,
+    attribute: CFStringRef,
+    value: CFTypeRef,
+) -> AXError {
+    super::budget::request(element, || {
+        AXUIElementSetAttributeValue_native(element, attribute, value)
+    })
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn AXUIElementIsAttributeSettable(
+    element: AXUIElementRef,
+    attribute: CFStringRef,
+    settable: *mut u8,
+) -> AXError {
+    super::budget::request(element, || {
+        AXUIElementIsAttributeSettable_native(element, attribute, settable)
+    })
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn _AXUIElementGetWindow(element: AXUIElementRef, window_id: *mut u32) -> AXError {
+    super::budget::request(element, || _AXUIElementGetWindow_native(element, window_id))
+}
+
+/// Read a hosted element's backing PID, not its presenter's PID.
+///
+/// The private SPI is optional: unavailable symbols and failed/unknown identity
+/// reads return `None`, never a host-PID or debug-description fallback.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef`.
+pub unsafe fn actual_pid_of_element(element: AXUIElementRef) -> Option<i32> {
+    type GetActualPid = unsafe extern "C" fn(AXUIElementRef, *mut i32) -> AXError;
+    static GET_ACTUAL_PID: std::sync::LazyLock<Option<GetActualPid>> =
+        std::sync::LazyLock::new(|| unsafe {
+            let symbol = libc::dlsym(libc::RTLD_DEFAULT, c"_AXUIElementGetActualPid".as_ptr());
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, GetActualPid>(symbol))
+            }
+        });
+    let get_pid = (*GET_ACTUAL_PID)?;
+    let mut pid = 0;
+    (get_pid(element, &mut pid) == kAXErrorSuccess && pid > 0).then_some(pid)
 }
 
 /// Hit-test one process's accessibility tree at a screen point. The returned
@@ -519,6 +614,37 @@ pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
         .collect()
 }
 
+/// Copy a child only when AXChildren is exactly one valid AX element.
+///
+/// Failed or malformed reads return `None`, rather than filtering unusable
+/// entries. The caller must release the returned element.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef`.
+pub unsafe fn copy_only_child(element: AXUIElementRef) -> Option<AXUIElementRef> {
+    let attr = CFStr::new("AXChildren");
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    if core_foundation::base::CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
+        CFRelease(value);
+        return None;
+    }
+    let children = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+    if children.len() != 1 {
+        return None;
+    }
+    let child = *children.get(0)?;
+    if core_foundation::base::CFGetTypeID(child) != AXUIElementGetTypeID() {
+        return None;
+    }
+    CFRetain(child);
+    Some(child as AXUIElementRef)
+}
+
 /// Copy an AX element-valued attribute. The returned element is retained and
 /// must be released by the caller.
 ///
@@ -693,36 +819,136 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+    copy_ax_windows_checked(element).unwrap_or_default()
+}
+
+/// Fresh AXWindows plus their explicitly attached AXSheet children.
+///
+/// AppKit file panels expose a same-process sheet below the document window,
+/// not in AXWindows. Its mapped CGWindowID is the visible panel, while children
+/// can be supplied by an XPC service. Do not substitute those provider windows
+/// or arbitrary descendants for the sheet. Every returned element is retained.
+/// The bounded walk follows only window -> sheet -> sheet edges.
+///
+/// # Safety
+/// `element` must be valid; release every returned element exactly once.
+pub unsafe fn copy_ax_window_surfaces(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+    use core_foundation::base::CFEqual;
+    let mut surfaces = copy_ax_windows(element);
+    let mut depths = vec![0usize; surfaces.len()];
+    let mut index = 0;
+    while index < surfaces.len() && index < 64 {
+        let parent = surfaces[index];
+        let depth = depths[index];
+        index += 1;
+        if depth >= 4 {
+            continue;
+        }
+        for child in copy_children(parent) {
+            let is_sheet = copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet");
+            if surfaces.len() < 64
+                && is_sheet
+                && ax_get_window_id(child).is_some()
+                && ax_get_window_id(child) != ax_get_window_id(parent)
+                && !surfaces
+                    .iter()
+                    .any(|&other| CFEqual(other as CFTypeRef, child as CFTypeRef) != 0)
+            {
+                surfaces.push(child);
+                depths.push(depth + 1);
+            } else {
+                CFRelease(child as CFTypeRef);
+            }
+        }
+    }
+    surfaces
+}
+
+/// Read the application window list without conflating failure with an empty list.
+///
+/// # Safety
+/// `element` must be valid. The caller must release every returned element.
+pub unsafe fn copy_ax_windows_checked(
+    element: AXUIElementRef,
+) -> Result<Vec<AXUIElementRef>, AXError> {
     let attr = CFStr::new("AXWindows");
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
+    if err != kAXErrorSuccess {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return Err(err);
+    }
+    take_ax_window_array(value)
+}
+
+// Consumes the copied attribute value on every path. Do not treat a partially
+// readable window array as a complete inventory.
+unsafe fn take_ax_window_array(value: CFTypeRef) -> Result<Vec<AXUIElementRef>, AXError> {
+    if value.is_null() {
+        return Err(kAXErrorNoValue);
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return vec![];
+        return Err(kAXErrorFailure);
     }
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
-        .filter_map(|i| {
-            let item = *arr.get(i)?;
-            if core_foundation::base::CFGetTypeID(item) == ax_type_id {
-                CFRetain(item);
-                Some(item as AXUIElementRef)
-            } else {
-                None
-            }
+    if arr
+        .iter()
+        .any(|item| item.is_null() || core_foundation::base::CFGetTypeID(*item) != ax_type_id)
+    {
+        return Err(kAXErrorFailure);
+    }
+    Ok(arr
+        .iter()
+        .map(|item| {
+            CFRetain(*item);
+            *item as AXUIElementRef
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use core_foundation::{boolean::CFBoolean, number::CFNumber};
+
+    #[test]
+    fn checked_window_array_distinguishes_empty_from_unavailable_or_malformed() {
+        unsafe {
+            let empty = CFArray::<CFTypeRef>::from_copyable(&[]);
+            assert!(take_ax_window_array(CFRetain(empty.as_CFTypeRef()))
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                take_ax_window_array(std::ptr::null()).unwrap_err(),
+                kAXErrorNoValue
+            );
+            let text = CFStr::new("not a window");
+            assert_eq!(
+                take_ax_window_array(CFRetain(text.as_CFTypeRef())).unwrap_err(),
+                kAXErrorFailure
+            );
+            let app = AXUIElementCreateApplication(std::process::id() as i32);
+            assert!(!app.is_null());
+            let valid = CFArray::<CFTypeRef>::from_copyable(&[app as CFTypeRef]);
+            let copied = take_ax_window_array(CFRetain(valid.as_CFTypeRef())).unwrap();
+            assert_eq!(copied, vec![app]);
+            for element in copied {
+                CFRelease(element as CFTypeRef);
+            }
+            let mixed =
+                CFArray::<CFTypeRef>::from_copyable(&[app as CFTypeRef, text.as_CFTypeRef()]);
+            assert_eq!(
+                take_ax_window_array(CFRetain(mixed.as_CFTypeRef())).unwrap_err(),
+                kAXErrorFailure
+            );
+            CFRelease(app as CFTypeRef);
+        }
+    }
 
     #[test]
     fn stringish_value_coerces_cfstring_cfnumber_and_cfboolean() {
