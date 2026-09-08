@@ -300,7 +300,14 @@ impl Tool for VerifyStateTool {
                 .await
                 .is_err()
             {
-                return crate::operation::cancelled_result(None);
+                return crate::operation::cancelled_result(
+                    None,
+                    Some(serde_json::json!({
+                        "tool": "verify_state",
+                        "samples": samples,
+                        "elapsed_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    })),
+                );
             }
         };
 

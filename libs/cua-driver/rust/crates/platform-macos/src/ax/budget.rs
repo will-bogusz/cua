@@ -159,6 +159,34 @@ mod tests {
         assert_eq!(stop_reason(), None);
     }
 
+    #[tokio::test]
+    async fn a_cancelled_operation_stops_the_walk_at_the_same_gate_as_the_deadline() {
+        let operation = std::sync::Arc::new(cua_driver_core::operation::Cancellation::default());
+        let signal = operation.clone();
+        cua_driver_core::operation::scope(operation, async move {
+            cua_driver_core::operation::spawn_blocking(move || {
+                {
+                    let _budget = WalkBudget::new(Duration::from_secs(10));
+                    assert!(!exhausted(), "a live operation must not stop the walk");
+                    signal.cancel();
+                    assert_eq!(stop_reason(), Some(StopReason::Cancelled));
+                    assert_eq!(
+                        request_with(DEADLINE.with(Cell::get), |_| 0, || panic!(
+                            "a cancelled walk must not issue another native request"
+                        )),
+                        CANNOT_COMPLETE
+                    );
+                }
+                // Outside a traversal the cancelled operation changes nothing:
+                // ordinary native API behaviour is unaffected.
+                assert!(!exhausted());
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
     #[test]
     fn exhausted_walk_stops_subsequent_native_requests_and_restores_caller() {
         let calls = Cell::new(0);

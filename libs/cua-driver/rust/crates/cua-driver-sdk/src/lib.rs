@@ -1304,6 +1304,55 @@ impl CuaDriver {
         self.invoke(&name, arguments).await
     }
 
+    /// Invoke a tool under a caller-chosen call id so a later
+    /// [`Self::cancel_call`] can stop exactly this call.
+    ///
+    /// The id is transport identity, never a tool argument: caller-supplied
+    /// reserved arguments are stripped first, exactly as [`Self::call_tool`]
+    /// does, and only this id is added.
+    pub async fn call_tool_with_id(
+        &self,
+        call_id: String,
+        name: String,
+        arguments_json: String,
+    ) -> Result<ToolResult, DriverError> {
+        let mut arguments = parse_arguments(&name, &arguments_json)?;
+        cua_driver_core::tool_args::sanitize_reserved_args(&mut arguments);
+        let DriverBackend::Embedded(runtime) = &self.backend else {
+            // Only a directly owned runtime can be cancelled by id; naming the
+            // call elsewhere would promise a cancel that cannot arrive.
+            return Err(DriverError::Protocol {
+                reason: "call_tool_with_id requires a directly owned embedded runtime".into(),
+            });
+        };
+        if let (false, Some(object)) = (call_id.is_empty(), arguments.as_object_mut()) {
+            object.insert(
+                cua_driver_core::server::CALL_ID_ARG.to_owned(),
+                Value::String(call_id),
+            );
+        }
+        normalize_result(
+            &name,
+            runtime.invoke_from_trusted_adapter(&name, arguments).await?,
+        )
+    }
+
+    /// Request cancellation of one in-flight call by its call id.
+    ///
+    /// Returns whether a live operation carried that id — a cancel always
+    /// races the call it targets, so an unknown id means "already finished",
+    /// not "failed". Cancellation is cooperative: the call stops at its next
+    /// checkpoint, releases any held input, and reports a `cancelled` error
+    /// whose `partial` describes what had already been delivered.
+    pub fn cancel_call(&self, call_id: String) -> Result<bool, DriverError> {
+        match &self.backend {
+            DriverBackend::Embedded(runtime) => runtime.cancel_call(&call_id),
+            _ => Err(DriverError::Protocol {
+                reason: "cancel_call requires a directly owned embedded runtime".into(),
+            }),
+        }
+    }
+
     /// Canonical tool inventory for MCP and other protocol adapters.
     pub async fn list_tools_json(&self) -> Result<String, DriverError> {
         let result = match &self.backend {
@@ -1618,25 +1667,6 @@ impl CuaDriver {
             cua_driver_core::tool_args::sanitize_reserved_args(&mut arguments);
         }
         self.invoke(name, arguments).await
-    }
-
-    /// Request cancellation of one in-flight call by its call id.
-    ///
-    /// The id is the one a trusted adapter stamped on the call (`_call_id`),
-    /// or the id this runtime minted for it. Returns whether a live operation
-    /// carried that id — a cancel always races the call it targets, so an
-    /// unknown id means "already finished", not "failed".
-    ///
-    /// Only an embedded runtime owns the operations it can cancel; daemon,
-    /// remote, and private-worker backends must cancel through their own
-    /// transport and report an error here rather than a silent no-op.
-    pub fn cancel_call(&self, call_id: &str) -> Result<bool, DriverError> {
-        match &self.backend {
-            DriverBackend::Embedded(runtime) => runtime.cancel_call(call_id),
-            _ => Err(DriverError::Protocol {
-                reason: "cancel_call requires a directly owned embedded runtime".into(),
-            }),
-        }
     }
 
     async fn invoke_typed<T: Serialize>(
@@ -2095,7 +2125,7 @@ mod tests {
         CANCELLABLE_HOST_TOOL_STARTED.notified().await;
 
         let started = std::time::Instant::now();
-        assert!(driver.cancel_call("probe-1").unwrap(), "no live call named");
+        assert!(driver.cancel_call("probe-1".to_owned()).unwrap(), "no live call named");
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), call)
             .await
             .expect("cancelled call answered within a second")
@@ -2108,7 +2138,7 @@ mod tests {
         assert_eq!(structured["code"], "cancelled");
         assert_eq!(structured["call_id"], "probe-1");
         assert!(
-            !driver.cancel_call("probe-1").unwrap(),
+            !driver.cancel_call("probe-1".to_owned()).unwrap(),
             "a finished call must not stay cancellable"
         );
         driver.shutdown().await.unwrap();

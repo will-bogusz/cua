@@ -112,7 +112,7 @@ impl SdkAdapter {
     /// Signal one in-flight call to stop. `false` means no live call carried
     /// that id — it finished, or the cancel named a call that never ran.
     pub fn cancel_call(&self, call_id: &str) -> bool {
-        self.driver.cancel_call(call_id).unwrap_or(false)
+        self.driver.cancel_call(call_id.to_owned()).unwrap_or(false)
     }
 
     pub fn history(&self) -> Option<Arc<cua_driver_core::history::HistoryManager>> {
