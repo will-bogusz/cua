@@ -88,6 +88,67 @@ fn has_image(resp: &ToolResponse) -> bool {
     mcp_image || structured_png
 }
 
+/// An opaque AppKit window must reach the image edges at their midpoints.
+/// Avoid rounded corners. A correctly sized PNG with an inset, shadowed window
+/// passes geometry-only validation but fails this independent pixel oracle.
+#[cfg(target_os = "macos")]
+fn opaque_window_reaches_image_edges(image: &image::RgbaImage) -> bool {
+    let (width, height) = image.dimensions();
+    if width < 6 || height < 6 {
+        return false;
+    }
+    [
+        (2, height / 2),
+        (width - 3, height / 2),
+        (width / 2, 2),
+        (width / 2, height - 3),
+    ]
+    .into_iter()
+    .all(|(x, y)| image.get_pixel(x, y).0[3] >= 250)
+}
+
+#[cfg(target_os = "macos")]
+fn assert_unpadded_window_capture(resp: &ToolResponse) {
+    use base64::Engine;
+
+    let encoded = resp.structured()["screenshot_png_b64"]
+        .as_str()
+        .or_else(|| {
+            resp.raw["result"]["content"]
+                .as_array()?
+                .iter()
+                .find(|item| item["type"] == "image")?["data"]
+                .as_str()
+        })
+        .expect("capture response carries PNG bytes");
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("decode screenshot");
+    let image = image::load_from_memory(&png)
+        .expect("decode PNG")
+        .to_rgba8();
+    assert!(
+        opaque_window_reaches_image_edges(&image),
+        "opaque AppKit content is inset inside the reported screenshot frame"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn window_pixel_oracle_rejects_padding_even_when_dimensions_match() {
+    let mut image = image::RgbaImage::from_pixel(1280, 584, image::Rgba([30, 40, 50, 255]));
+    assert!(opaque_window_reaches_image_edges(&image));
+    // Reproduce a shadow-inclusive capture scaled into a shadowless frame:
+    // dimensions still agree, while visible content no longer starts at (0,0).
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        if x < 64 || x >= 1216 || y < 64 || y >= 520 {
+            *pixel = image::Rgba([0, 0, 0, 20]);
+        }
+    }
+    assert_eq!(image.dimensions(), (1280, 584));
+    assert!(!opaque_window_reaches_image_edges(&image));
+}
+
 /// Is the accessibility tree present (the increment-button marker rendered)?
 /// Checks the canonical `tree_markdown` structured field — `som` puts a short
 /// summary in the MCP text block but the full tree only in `tree_markdown`, so
@@ -397,6 +458,17 @@ fn default_returns_tree_and_screenshot() {
                 has_image(&resp),
                 "default response is missing its screenshot"
             );
+            #[cfg(target_os = "macos")]
+            {
+                assert_unpadded_window_capture(&resp);
+                assert!(
+                    matches!(
+                        resp.structured()["screenshot_capture_backend"].as_str(),
+                        Some("sck_screenshot" | "sck_legacy_image" | "screencapture_shadowless")
+                    ),
+                    "capture must name the actual image producer"
+                );
+            }
         },
     );
 }

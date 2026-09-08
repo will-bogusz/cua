@@ -149,6 +149,34 @@ impl Drop for RuntimeSession {
         self.authorization_registry
             .revoke_connection(&self.connection);
         self.authorization_registry.revoke_host(&self.host);
+        // A language finalizer must revoke immediately without waiting for a
+        // native stop callback. Keep the runtime and its cleanup hooks alive
+        // until the abandoned session's platform resources have drained.
+        // Explicit end_session remains the awaited, reportable cleanup path.
+        let session = self.context.runtime_session_key(&self.public_session);
+        if !cua_driver_core::session::has_session_activity(&session)
+            && cua_driver_core::session::session_cleanup_status(&session).complete
+        {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let owner = self
+            .context
+            .transport_session()
+            .map(|transport| self.context.runtime_session_key(transport));
+        if let Some(owner) = owner {
+            if let Err(error) = std::thread::Builder::new()
+                .name("cua-session-cleanup".into())
+                .spawn(move || {
+                    // shutdown waits for this drain; if it won the race, it
+                    // has already ended the runtime's sessions itself.
+                    let _drained = runtime.lifecycle.blocking_read();
+                    cua_driver_core::session::end_session_for_owner(&session, &owner);
+                })
+            {
+                tracing::error!(%error, "could not schedule abandoned session cleanup");
+            }
+        }
     }
 }
 
@@ -161,7 +189,8 @@ pub(crate) struct DriverRuntime {
     /// Calls hold a read guard; shutdown takes the write guard after closing
     /// admission. Therefore shutdown is idempotent and does not return while a
     /// previously admitted operation is still executing.
-    lifecycle: tokio::sync::RwLock<()>,
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
+    operations: Mutex<Vec<std::sync::Weak<cua_driver_core::operation::Cancellation>>>,
     lifecycle_maintenance: Mutex<Option<LifecycleMaintenance>>,
     activity_observer: Option<Arc<dyn DriverActivityObserver>>,
 }
@@ -203,7 +232,8 @@ impl DriverRuntime {
             compatibility_context,
             shutdown: AtomicBool::new(false),
             last_activity: AtomicU64::new(now_unix_secs()),
-            lifecycle: tokio::sync::RwLock::new(()),
+            lifecycle: Arc::new(tokio::sync::RwLock::new(())),
+            operations: Mutex::new(Vec::new()),
             lifecycle_maintenance: Mutex::new(None),
             activity_observer: options.activity_observer.clone(),
         });
@@ -220,23 +250,29 @@ impl DriverRuntime {
         self.compatibility_context.runtime_scope_key()
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
         self.shutdown.store(true, Ordering::Release);
+        self.cancel_operations();
         let _drained = self.lifecycle.write().await;
         self.stop_lifecycle_maintenance();
         self.authorization_registry.revoke_all();
-        let runtime_prefix = format!(
-            "__cua_runtime_{}:",
-            self.compatibility_context.runtime_scope_key()
-        );
-        cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
-        cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
-        cua_driver_core::session::forget_suspended_runtime_scope(
-            &self.compatibility_context.runtime_scope_key(),
-        );
-        cua_driver_core::element_token::global()
-            .clear_runtime_scope(&self.compatibility_context.runtime_scope_key());
-        let _ = self.registry.recording.stop_owner(None);
+        let registry = self.registry.clone();
+        let runtime_scope = self.compatibility_context.runtime_scope_key();
+        tokio::task::spawn_blocking(move || cleanup_runtime_resources(&registry, &runtime_scope))
+            .await
+            .map_err(|error| format!("runtime cleanup task failed: {error}"))?
+    }
+
+    fn cancel_operations(&self) {
+        for operation in self
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+        {
+            operation.cancel();
+        }
     }
 
     fn stop_lifecycle_maintenance(&self) {
@@ -303,92 +339,123 @@ impl DriverRuntime {
             return None;
         }
         self.last_activity.store(now_unix_secs(), Ordering::Relaxed);
-        let _operation = self.lifecycle.read().await;
+        let admission = self.lifecycle.clone().read_owned().await;
         if !self.is_running() {
             return None;
         }
-        let ending_session = (name == "end_session")
-            .then(|| {
-                args.get("session")
+        let cancellation = Arc::new(cua_driver_core::operation::Cancellation::default());
+        {
+            let mut operations = self.operations.lock().unwrap();
+            operations.retain(|operation| operation.strong_count() > 0);
+            operations.push(Arc::downgrade(&cancellation));
+        }
+        if !self.is_running() {
+            cancellation.cancel();
+        }
+        let _cancel_on_drop = cua_driver_core::operation::CancelOnDrop(cancellation.clone());
+        let registry = self.registry.clone();
+        let activity_observer = self.activity_observer.clone();
+        let name = name.to_owned();
+        // The admitted task owns the lease and all native cleanup. Dropping a
+        // language/ABI caller signals cancellation without dropping that task.
+        let work = tokio::spawn(cua_driver_core::operation::scope(
+            cancellation,
+            async move {
+                let _admission = admission;
+                let name = name.as_str();
+                if let Err(error) = cua_driver_core::operation::check() {
+                    return CoreToolResult::error(error.to_string());
+                }
+                let ending_session = (name == "end_session")
+                    .then(|| {
+                        args.get("session")
+                            .and_then(Value::as_str)
+                            .map(|session| context.runtime_session_key(session))
+                    })
+                    .flatten();
+                let public_session = args
+                    .get("session")
                     .and_then(Value::as_str)
-                    .map(|session| context.runtime_session_key(session))
-            })
-            .flatten();
-        let public_session = args
-            .get("session")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        let risk = cua_driver_core::authorization::classify_tool_call(name, &args);
-        let adapters = cua_driver_core::authorization::enforcement_adapters_for_call(name, &args)
-            .into_iter()
-            .map(|adapter| adapter.id.to_owned())
-            .collect::<Vec<_>>();
-        let result = self
-            .registry
-            .invoke_with_context_and_evidence(name, args, context, evidence)
-            .await;
-        if let Some(observer) = self.activity_observer.as_ref() {
-            let refusal_code = result
-                .structured_content
-                .as_ref()
-                .and_then(|value| value.pointer("/refusal/code"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let success = result.is_error != Some(true);
-            observer.on_activity(DriverActivityEvent {
-                kind: if success {
-                    DriverActivityKind::AuthorizedAction
-                } else if refusal_code.is_some() {
-                    DriverActivityKind::AuthorizationRefused
-                } else {
-                    DriverActivityKind::ActionFailed
-                },
-                unix_ms: now_unix_ms(),
-                tool_name: name.to_owned(),
-                adapter_ids: adapters.clone(),
-                risk_class: risk.class.as_str().to_owned(),
-                public_session: public_session.clone(),
-                refusal_code,
-            });
-            if success && name == "start_session" {
-                observer.on_activity(activity_lifecycle_event(
-                    DriverActivityKind::SessionStarted,
-                    name,
-                    public_session.clone(),
-                ));
-            }
-            if success
-                && adapters
-                    .iter()
-                    .any(|adapter| adapter == "browser_prepare.existing_profile")
-            {
-                observer.on_activity(activity_lifecycle_event(
-                    DriverActivityKind::GrantIssued,
-                    name,
-                    public_session.clone(),
-                ));
-            }
-            if success && name == "end_session" {
-                observer.on_activity(activity_lifecycle_event(
-                    DriverActivityKind::GrantRevoked,
-                    name,
-                    public_session.clone(),
-                ));
-                observer.on_activity(activity_lifecycle_event(
-                    DriverActivityKind::SessionEnded,
-                    name,
-                    public_session,
-                ));
-            }
-        }
-        if let Some(session) = ending_session {
-            // `end_session` is a lifecycle boundary: do not report completion
-            // until any recording owned by the session has finalized.
-            let recording = self.registry.recording.clone();
-            let _ = tokio::task::spawn_blocking(move || recording.stop_owner(Some(&session))).await;
-        }
-        Some(result)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                let risk = cua_driver_core::authorization::classify_tool_call(name, &args);
+                let adapters =
+                    cua_driver_core::authorization::enforcement_adapters_for_call(name, &args)
+                        .into_iter()
+                        .map(|adapter| adapter.id.to_owned())
+                        .collect::<Vec<_>>();
+                let result = registry
+                    .invoke_with_context_and_evidence(name, args, context, evidence)
+                    .await;
+                if let Some(observer) = activity_observer.as_ref() {
+                    let refusal_code = result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|value| value.pointer("/refusal/code"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let success = result.is_error != Some(true);
+                    observer.on_activity(DriverActivityEvent {
+                        kind: if success {
+                            DriverActivityKind::AuthorizedAction
+                        } else if refusal_code.is_some() {
+                            DriverActivityKind::AuthorizationRefused
+                        } else {
+                            DriverActivityKind::ActionFailed
+                        },
+                        unix_ms: now_unix_ms(),
+                        tool_name: name.to_owned(),
+                        adapter_ids: adapters.clone(),
+                        risk_class: risk.class.as_str().to_owned(),
+                        public_session: public_session.clone(),
+                        refusal_code,
+                    });
+                    if success && name == "start_session" {
+                        observer.on_activity(activity_lifecycle_event(
+                            DriverActivityKind::SessionStarted,
+                            name,
+                            public_session.clone(),
+                        ));
+                    }
+                    if success
+                        && adapters
+                            .iter()
+                            .any(|adapter| adapter == "browser_prepare.existing_profile")
+                    {
+                        observer.on_activity(activity_lifecycle_event(
+                            DriverActivityKind::GrantIssued,
+                            name,
+                            public_session.clone(),
+                        ));
+                    }
+                    if success && name == "end_session" {
+                        observer.on_activity(activity_lifecycle_event(
+                            DriverActivityKind::GrantRevoked,
+                            name,
+                            public_session.clone(),
+                        ));
+                        observer.on_activity(activity_lifecycle_event(
+                            DriverActivityKind::SessionEnded,
+                            name,
+                            public_session,
+                        ));
+                    }
+                }
+                if let Some(session) = ending_session {
+                    // `end_session` is a lifecycle boundary: do not report completion
+                    // until any recording owned by the session has finalized.
+                    let recording = registry.recording.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || recording.stop_owner(Some(&session)))
+                            .await;
+                }
+                result
+            },
+        ));
+        Some(match work.await {
+            Ok(result) => result,
+            Err(error) => CoreToolResult::error(format!("native operation failed: {error}")),
+        })
     }
 
     pub(crate) fn create_trusted_session(
@@ -446,23 +513,38 @@ fn activity_lifecycle_event(
 
 impl Drop for DriverRuntime {
     fn drop(&mut self) {
-        let was_running = !self.shutdown.swap(true, Ordering::AcqRel);
+        self.shutdown.store(true, Ordering::Release);
+        self.cancel_operations();
         self.stop_lifecycle_maintenance();
         self.authorization_registry.revoke_all();
         let runtime_scope = self.compatibility_context.runtime_scope_key();
-        let runtime_prefix = format!("__cua_runtime_{runtime_scope}:");
-        cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
-        cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
-        cua_driver_core::session::forget_suspended_runtime_scope(&runtime_scope);
-        cua_driver_core::element_token::global().clear_runtime_scope(&runtime_scope);
-        // Explicit `shutdown()` drains work and finalizes recordings. Drop is
-        // runtime-scoped and non-blocking so a retained binding cannot affect
-        // another generation.
-        if was_running {
-            let recording = self.registry.recording.clone();
-            let _ = recording.stop_owner(None);
+        let registry = self.registry.clone();
+        let lifecycle = self.lifecycle.clone();
+        // Preserve the registry and its session hooks while native teardown
+        // runs off the finalizer thread. Explicit shutdown is the awaited path.
+        if let Err(error) = std::thread::Builder::new()
+            .name("cua-runtime-cleanup".into())
+            .spawn(move || {
+                let _drained = lifecycle.blocking_write();
+                if let Err(error) = cleanup_runtime_resources(&registry, &runtime_scope) {
+                    tracing::error!(%error, "abandoned runtime cleanup incomplete");
+                }
+            })
+        {
+            tracing::error!(%error, "could not schedule abandoned runtime cleanup");
         }
     }
+}
+
+fn cleanup_runtime_resources(registry: &ToolRegistry, runtime_scope: &str) -> Result<(), String> {
+    let runtime_prefix = format!("__cua_runtime_{runtime_scope}:");
+    cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
+    registry.drain_runtime_resources()?;
+    cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
+    cua_driver_core::session::forget_suspended_runtime_scope(runtime_scope);
+    cua_driver_core::element_token::global().clear_runtime_scope(runtime_scope);
+    let _ = registry.recording.stop_owner(None);
+    Ok(())
 }
 
 fn permission_denied_result(message: String) -> CoreToolResult {
@@ -730,6 +812,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_reports_native_cleanup_failure_and_retries_only_failed_resources() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().unwrap();
+        let runtime = DriverRuntime::create(standard_options()).unwrap();
+        let failed_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let passed_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = failed_attempts.clone();
+        runtime
+            .registry
+            .retain_fallible_runtime_cleanup("native_stop", move || {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("stop failed".into())
+                } else {
+                    Ok(())
+                }
+            });
+        let attempts = passed_attempts.clone();
+        runtime
+            .registry
+            .retain_fallible_runtime_cleanup("independent_resource", move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        let error = runtime.shutdown().await.unwrap_err();
+        assert!(error.contains("native_stop: stop failed"), "{error}");
+        assert!(!runtime.is_running());
+        assert!(runtime
+            .invoke("get_screen_size", serde_json::json!({}))
+            .await
+            .is_none());
+        runtime.shutdown().await.unwrap();
+        runtime.shutdown().await.unwrap();
+        assert_eq!(failed_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(passed_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_trusted_session_drains_only_its_resources_without_blocking_finalizer() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().unwrap();
+        let runtime = DriverRuntime::create(standard_options()).unwrap();
+        let make_session = |label: &str| {
+            runtime
+                .create_trusted_session(DelegatedSessionRequest {
+                    public_session: label.into(),
+                    transport_session: format!("{label}-transport"),
+                    mode: PermissionMode::Standard,
+                    ttl: Duration::from_secs(60),
+                    idle_ttl: Duration::from_secs(30),
+                    capability_manifest: None,
+                })
+                .unwrap()
+        };
+        let abandoned = make_session("abandoned-rendering-owner");
+        let retained = make_session("retained-rendering-owner");
+        for session in [&abandoned, &retained] {
+            assert_ne!(
+                session
+                    .invoke("start_session", serde_json::json!({}))
+                    .await
+                    .unwrap()
+                    .is_error,
+                Some(true)
+            );
+        }
+        let abandoned_key = runtime
+            .compatibility_context
+            .runtime_session_key("abandoned-rendering-owner");
+        let retained_key = runtime
+            .compatibility_context
+            .runtime_session_key("retained-rendering-owner");
+        let watched_key = abandoned_key.clone();
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let (drained, drained_rx) = std::sync::mpsc::channel();
+        let _hook = cua_driver_core::session::register_scoped_fallible_session_end_hook(
+            "test_abandoned_rendering_drain",
+            move |session| {
+                if session == watched_key {
+                    entered.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|e| e.to_string())?;
+                    drained.send(()).unwrap();
+                }
+                Ok(())
+            },
+        );
+        let (finalized, finalized_rx) = std::sync::mpsc::channel();
+        let finalizer = std::thread::spawn(move || {
+            drop(abandoned);
+            finalized.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        finalized_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("finalizer must return before native cleanup finishes");
+        finalizer.join().unwrap();
+        assert!(
+            runtime.lifecycle.try_write().is_err(),
+            "shutdown must wait for abandoned resource drain"
+        );
+        assert!(cua_driver_core::session::is_session_ended(&abandoned_key));
+        assert!(!cua_driver_core::session::is_session_ended(&retained_key));
+        release.send(()).unwrap();
+        drained_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn authorized_dispatch_refreshes_only_the_runtime_private_activity_key() {
         let _runtime_test = TEST_RUNTIME_LOCK.lock().unwrap();
         let runtime = DriverRuntime::create(standard_options()).unwrap();
@@ -771,7 +964,7 @@ mod tests {
             "continuous authorized traffic must refresh the private idle clock"
         );
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -819,7 +1012,7 @@ mod tests {
             "session-end hook must finalize recording after idle eviction"
         );
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -897,7 +1090,7 @@ mod tests {
             Some("authorization_revoked")
         );
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -906,7 +1099,7 @@ mod tests {
         let runtime = DriverRuntime::create(standard_options()).unwrap();
         assert!(runtime.lifecycle_maintenance.lock().unwrap().is_some());
 
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
 
         assert!(runtime.lifecycle_maintenance.lock().unwrap().is_none());
     }

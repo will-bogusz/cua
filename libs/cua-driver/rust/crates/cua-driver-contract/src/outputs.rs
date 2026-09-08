@@ -287,6 +287,21 @@ fn inactive_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct DisplayIdentityOutput {
+    /// Operating-system display UUID; distinct from the public `primary` selector.
+    pub uuid: String,
+    /// Current native display handle (CGDirectDisplayID on macOS).
+    pub native_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ScreenOriginOutput {
+    /// Global logical coordinates; macOS uses CoreGraphics' top-left origin.
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct DesktopStateOutput {
     #[schemars(schema_with = "platform_schema")]
     pub platform: Platform,
@@ -301,6 +316,10 @@ pub struct DesktopStateOutput {
     pub screen_height: u64,
     #[schemars(schema_with = "number_schema")]
     pub scale_factor: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_identity: Option<DisplayIdentityOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_origin: Option<ScreenOriginOutput>,
     #[schemars(schema_with = "png_mime_schema")]
     pub screenshot_mime_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,6 +351,10 @@ pub struct ScreenSizeOutput {
     pub height: f64,
     #[schemars(schema_with = "number_schema")]
     pub scale_factor: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_identity: Option<DisplayIdentityOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_origin: Option<ScreenOriginOutput>,
     #[serde(flatten)]
     pub extensions: BTreeMap<String, Value>,
 }
@@ -606,6 +629,26 @@ fn nullable_escalation_reason_schema(_: &mut schemars::SchemaGenerator) -> schem
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn display_metadata_round_trips_without_requiring_other_platforms_to_invent_it() {
+        let legacy = json!({"width":1920.0,"height":1080.0,"scale_factor":2.0});
+        let output: ScreenSizeOutput = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(output.display_identity.is_none());
+        assert_eq!(serde_json::to_value(output).unwrap(), legacy);
+        let mut current = legacy;
+        current["display_identity"] = json!({"uuid":"display-a","native_id":7});
+        current["screen_origin"] = json!({"x":0.0,"y":0.0});
+        let output: ScreenSizeOutput = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(serde_json::to_value(output).unwrap(), current);
+        for schema in [
+            ScreenSizeOutput::output_schema(),
+            DesktopStateOutput::output_schema(),
+        ] {
+            assert!(schema["properties"]["display_identity"].is_object());
+            assert!(schema["properties"]["screen_origin"].is_object());
+        }
+    }
 
     fn object_variant(schema: &Value) -> &Value {
         if schema.get("properties").is_some() {

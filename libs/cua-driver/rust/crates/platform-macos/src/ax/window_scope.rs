@@ -14,7 +14,7 @@ use crate::windows::WindowOwner;
 /// What the requested `window_id` turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowScope {
-    /// A top-level AXWindow reported the requested CGWindowID.
+    /// An AXWindow or an explicitly attached AXSheet reported the requested CGWindowID.
     Matched,
     /// WindowServer has no record of the requested CGWindowID — closed,
     /// stale, or fabricated.
@@ -53,8 +53,7 @@ pub struct TopLevelCandidate {
     /// report `AXStandardWindow` rather than a dialog subrole, but identify
     /// themselves as `open-panel` / `save-panel`.
     pub identifier: Option<String>,
-    /// `_AXUIElementGetWindow` result, when the SPI resolved one. Only read
-    /// for `AXWindow` roles.
+    /// `_AXUIElementGetWindow` result for an AXWindow or attached AXSheet.
     pub ax_window_id: Option<u32>,
 }
 
@@ -118,6 +117,13 @@ pub fn scope_from_owner(owner: &WindowOwner) -> Option<WindowScope> {
     }
 }
 
+/// An independently mapped attached sheet has its own control scope. Its
+/// subtree must not mint tokens for the document window being observed.
+pub fn is_related_sheet(role: &str, requested: Option<u32>, mapped: Option<u32>) -> bool {
+    role == "AXSheet"
+        && matches!((requested, mapped), (Some(parent), Some(sheet)) if parent != sheet)
+}
+
 /// Decide what a window-scoped walk of `candidates` should cover.
 ///
 /// `resolve_owner` is only invoked when no candidate claims `requested` — the
@@ -133,7 +139,9 @@ where
     let matched: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.role == "AXWindow" && c.ax_window_id == Some(requested))
+        .filter(|(_, c)| {
+            matches!(c.role.as_str(), "AXWindow" | "AXSheet") && c.ax_window_id == Some(requested)
+        })
         .map(|(i, _)| i)
         .collect();
 
@@ -160,12 +168,15 @@ where
     // menu navigation with no replacement path. Keeping other non-window
     // children is also what `browser/consent_ui.rs` relies on to reach a
     // top-level `AXSheet` consent prompt.
-    let dialog_scope = matched.iter().any(|&i| candidates[i].is_dialog_like());
+    let sheet_scope = matched.iter().any(|&i| candidates[i].role == "AXSheet");
+    let dialog_scope = sheet_scope || matched.iter().any(|&i| candidates[i].is_dialog_like());
     let walk = candidates
         .iter()
         .enumerate()
         .filter(|(i, c)| {
-            (c.role != "AXWindow" || matched.contains(i))
+            (!sheet_scope || matched.contains(i))
+                && (matched.contains(i)
+                    || (c.role != "AXWindow" && !(c.role == "AXSheet" && c.ax_window_id.is_some())))
                 && !(dialog_scope && c.role == "AXMenuBar")
         })
         .map(|(i, _)| i)
@@ -179,6 +190,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attached_sheet_requires_an_independent_mapped_identity() {
+        assert!(is_related_sheet("AXSheet", Some(11), Some(22)));
+        assert!(!is_related_sheet("AXSheet", Some(22), Some(22)));
+        assert!(!is_related_sheet("AXSheet", Some(11), None));
+        assert!(!is_related_sheet("AXSheet", None, Some(22)));
+        assert!(!is_related_sheet("AXWindow", Some(11), Some(22)));
+        assert!(!is_related_sheet("AXButton", Some(11), Some(22)));
+    }
 
     fn panel_service_owner() -> WindowOwner {
         WindowOwner::ForeignPid {
@@ -285,6 +306,25 @@ mod tests {
         let d = decide_window_scope(&candidates, 67340, || WindowOwner::SamePid);
         assert_eq!(d.scope, WindowScope::AxUnresolved { ax_window_count: 0 });
         assert!(d.walk.is_empty());
+    }
+
+    #[test]
+    fn mapped_sheet_is_scoped_without_parent_sibling_or_menu_controls() {
+        let candidates = [
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXWindow", Some(11)),
+            TopLevelCandidate::new("AXSheet", Some(22)),
+            TopLevelCandidate::new("AXSheet", Some(33)),
+            TopLevelCandidate::new("AXSheet", None),
+        ];
+        let sheet = decide_window_scope(&candidates, 22, never_called);
+        assert_eq!(sheet.scope, WindowScope::Matched);
+        assert_eq!(sheet.walk, vec![2]);
+        let parent = decide_window_scope(&candidates, 11, never_called);
+        assert_eq!(parent.walk, vec![0, 1, 4]);
+        let missing = decide_window_scope(&candidates, 44, || WindowOwner::SamePid);
+        assert!(!missing.scope.is_matched());
+        assert!(missing.walk.is_empty());
     }
 
     /// A resolved window still carries its sibling sheets — `consent_ui.rs`

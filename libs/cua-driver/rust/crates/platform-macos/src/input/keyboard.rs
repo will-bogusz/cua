@@ -9,6 +9,7 @@ use core_graphics::{
     event::{CGEvent, CGEventFlags},
     event_source::{CGEventSource, CGEventSourceStateID},
 };
+use cua_driver_core::operation;
 use foreign_types::ForeignType;
 
 const SCREEN_SHARING_BUNDLE_ID: &str = "com.apple.ScreenSharing";
@@ -32,23 +33,20 @@ pub fn is_screen_sharing_pid(pid: i32) -> bool {
 
 /// Press and release a single key, delivered to `pid` without stealing focus.
 pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    // Handle "+" / "plus" → Shift+= (US keyboard layout).
-    if key == "+" || key.to_lowercase() == "plus" {
-        let flags = modifier_flags(&["shift"]);
-        let eq_code = key_name_to_code("=")?;
-        post_key(pid, eq_code, true, modifier_flags(modifiers) | flags)?;
-        std::thread::sleep(std::time::Duration::from_millis(8));
-        post_key(pid, eq_code, false, modifier_flags(modifiers) | flags)?;
-        return Ok(());
-    }
-
-    let key_code = key_name_to_code(key)?;
-    let flags = modifier_flags(modifiers);
-
-    post_key(pid, key_code, true, flags)?;
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    post_key(pid, key_code, false, flags)?;
-    Ok(())
+    operation::check()?;
+    let (key, flags) = if key == "+" || key.eq_ignore_ascii_case("plus") {
+        ("=", modifier_flags(modifiers) | modifier_flags(&["shift"]))
+    } else {
+        (key, modifier_flags(modifiers))
+    };
+    prepared_key_pair(
+        KeyDelivery::Pid {
+            pid,
+            authenticated: true,
+        },
+        key_name_to_code(key)?,
+        flags,
+    )
 }
 
 /// Type a string character-by-character to `pid`.
@@ -57,6 +55,7 @@ pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
     for ch in text.chars() {
+        operation::check()?;
         let ch_str = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
@@ -65,15 +64,15 @@ pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
         // state; without this, uppercase chars (e.g. 'E') are seen as Shift+e
         // and the modifier leaks into the next character (Swift fix: event.flags = []).
         down.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &down);
-        std::thread::sleep(std::time::Duration::from_millis(8));
-
         let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
         up.set_string(&ch_str);
         up.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &up);
+        post_keyboard_event(pid, &down);
         std::thread::sleep(std::time::Duration::from_millis(8));
+
+        post_keyboard_event(pid, &up);
+        operation::sleep(std::time::Duration::from_millis(8))?;
     }
     Ok(())
 }
@@ -85,25 +84,26 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
     for ch in text.chars() {
+        operation::check()?;
         let ch_str = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
         down.set_string(&ch_str);
         down.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &down);
-        std::thread::sleep(std::time::Duration::from_millis(8));
-
         let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
         up.set_string(&ch_str);
         up.set_flags(CGEventFlags::CGEventFlagNull);
+        post_keyboard_event(pid, &down);
+        std::thread::sleep(std::time::Duration::from_millis(8));
+
         post_keyboard_event(pid, &up);
 
         // Additional inter-character delay on top of the 8 ms internal gap.
         if inter_char_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
+            operation::sleep(std::time::Duration::from_millis(inter_char_delay_ms))?;
         } else {
-            std::thread::sleep(std::time::Duration::from_millis(8));
+            operation::sleep(std::time::Duration::from_millis(8))?;
         }
     }
     Ok(())
@@ -121,176 +121,158 @@ pub fn hotkey(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
 /// sees those events. Without the envelope the path goes through IOHIDPostEvent
 /// so NSApplication.sendEvent: dispatches NSMenu key equivalents.
 pub fn hotkey_no_auth(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    let key_code = key_name_to_code(key)?;
-    let flags = modifier_flags(modifiers);
-    post_key_no_auth(pid, key_code, true, flags)?;
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    post_key_no_auth(pid, key_code, false, flags)?;
-    Ok(())
+    press_key_no_auth(pid, key, modifiers)
 }
 
-/// Press and release a single key to `pid` WITHOUT the auth-message envelope.
-/// Works for single keys as well as combinations (same as hotkey_no_auth for single key).
 pub fn press_key_no_auth(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    let key_code = key_name_to_code(key)?;
-    let flags = modifier_flags(modifiers);
-    post_key_no_auth(pid, key_code, true, flags)?;
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    post_key_no_auth(pid, key_code, false, flags)?;
-    Ok(())
+    prepared_key_pair(
+        KeyDelivery::Pid {
+            pid,
+            authenticated: false,
+        },
+        key_name_to_code(key)?,
+        modifier_flags(modifiers),
+    )
 }
 
-/// Press and release one key on the global HID queue.
-///
-/// This is reserved for an explicitly approved, bounded foreground assist.
-/// Callers must prove and temporarily activate the exact target window before
-/// invoking it; unlike the PID-routed helpers above, the HID queue itself has
-/// no process addressing.
+/// Foreground chords hold only their prepared modifier pairs, then release
+/// them in reverse order even if base-key preparation or the gesture fails.
 pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    use core_graphics::event::CGEventTapLocation;
-
-    let key_code = key_name_to_code(key)?;
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let mut active_flags = CGEventFlags::CGEventFlagNull;
-    let mut pressed_modifiers: Vec<(u16, CGEventFlags)> = Vec::new();
-
-    // A flag-only base-key event can leave the HID modifier state latched on
-    // macOS. Model a physical chord instead: modifier downs in caller order,
-    // base down/up, then modifier ups in reverse order. This also matches the
-    // Windows SendInput and Linux XTest implementations.
-    for modifier in modifiers {
-        let Some((modifier_code, modifier_flag)) = modifier_key_code_and_flag(modifier) else {
-            continue;
-        };
-        if pressed_modifiers
-            .iter()
-            .any(|(pressed_code, _)| *pressed_code == modifier_code)
-        {
-            continue;
-        }
-        active_flags |= modifier_flag;
-        if let Err(error) = post_global_key(
-            &source,
-            modifier_code,
-            true,
-            active_flags,
-            CGEventTapLocation::HID,
-        ) {
-            release_global_modifiers(
-                &source,
-                &pressed_modifiers,
-                active_flags,
-                CGEventTapLocation::HID,
-            );
-            return Err(error);
-        }
-        pressed_modifiers.push((modifier_code, modifier_flag));
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
-
-    let result = (|| {
-        post_global_key(
-            &source,
-            key_code,
-            true,
-            active_flags,
-            CGEventTapLocation::HID,
-        )?;
-        std::thread::sleep(std::time::Duration::from_millis(8));
-        post_global_key(
-            &source,
-            key_code,
-            false,
-            active_flags,
-            CGEventTapLocation::HID,
-        )
-    })();
-
-    release_global_modifiers(
-        &source,
-        &pressed_modifiers,
-        active_flags,
-        CGEventTapLocation::HID,
-    );
-    result
+    let code = key_name_to_code(key)?;
+    with_global_modifier_keys(modifiers, |flags| {
+        prepared_key_pair(KeyDelivery::Global, code, flags)
+    })
 }
 
-/// Hold physical modifier keys on the global HID queue around one pointer
-/// gesture, then release them in reverse order even when the gesture fails.
-///
-/// This is only safe inside an exact-window foreground activation guard. The
-/// caller receives the live modifier flags so every mouse event in the gesture
-/// carries the same state as the physical key transitions.
-pub(super) fn with_global_modifier_keys<T>(
-    modifiers: &[&str],
-    gesture: impl FnOnce(CGEventFlags) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    use core_graphics::event::CGEventTapLocation;
-
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let mut active_flags = CGEventFlags::CGEventFlagNull;
-    let mut pressed = Vec::new();
-
-    for modifier in modifiers {
-        let Some((key_code, flag)) = modifier_key_code_and_flag(modifier) else {
-            continue;
-        };
-        if pressed
-            .iter()
-            .any(|(pressed_code, _)| *pressed_code == key_code)
-        {
-            continue;
+#[derive(Clone, Copy)]
+enum KeyDelivery {
+    Global,
+    Pid { pid: i32, authenticated: bool },
+}
+impl KeyDelivery {
+    fn post(self, event: &CGEvent) {
+        match self {
+            Self::Global => event.post(core_graphics::event::CGEventTapLocation::HID),
+            Self::Pid {
+                pid,
+                authenticated: true,
+            } => post_keyboard_event(pid, event),
+            Self::Pid {
+                pid,
+                authenticated: false,
+            } => {
+                if !crate::input::skylight::post_to_pid(
+                    pid as libc::pid_t,
+                    event.as_ptr() as *mut std::ffi::c_void,
+                    false,
+                ) {
+                    event.post_to_pid(pid as libc::pid_t);
+                }
+            }
         }
-        active_flags |= flag;
-        if let Err(error) = post_global_key(
-            &source,
-            key_code,
-            true,
-            active_flags,
-            CGEventTapLocation::HID,
-        ) {
-            release_global_modifiers(&source, &pressed, active_flags, CGEventTapLocation::HID);
-            return Err(error);
-        }
-        pressed.push((key_code, flag));
-        std::thread::sleep(std::time::Duration::from_millis(8));
     }
-
-    let result = gesture(active_flags);
-    release_global_modifiers(&source, &pressed, active_flags, CGEventTapLocation::HID);
-    result
 }
 
-fn post_global_key(
+fn prepare_key_event(
     source: &CGEventSource,
-    key_code: u16,
-    key_down: bool,
+    code: u16,
+    down: bool,
     flags: CGEventFlags,
-    tap: core_graphics::event::CGEventTapLocation,
-) -> anyhow::Result<()> {
-    let event = CGEvent::new_keyboard_event(source.clone(), key_code, key_down)
-        .map_err(|_| anyhow::anyhow!("CGEvent keyboard event creation failed"))?;
+) -> anyhow::Result<CGEvent> {
+    let event = CGEvent::new_keyboard_event(source.clone(), code, down)
+        .map_err(|_| anyhow::anyhow!("keyboard event preparation failed"))?;
     event.set_flags(flags);
-    event.post(tap);
-    Ok(())
+    Ok(event)
 }
 
-fn release_global_modifiers(
-    source: &CGEventSource,
-    pressed: &[(u16, CGEventFlags)],
-    mut active_flags: CGEventFlags,
-    tap: core_graphics::event::CGEventTapLocation,
-) {
-    for &(key_code, flag) in pressed.iter().rev() {
-        active_flags.remove(flag);
-        if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), key_code, false) {
-            event.set_flags(active_flags);
-            event.post(tap);
+/// Allocation completes before the matching down can be sent. The same
+/// prepared release is used on success, cancellation and unwind.
+fn prepared_key_pair(delivery: KeyDelivery, code: u16, flags: CGEventFlags) -> anyhow::Result<()> {
+    operation::check()?;
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let pair = (
+        prepare_key_event(&source, code, true, flags)?,
+        prepare_key_event(&source, code, false, flags)?,
+    );
+    with_pressed_pairs(&[pair], |event| delivery.post(event), || Ok(()))
+}
+
+/// Native posting is infallible after event preparation. This small generic
+/// state machine is also exercised against a receiver journal without sending
+/// test keys into the user's desktop.
+fn with_pressed_pairs<E, R>(
+    pairs: &[(E, E)],
+    post: impl Fn(&E),
+    gesture: impl FnOnce() -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    let pressed = std::cell::Cell::new(0);
+    let release = operation::ReleaseOnDrop::new(|| {
+        for (_, up) in pairs.iter().take(pressed.get()).rev() {
+            post(up);
+            std::thread::sleep(std::time::Duration::from_millis(8));
         }
-        std::thread::sleep(std::time::Duration::from_millis(8));
+    });
+    for (down, _) in pairs {
+        operation::check()?;
+        pressed.set(pressed.get() + 1);
+        post(down);
+        operation::sleep(std::time::Duration::from_millis(8))?;
     }
+    operation::check()?;
+    let result = gesture();
+    drop(release);
+    result
+}
+
+fn with_modifier_keys<R>(
+    delivery: KeyDelivery,
+    modifiers: &[&str],
+    gesture: impl FnOnce(CGEventFlags) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    operation::check()?;
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let mut flags = CGEventFlags::CGEventFlagNull;
+    let mut codes = Vec::new();
+    let mut pairs = Vec::new();
+    for modifier in modifiers {
+        let Some((code, flag)) = modifier_key_code_and_flag(modifier) else {
+            continue;
+        };
+        if codes.contains(&code) {
+            continue;
+        }
+        codes.push(code);
+        let previous = flags;
+        flags |= flag;
+        pairs.push((
+            prepare_key_event(&source, code, true, flags)?,
+            prepare_key_event(&source, code, false, previous)?,
+        ));
+    }
+    with_pressed_pairs(&pairs, |event| delivery.post(event), || gesture(flags))
+}
+
+pub(super) fn with_global_modifier_keys<R>(
+    modifiers: &[&str],
+    gesture: impl FnOnce(CGEventFlags) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    with_modifier_keys(KeyDelivery::Global, modifiers, gesture)
+}
+pub(super) fn with_pid_modifier_keys<R>(
+    pid: i32,
+    modifiers: &[&str],
+    gesture: impl FnOnce() -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    with_modifier_keys(
+        KeyDelivery::Pid {
+            pid,
+            authenticated: true,
+        },
+        modifiers,
+        |_| gesture(),
+    )
 }
 
 fn modifier_key_code_and_flag(modifier: &str) -> Option<(u16, CGEventFlags)> {
@@ -304,57 +286,6 @@ fn modifier_key_code_and_flag(modifier: &str) -> Option<(u16, CGEventFlags)> {
     }
 }
 
-/// Hold PID-routed modifier keys around one pointer gesture and release them in
-/// reverse order even when the gesture fails.
-///
-/// Mouse-event flag bits alone are not a sufficient physical-modifier model for
-/// every AppKit host (Finder's collection views are a notable example). Pairing
-/// the flagged mouse events with real modifier down/up transitions gives the
-/// target the same ordered state it receives for a keyboard chord without
-/// putting those transitions on the global HID queue.
-pub(super) fn with_pid_modifier_keys<T>(
-    pid: i32,
-    modifiers: &[&str],
-    gesture: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let mut active_flags = CGEventFlags::CGEventFlagNull;
-    let mut pressed = Vec::new();
-    for modifier in modifiers {
-        let Some((key_code, flag)) = modifier_key_code_and_flag(modifier) else {
-            continue;
-        };
-        if pressed
-            .iter()
-            .any(|(pressed_code, _)| *pressed_code == key_code)
-        {
-            continue;
-        }
-        active_flags |= flag;
-        if let Err(error) = post_key(pid, key_code, true, active_flags) {
-            release_pid_modifiers(pid, &pressed, active_flags);
-            return Err(error);
-        }
-        pressed.push((key_code, flag));
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
-
-    let result = gesture();
-    release_pid_modifiers(pid, &pressed, active_flags);
-    result
-}
-
-fn release_pid_modifiers(
-    pid: i32,
-    pressed: &[(u16, CGEventFlags)],
-    mut active_flags: CGEventFlags,
-) {
-    for &(key_code, flag) in pressed.iter().rev() {
-        active_flags.remove(flag);
-        let _ = post_key(pid, key_code, false, active_flags);
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
-}
-
 /// Type Unicode text into the frontmost application through the global HID
 /// queue. This is the desktop-scope counterpart to PID-routed `type_text` and
 /// mirrors computer-server's frontmost pynput typing behavior.
@@ -364,19 +295,20 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     for ch in text.chars() {
+        operation::check()?;
         let value = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
         down.set_string(&value);
         down.set_flags(CGEventFlags::CGEventFlagNull);
-        down.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(8));
         let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
         up.set_string(&value);
         up.set_flags(CGEventFlags::CGEventFlagNull);
+        down.post(CGEventTapLocation::HID);
+        std::thread::sleep(std::time::Duration::from_millis(8));
         up.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms.max(8)));
+        operation::sleep(std::time::Duration::from_millis(inter_char_delay_ms.max(8)))?;
     }
     Ok(())
 }
@@ -390,6 +322,7 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
 /// payload carried by keycode 0, so the ordinary text synthesis path cannot be
 /// used for them.
 pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
+    operation::check()?;
     use core_graphics::event::CGEventTapLocation;
 
     // Validate the complete payload before posting its first event. A string
@@ -399,6 +332,7 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
         .map(physical_text_events)
         .collect::<anyhow::Result<Vec<_>>>()?;
     for events in event_groups {
+        operation::check()?;
         let native_events = events
             .iter()
             .map(|event| create_bare_keyboard_event(event.key_code, event.key_down))
@@ -420,6 +354,7 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
 /// event-type overrides are applied; CoreGraphics derives those from the
 /// virtual key transitions and its default source state.
 pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
+    operation::check()?;
     use core_graphics::event::CGEventTapLocation;
 
     let key_code = key_name_to_code(key)?;
@@ -596,38 +531,6 @@ pub(super) fn post_keyboard_event(pid: i32, event: &CGEvent) {
     if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, true) {
         event.post_to_pid(pid as libc::pid_t);
     }
-}
-
-fn post_key(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> anyhow::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let event = CGEvent::new_keyboard_event(source, key_code, key_down)
-        .map_err(|_| anyhow::anyhow!("CGEvent::new_keyboard_event failed"))?;
-    // HIDSystemState can inherit physically held modifiers. Always overwrite
-    // the event flags, including the empty case, so an unrelated Shift/Caps
-    // state cannot leak into a targeted key press.
-    event.set_flags(flags);
-    post_keyboard_event(pid, &event);
-    Ok(())
-}
-
-fn post_key_no_auth(
-    pid: i32,
-    key_code: u16,
-    key_down: bool,
-    flags: CGEventFlags,
-) -> anyhow::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let event = CGEvent::new_keyboard_event(source, key_code, key_down)
-        .map_err(|_| anyhow::anyhow!("CGEvent::new_keyboard_event failed"))?;
-    event.set_flags(flags);
-    let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
-    // attach_auth_message = false → IOHIDPostEvent path → NSMenu fires
-    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false) {
-        event.post_to_pid(pid as libc::pid_t);
-    }
-    Ok(())
 }
 
 fn modifier_flags(modifiers: &[&str]) -> CGEventFlags {
@@ -881,5 +784,81 @@ mod tests {
         assert!(is_screen_sharing_bundle_id("com.apple.ScreenSharing"));
         assert!(!is_screen_sharing_bundle_id("com.apple.screensharing"));
         assert!(!is_screen_sharing_bundle_id("com.microsoft.rdc.macos"));
+    }
+}
+
+#[cfg(test)]
+mod held_key_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancellation_without_modifiers_still_prevents_the_gesture() {
+        let control = std::sync::Arc::new(operation::Cancellation::default());
+        control.cancel();
+        let called = std::cell::Cell::new(false);
+        let result = operation::scope(control, async {
+            with_pressed_pairs::<u8, _>(
+                &[],
+                |_| panic!("no keys"),
+                || {
+                    called.set(true);
+                    Ok(())
+                },
+            )
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!called.get());
+    }
+
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cancellation_releases_only_pressed_keys_without_entering_the_gesture() {
+        let control = Arc::new(operation::Cancellation::default());
+        let cancel = control.clone();
+        let journal = RefCell::new(Vec::new());
+        let result = operation::scope(control, async {
+            with_pressed_pairs(
+                &[("shift-down", "shift-up"), ("cmd-down", "cmd-up")],
+                |event| {
+                    journal.borrow_mut().push(*event);
+                    if *event == "shift-down" {
+                        cancel.cancel();
+                    }
+                },
+                || -> anyhow::Result<()> { panic!("cancelled gesture must not run") },
+            )
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*journal.borrow(), ["shift-down", "shift-up"]);
+    }
+    #[test]
+    fn callback_error_releases_modifiers_in_reverse_order() {
+        let journal = RefCell::new(Vec::new());
+        let result = with_pressed_pairs(
+            &[("shift-down", "shift-up"), ("cmd-down", "cmd-up")],
+            |event| journal.borrow_mut().push(*event),
+            || -> anyhow::Result<()> { anyhow::bail!("base key preparation failed") },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            *journal.borrow(),
+            ["shift-down", "cmd-down", "cmd-up", "shift-up"]
+        );
+    }
+    #[test]
+    fn callback_unwind_releases_all_owned_keys() {
+        let journal = RefCell::new(Vec::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_pressed_pairs(
+                &[("down", "up")],
+                |event| journal.borrow_mut().push(*event),
+                || -> anyhow::Result<()> { panic!("gesture unwound") },
+            )
+        }));
+        assert!(result.is_err());
+        assert_eq!(*journal.borrow(), ["down", "up"]);
     }
 }

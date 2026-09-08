@@ -61,7 +61,10 @@ impl Tool for MoveCursorTool {
                 Err(result) => return result,
             };
             let (x, y) = (input.x, input.y);
-            let (x, y) = super::desktop_screenshot_point(x, y).await;
+            let (x, y) = match super::desktop_screenshot_point(x, y).await {
+                Ok(point) => point,
+                Err(error) => return error,
+            };
             let result =
                 tokio::task::spawn_blocking(move || crate::input::mouse::move_cursor_desktop(x, y))
                     .await;

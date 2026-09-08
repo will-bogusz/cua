@@ -177,7 +177,7 @@ impl Tool for TypeTextTool {
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::operation::spawn_blocking(move || {
                 crate::input::keyboard::type_text_global(&text, delay_ms)
             })
             .await;
@@ -332,10 +332,11 @@ impl Tool for TypeTextTool {
         }
         if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
             let center_ptr = element.as_ptr() as usize;
-            if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-                crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
-            })
-            .await
+            if let Ok(Some((screen_x, screen_y))) =
+                cua_driver_core::operation::spawn_blocking(move || unsafe {
+                    crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
+                })
+                .await
             {
                 let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
                 crate::cursor::overlay::send_command(
@@ -377,7 +378,7 @@ impl Tool for TypeTextTool {
             prior_front,
             "type_text.AXSelectedText",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::operation::spawn_blocking(move || {
                     type_text_blocking(
                         pid,
                         &text_clone,
@@ -800,7 +801,7 @@ async fn background_keyboard_policy(
         decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
     };
     let lease = super::acquire_background_mutation(pid).await;
-    let facts = match tokio::task::spawn_blocking(move || {
+    let facts = match cua_driver_core::operation::spawn_blocking(move || {
         crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
     })
     .await
