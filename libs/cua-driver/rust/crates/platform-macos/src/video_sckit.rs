@@ -23,7 +23,9 @@
 //!      atom) and returns the elapsed-time metadata.
 
 use std::path::Path;
-use std::time::Instant;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cua_driver_core::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
@@ -43,13 +45,40 @@ impl VideoBackendFactory for SckitVideoBackendFactory {
     }
 }
 
+/// Deadline for `SCStream::start_capture`.
+///
+/// The binding awaits Apple's completion handler on an unbounded condvar
+/// (`SyncCompletion::wait`). When the capture stack wedges for a given client
+/// process, that handler is never called and the wait never returns: starting
+/// a recording hangs the calling thread for the life of the process, with no
+/// error and no way to give up. Bound the wait and report a timeout instead.
+const CAPTURE_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `work` on a thread we are willing to abandon, and give up after
+/// `timeout`.
+///
+/// On timeout the thread is left running; it still owns everything it captured
+/// (here the `Arc`-shared stream and recording output), so abandoning it is
+/// sound — the native objects are released whenever Apple finally answers.
+fn bounded<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    timeout: Duration,
+) -> Result<T, Duration> {
+    let (done, finished) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    finished.recv_timeout(timeout).map_err(|_| timeout)
+}
+
 pub struct SckitVideoBackend {
-    stream: SCStream,
+    stream: Arc<SCStream>,
     // SCStream's add_recording_output is non-owning — Apple's API requires
     // the SCRecordingOutput stay alive for the stream's lifetime, so we
     // keep it parked here. Dropping it before stop_capture aborts the
-    // encode mid-file.
-    _recording: SCRecordingOutput,
+    // encode mid-file. Shared with the bounded start so a timed-out start
+    // cannot drop it out from under a native call that is still running.
+    _recording: Arc<SCRecordingOutput>,
     output_path: std::path::PathBuf,
     started_at: Instant,
 }
@@ -108,21 +137,37 @@ impl SckitVideoBackend {
             .with_video_codec(SCRecordingOutputCodec::H264)
             .with_output_file_type(SCRecordingOutputFileType::MP4);
 
-        let recording = SCRecordingOutput::new(&rec_config).ok_or_else(|| {
+        let recording = Arc::new(SCRecordingOutput::new(&rec_config).ok_or_else(|| {
             anyhow::anyhow!(
                 "SCRecordingOutput::new returned nil — macOS 15.0+ is required for \
                  native ScreenCaptureKit video; older macOS needs to use the ffmpeg \
                  backend (currently disabled on macOS)."
             )
-        })?;
+        })?);
 
-        let stream = SCStream::new(&filter, &config);
+        let stream = Arc::new(SCStream::new(&filter, &config));
         stream
             .add_recording_output(&recording)
             .map_err(|e| anyhow::anyhow!("SCStream::add_recording_output failed: {e}"))?;
-        stream
-            .start_capture()
-            .map_err(|e| anyhow::anyhow!("SCStream::start_capture failed: {e}"))?;
+        // Hand the start to a thread we can abandon: a wedged capture stack
+        // never calls Apple's completion handler, and the binding's wait for it
+        // has no deadline of its own.
+        let starting = (stream.clone(), recording.clone());
+        bounded(
+            move || {
+                let (stream, _recording) = starting;
+                stream.start_capture()
+            },
+            CAPTURE_START_TIMEOUT,
+        )
+        .map_err(|waited| {
+            anyhow::anyhow!(
+                "SCStream::start_capture did not complete within {} s — the capture stack \
+                 is not answering; recording was not started",
+                waited.as_secs()
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("SCStream::start_capture failed: {e}"))?;
 
         tracing::info!(
             target: "recording",
@@ -159,5 +204,53 @@ impl VideoBackend for SckitVideoBackend {
             duration_ms: elapsed.as_millis() as u64,
             finalized,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Stands in for Apple's start-capture completion handler: a caller parks
+    /// on it exactly like the binding's `SyncCompletion::wait`, and this one
+    /// never fires.
+    fn never_fires(entered: Arc<AtomicBool>) -> impl FnOnce() -> Result<(), String> + Send {
+        move || {
+            entered.store(true, Ordering::SeqCst);
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    #[test]
+    fn a_completion_that_never_fires_times_out_instead_of_parking_the_caller() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let deadline = Duration::from_millis(150);
+        let started = Instant::now();
+        let outcome = bounded(never_fires(entered.clone()), deadline);
+        let waited = started.elapsed();
+        assert_eq!(outcome, Err(deadline));
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the abandoned thread must actually have reached the wait"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "the caller must return at its own deadline, not the completion's: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_completion_that_fires_delivers_its_result() {
+        assert_eq!(
+            bounded(
+                || Err::<(), String>("native refused".into()),
+                CAPTURE_START_TIMEOUT
+            ),
+            Ok(Err("native refused".into()))
+        );
+        assert_eq!(bounded(|| 7u8, CAPTURE_START_TIMEOUT), Ok(7));
     }
 }
