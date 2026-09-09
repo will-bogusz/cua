@@ -195,7 +195,17 @@ fn def() -> &'static ToolDef {
             effect:\"unverifiable\" without implying delivery failure or recommending foreground. \
             Key names: return, tab, escape, up/down/left/right, space, delete, \
             home, end, pageup, pagedown, f1-f12, plus any letter or digit. \
-            Modifiers array: cmd, shift, option/alt, ctrl, fn.".into(),
+            Modifiers array: cmd, shift, option/alt, ctrl, fn.\n\n\
+            SHEETS (modal panels attached to a window): background Escape cannot \
+            dismiss one. A sheet and the window it is attached to are two \
+            same-pid keyboard destinations, so this refuses with \
+            same_pid_keyboard_ambiguity at the sheet's window_id AND at the host \
+            window's. Dismiss it the exact way instead: get_window_state on the \
+            host window reports the sheet under related_windows, snapshot THAT \
+            window_id, and `click` the sheet's Cancel/Close button with the \
+            default action:\"press\" (AppKit sheets and their buttons do not \
+            expose AXCancel, so click action:\"cancel\" returns \
+            actionUnsupported).".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["key"],

@@ -125,6 +125,134 @@ unsafe fn element_is_app_menu_descendant(element: AXUIElementRef, pid: i32) -> b
     in_menu_bar
 }
 
+/// How the sheet an element lives in relates to the requested window.
+///
+/// AppKit answers `AXWindow` for a control inside a sheet with the window the
+/// sheet is attached to, never the sheet, while `_AXUIElementGetWindow` maps
+/// the control to the sheet's own CGWindowID. Window ancestry through
+/// [`element_window_id`] therefore always points away from a sheet, in both
+/// directions, and neither answer is a reason to refuse the element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SheetAncestry {
+    /// The requested window IS the sheet the element lives in. The element is
+    /// exactly addressed: the sheet is its own WindowServer window and, while
+    /// modal, the key window of its application.
+    RequestedWindowIsTheSheet,
+    /// The element lives in a sheet attached to the requested window. The
+    /// sheet's own CGWindowID when WindowServer gave it one — the identity
+    /// `get_window_state` reports for it under `related_windows`, which is
+    /// the scope the caller can re-target. `None` when the sheet has no
+    /// CGWindowID of its own, in which case it is composited into the
+    /// requested window and that window is its only scope.
+    AttachedToRequestedWindow(Option<u32>),
+}
+
+/// Resolve `element`'s nearest `AXSheet` ancestor against `target_window_id`.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn sheet_ancestry(
+    element: AXUIElementRef,
+    target_window_id: u32,
+) -> Option<SheetAncestry> {
+    let mut current: AXUIElementRef = element;
+    let mut owned = false;
+    let mut ancestry = None;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        match copy_string_attr(current, "AXRole").as_deref() {
+            Some("AXSheet") => {
+                let sheet_window_id = ax_get_window_id(current);
+                if sheet_window_id == Some(target_window_id) {
+                    ancestry = Some(SheetAncestry::RequestedWindowIsTheSheet);
+                    break;
+                }
+                let attached_to = copy_element_attr(current, "AXParent").and_then(|parent| {
+                    let id = ax_get_window_id(parent);
+                    CFRelease(parent as CFTypeRef);
+                    id
+                });
+                if attached_to == Some(target_window_id) {
+                    ancestry = Some(SheetAncestry::AttachedToRequestedWindow(sheet_window_id));
+                }
+                break;
+            }
+            Some("AXWindow" | "AXApplication") | None => break,
+            _ => {}
+        }
+        let parent = copy_element_attr(current, "AXParent");
+        if owned {
+            CFRelease(current as CFTypeRef);
+        }
+        match parent {
+            Some(parent) => {
+                current = parent;
+                owned = true;
+            }
+            None => return None,
+        }
+    }
+    if owned {
+        CFRelease(current as CFTypeRef);
+    }
+    ancestry
+}
+
+/// WindowServer's owner for one CGWindowID, as `get_window_state` reports it.
+/// `None` means WindowServer has no record of the id, so no owner may be named.
+fn window_owner_pid(pid: i32, window_id: u32) -> Option<i32> {
+    match resolve_window_owner(pid, window_id) {
+        WindowOwner::SamePid => Some(pid),
+        WindowOwner::ForeignPid { owner_pid, .. } => Some(owner_pid),
+        WindowOwner::Unknown => None,
+    }
+}
+
+/// Classify an addressed element that did not resolve to the requested window.
+/// `resolved` is the window its `AXWindow`/`AXParent` chain did reach, when
+/// one could be mapped at all.
+///
+/// A sheet is checked first: it is the requested window's modal state, not a
+/// separate scope the caller chose, and the window cannot be used again until
+/// the sheet is dismissed.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn classify_foreign_ancestry(
+    element: AXUIElementRef,
+    pid: i32,
+    target_window_id: u32,
+    resolved: Option<u32>,
+) -> ElementAncestry {
+    match sheet_ancestry(element, target_window_id) {
+        // The requested window is the sheet this element lives in, or a sheet
+        // WindowServer never gave an id to, which is composited into the
+        // requested window. Either way the element is in the requested window.
+        Some(SheetAncestry::RequestedWindowIsTheSheet)
+        | Some(SheetAncestry::AttachedToRequestedWindow(None)) => {
+            return ElementAncestry::ProvenDescendant
+        }
+        Some(SheetAncestry::AttachedToRequestedWindow(Some(sheet_window_id))) => {
+            if let Some(owner_pid) = window_owner_pid(pid, sheet_window_id) {
+                return ElementAncestry::ProvenAttachedSheet {
+                    pid: owner_pid,
+                    window_id: sheet_window_id,
+                };
+            }
+        }
+        None => {}
+    }
+    match resolved {
+        Some(window_id) => ElementAncestry::OutsideTargetWindow {
+            pid: window_owner_pid(pid, window_id),
+            window_id,
+        },
+        None if element_is_app_menu_descendant(element, pid) => ElementAncestry::ProvenAppMenu,
+        None => ElementAncestry::Unproven,
+    }
+}
+
 /// The process's focused AX element, but only when it provably belongs to the
 /// requested window. Returns a retained element the caller must release.
 ///
@@ -362,11 +490,7 @@ pub fn gather_background_facts(
                 }
                 match element_window_id(element) {
                     Some(id) if id == window_id => ElementAncestry::ProvenDescendant,
-                    Some(_) => ElementAncestry::OutsideTargetWindow,
-                    None if element_is_app_menu_descendant(element, pid) => {
-                        ElementAncestry::ProvenAppMenu
-                    }
-                    None => ElementAncestry::Unproven,
+                    resolved => classify_foreign_ancestry(element, pid, window_id, resolved),
                 }
             });
             CFRelease(app as CFTypeRef);
