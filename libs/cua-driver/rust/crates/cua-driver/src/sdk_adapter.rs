@@ -91,11 +91,14 @@ impl SdkAdapter {
             .list_tools_json()
             .await
             .map_err(|error| anyhow::anyhow!("load SDK tool inventory: {error}"))?;
-        let tools_list: Value = serde_json::from_str(&tools_json)
+        let mut tools_list: Value = serde_json::from_str(&tools_json)
             .map_err(|error| anyhow::anyhow!("parse SDK tool inventory: {error}"))?;
-        if !tools_list.get("tools").is_some_and(Value::is_array) {
+        let Some(tools) = tools_list.get_mut("tools").and_then(Value::as_array_mut) else {
             anyhow::bail!("SDK tool inventory omitted tools array");
-        }
+        };
+        // Cancellation is owned by this adapter, not by the platform registry:
+        // it must stay reachable when every desktop tool is busy or refused.
+        tools.push(cua_driver_core::server::cancel_operation_tool_def());
         let runtime_prefix = driver.runtime_scope_prefix().ok_or_else(|| {
             anyhow::anyhow!("SDK adapter requires a directly owned embedded runtime")
         })?;
@@ -133,6 +136,12 @@ impl SdkAdapter {
 
     pub fn tools_list(&self) -> Value {
         self.tools_list.clone()
+    }
+
+    /// Signal one in-flight call to stop. `false` means no live call carried
+    /// that id — it finished, or the cancel named a call that never ran.
+    pub fn cancel_call(&self, call_id: &str) -> bool {
+        self.driver.cancel_call(call_id.to_owned()).unwrap_or(false)
     }
 
     pub fn history(&self) -> Option<Arc<cua_driver_core::history::HistoryManager>> {
@@ -446,6 +455,10 @@ impl ToolProvider for SdkAdapter {
 
     async fn invoke_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
         self.invoke_raw(name, arguments).await
+    }
+
+    fn cancel_call(&self, call_id: &str) -> bool {
+        SdkAdapter::cancel_call(self, call_id)
     }
 }
 

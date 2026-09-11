@@ -38,6 +38,12 @@ use crate::serve::{
 /// The runtime lives exactly as long as stdin: EOF ends every observed public
 /// session, drains admitted work through `shutdown`, and releases process
 /// ownership before returning.
+///
+/// Requests are dispatched concurrently and answered out of order. A serial
+/// loop cannot read `notifications/cancelled` while the call it cancels is
+/// still running, which would make cancellation arrive only after the work it
+/// was meant to stop. JSON-RPC permits out-of-order responses; every reply
+/// still carries the request id it answers.
 pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Result<()> {
     // Direct stdio is an action endpoint just like `serve`; enforce the same
     // admin lock, bounded-manifest approval/expiry, and legacy-approval
@@ -58,9 +64,8 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
-    let mut writer = tokio::io::BufWriter::new(stdout);
     let mut line = String::new();
-    let mut session_observed = false;
+    let session_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut protocol_session = ProtocolSession::default();
     let transport_session = format!("mcp-{}", uuid::Uuid::new_v4());
     struct DirectTransportCleanup {
@@ -76,6 +81,17 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
         sdk: sdk.clone(),
         transport_session: transport_session.clone(),
     };
+    let (replies, mut pending_replies) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        let mut writer = tokio::io::BufWriter::new(stdout);
+        while let Some(serialized) = pending_replies.recv().await {
+            writer.write_all(serialized.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    let mut in_flight = tokio::task::JoinSet::new();
 
     loop {
         line.clear();
@@ -86,82 +102,120 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
         if trimmed.is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<Request>(trimmed) {
+        let request = match serde_json::from_str::<Request>(trimmed) {
             Err(error) => {
                 error!("JSON parse error: {error}");
-                Response::parse_error()
+                let _ = replies.send(serialize_response(&Response::parse_error()));
+                continue;
             }
-            Ok(request) if request.is_notification() => continue,
-            Ok(mut request) => {
-                let admission = protocol_session.validate(&request).and_then(|era| {
-                    if request.method == "tools/call" {
-                        mcp_wire::validate_tool_call(
-                            &request,
-                            request.id.clone().unwrap_or_default(),
-                            era,
-                            &sdk.tools_list(),
-                        )?;
-                    }
-                    Ok(era)
-                });
-                if let Err(response) = admission {
-                    writer
-                        .write_all(serde_json::to_string(&response)?.as_bytes())
-                        .await?;
-                    writer.write_all(b"\n").await?;
-                    writer.flush().await?;
-                    continue;
-                }
-                apply_direct_session_identity(&mut request, &transport_session);
-                let initialize_metadata = (!session_observed)
-                    .then(|| request.initialize_metadata())
-                    .flatten();
-                let session_context = request.tool_call().ok().and_then(|call| {
-                    sdk.begin_tool_call(
-                        &call.name,
-                        &call.args,
-                        cua_driver_core::session::SessionTransport::McpStdio,
-                        cua_driver_core::session::SessionClientKind::Mcp,
-                    )
-                });
-                let timer = tool_observation_timer(
-                    &request,
-                    |name| sdk.is_known_tool(name),
-                    StdioExecutionPath::DirectDaemon,
-                );
-                let id = request.id.clone().unwrap_or(serde_json::Value::Null);
-                let response = cua_driver_core::server::handle_request_with_transport_session(
-                    request,
-                    id,
-                    sdk.as_ref(),
-                    &transport_session,
-                )
-                .await;
-                if let Some(metadata) = initialize_metadata {
-                    observe_proxy_session_started(metadata);
-                    session_observed = true;
-                }
-                if let Some(timer) = timer {
-                    let outcome = timer.finish(&response);
-                    if let Some(context) = session_context {
-                        context.complete(&outcome);
-                    }
-                    observe_proxy_tool_completed(outcome);
-                }
-                response
-            }
+            Ok(request) => request,
         };
-        let serialized = serde_json::to_string(&response).unwrap_or_else(|error| {
-            format!(
-                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize error: {error}"}}}}"#
-            )
+        if request.is_notification() {
+            // Notifications carry no id and get no reply. `cancelled` is the
+            // one this adapter acts on; the rest are still dropped.
+            if let Some(call_id) = cancelled_notification_call_id(&request, &transport_session) {
+                let cancelled = sdk.cancel_call(&call_id);
+                debug!(call_id, cancelled, "cancellation notification");
+            }
+            continue;
+        }
+        // Admission is per-connection state (a legacy `initialize` unlocks
+        // metadata-free requests), so it stays on the reader before dispatch
+        // fans out. A rejected request is answered here and never spawned.
+        let admission = protocol_session.validate(&request).and_then(|era| {
+            if request.method == "tools/call" {
+                mcp_wire::validate_tool_call(
+                    &request,
+                    request.id.clone().unwrap_or_default(),
+                    era,
+                    &sdk.tools_list(),
+                )?;
+            }
+            Ok(era)
         });
-        writer.write_all(serialized.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        if let Err(response) = admission {
+            let _ = replies.send(serialize_response(&response));
+            continue;
+        }
+        let sdk = sdk.clone();
+        let replies = replies.clone();
+        let transport_session = transport_session.clone();
+        let session_observed = session_observed.clone();
+        in_flight.spawn(async move {
+            let mut request = request;
+            apply_direct_session_identity(&mut request, &transport_session);
+            let initialize_metadata = (!session_observed
+                .load(std::sync::atomic::Ordering::Relaxed))
+            .then(|| request.initialize_metadata())
+            .flatten();
+            let session_context = request.tool_call().ok().and_then(|call| {
+                sdk.begin_tool_call(
+                    &call.name,
+                    &call.args,
+                    cua_driver_core::session::SessionTransport::McpStdio,
+                    cua_driver_core::session::SessionClientKind::Mcp,
+                )
+            });
+            let timer = tool_observation_timer(
+                &request,
+                |name| sdk.is_known_tool(name),
+                StdioExecutionPath::DirectDaemon,
+            );
+            let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+            let response = cua_driver_core::server::handle_request_with_transport_session(
+                request,
+                id,
+                sdk.as_ref(),
+                &transport_session,
+            )
+            .await;
+            if let Some(metadata) = initialize_metadata {
+                observe_proxy_session_started(metadata);
+                session_observed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(timer) = timer {
+                let outcome = timer.finish(&response);
+                if let Some(context) = session_context {
+                    context.complete(&outcome);
+                }
+                observe_proxy_tool_completed(outcome);
+            }
+            let _ = replies.send(serialize_response(&response));
+        });
+        // Reap finished dispatches so a long session does not accumulate them.
+        while in_flight.try_join_next().is_some() {}
     }
 
-    sdk.shutdown().await.map_err(anyhow::Error::msg)
+    // Stdin EOF means the client is gone. Calls admitted before it left are
+    // still owned by this process — a batch fed through a pipe reaches EOF
+    // while its last requests are in flight — so they finish and answer
+    // before admission closes. `shutdown` then drains the runtime itself.
+    while in_flight.join_next().await.is_some() {}
+    let shutdown = sdk.shutdown().await.map_err(anyhow::Error::msg);
+    drop(replies);
+    let _ = writer.await;
+    shutdown
+}
+
+fn serialize_response(response: &Response) -> String {
+    serde_json::to_string(response).unwrap_or_else(|error| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize error: {error}"}}}}"#
+        )
+    })
+}
+
+/// Map an MCP `notifications/cancelled` to the call id the runtime registered
+/// for that request. Any other notification yields `None`.
+fn cancelled_notification_call_id(request: &Request, transport_session: &str) -> Option<String> {
+    if request.method != "notifications/cancelled" {
+        return None;
+    }
+    let request_id = request.params.as_ref()?.get("requestId")?;
+    Some(cua_driver_core::server::transport_call_id(
+        transport_session,
+        request_id,
+    ))
 }
 
 pub(crate) fn apply_direct_session_identity(request: &mut Request, transport_session: &str) {

@@ -895,6 +895,8 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "set_window_frame"
         | "start_session"
         | "end_session"
+        // Transport control: can only stop admitted work, never start any.
+        | "cancel_operation"
         | "set_agent_cursor_enabled"
         | "set_agent_cursor_motion"
         | "set_agent_cursor_theme" => RiskClass::R1,

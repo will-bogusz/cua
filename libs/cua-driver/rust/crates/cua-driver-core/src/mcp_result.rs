@@ -384,6 +384,29 @@ mod tests {
         );
     }
 
+    /// A cancelled call answers with its own typed code. The boundary must not
+    /// relabel it as an invocation failure or an output mismatch, or the
+    /// caller loses the `partial` evidence it has to reconcile.
+    #[test]
+    fn a_cancelled_call_keeps_its_code_and_partial_evidence() {
+        let tool = "type_text";
+        let cancelled = crate::operation::cancelled_result(
+            Some("mcp-1#4"),
+            Some(json!({"delivered_chars": 3})),
+        );
+        let result =
+            conforming_tool_result(tool, serde_json::to_value(cancelled).expect("serializes"));
+
+        assert_conforms(tool, &result);
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["code"],
+            crate::operation::CANCELLED_CODE
+        );
+        assert_eq!(result["structuredContent"]["call_id"], "mcp-1#4");
+        assert_eq!(result["structuredContent"]["partial"]["delivered_chars"], 3);
+    }
+
     #[test]
     fn a_result_that_is_not_an_object_becomes_a_conforming_error() {
         let result = conforming_tool_result(ACTION_TOOL, json!("not a result"));

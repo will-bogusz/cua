@@ -23,7 +23,7 @@
 
 #define CUA_DRIVER_ABI_MAJOR 1
 
-#define CUA_DRIVER_ABI_MINOR 1
+#define CUA_DRIVER_ABI_MINOR 2
 
 #define CUA_DRIVER_ABI_PATCH 0
 
@@ -176,6 +176,40 @@ CuaDriverStatus cua_driver_invoke_v1(CuaDriverHandle *handle,
                                      void *context,
                                      CuaDriverOperation **out_operation,
                                      CuaDriverBuffer *out_error);
+
+/**
+ * Invoke a named tool under a caller-chosen call id.
+ *
+ * The operation token cancels one call the caller still holds. A call id
+ * cancels a call the caller can only name — from another thread, another
+ * binding, or after the token was released — through
+ * `cua_driver_cancel_call_v1`. An empty id behaves like `cua_driver_invoke_v1`.
+ */
+CUA_DRIVER_API
+CuaDriverStatus cua_driver_invoke_call_v1(CuaDriverHandle *handle,
+                                          const uint8_t *call_id,
+                                          size_t call_id_len,
+                                          const uint8_t *name,
+                                          size_t name_len,
+                                          const uint8_t *arguments_json,
+                                          size_t arguments_len,
+                                          CuaDriverCompletionV1 callback,
+                                          void *context,
+                                          CuaDriverOperation **out_operation,
+                                          CuaDriverBuffer *out_error);
+
+/**
+ * Request cooperative cancellation of one in-flight call by its call id.
+ *
+ * `out_cancelled` reports whether a live operation carried that id. An
+ * unknown id is not an error: a cancel always races the call it targets.
+ */
+CUA_DRIVER_API
+CuaDriverStatus cua_driver_cancel_call_v1(CuaDriverHandle *handle,
+                                          const uint8_t *call_id,
+                                          size_t call_id_len,
+                                          bool *out_cancelled,
+                                          CuaDriverBuffer *out_error);
 
 /**
  * Create a trusted, immutable session binding below this runtime's ceiling.

@@ -294,7 +294,21 @@ impl Tool for VerifyStateTool {
                 break outcomes;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            tokio::time::sleep(remaining.min(Duration::from_millis(POLL_INTERVAL_MS))).await;
+            // A cancelled caller must not keep waiting out a polling window it
+            // no longer cares about; the wait ends as soon as the cancel lands.
+            if crate::operation::sleep_async(remaining.min(Duration::from_millis(POLL_INTERVAL_MS)))
+                .await
+                .is_err()
+            {
+                return crate::operation::cancelled_result(
+                    None,
+                    Some(serde_json::json!({
+                        "tool": "verify_state",
+                        "samples": samples,
+                        "elapsed_ms": started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    })),
+                );
+            }
         };
 
         let last_status = aggregate_status(&last_outcomes);

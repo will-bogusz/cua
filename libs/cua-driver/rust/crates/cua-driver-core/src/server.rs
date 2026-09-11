@@ -23,6 +23,14 @@ pub trait ToolProvider: Send + Sync {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String>;
+
+    /// Request cooperative cancellation of one in-flight call by id.
+    ///
+    /// Returns whether a live call carried that id. Providers that do not own
+    /// their operations (pure registries, forwarding shims) keep the default.
+    fn cancel_call(&self, _call_id: &str) -> bool {
+        false
+    }
 }
 
 #[async_trait::async_trait]
@@ -919,6 +927,13 @@ async fn dispatch_request(
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
             Ok(mut call) => {
                 crate::tool_args::sanitize_reserved_args(&mut call.args);
+                // Cancellation is transport control, not a desktop action. It
+                // is answered above authorization on purpose: stopping input
+                // already in flight must never depend on a capability
+                // manifest, a permission mode, or an unexpired grant.
+                if call.name == CANCEL_OPERATION_TOOL {
+                    return cancel_operation_response(id, &call.args, provider, transport_session);
+                }
                 if let Err(error) = authorize_tool_call(&call.name, &call.args) {
                     return Response::ok(
                         id,
@@ -949,6 +964,16 @@ async fn dispatch_request(
                         arguments.insert(
                             "_transport_session_id".to_owned(),
                             serde_json::Value::String(owner.to_owned()),
+                        );
+                    }
+                    // Name the call so `notifications/cancelled` (or the
+                    // fallback tool) can reach it. Only a transport that owns
+                    // its own identity may name calls; an unauthenticated
+                    // client could otherwise cancel another connection's work.
+                    if let Some(transport) = transport_session {
+                        arguments.insert(
+                            CALL_ID_ARG.to_owned(),
+                            serde_json::Value::String(transport_call_id(transport, &id)),
                         );
                     }
                 }
@@ -1133,6 +1158,103 @@ mod dispatch_contract_tests {
     }
 }
 
+/// Transport-owned tool that cancels an in-flight call. MCP clients that can
+/// send `notifications/cancelled` should do that instead; this exists for
+/// clients whose tool loop cannot emit a notification mid-call.
+pub const CANCEL_OPERATION_TOOL: &str = "cancel_operation";
+
+/// Reserved argument naming one call, stamped by a transport that owns its
+/// own identity. Untrusted requests never carry it: reserved arguments are
+/// stripped before this stamp is applied.
+pub const CALL_ID_ARG: &str = "_call_id";
+
+/// The id one transport gives one JSON-RPC request. Scoping by transport
+/// session keeps two connections that both chose request id `1` apart.
+pub fn transport_call_id(transport_session: &str, request_id: &serde_json::Value) -> String {
+    format!("{transport_session}#{request_id}")
+}
+
+/// Published definition of [`CANCEL_OPERATION_TOOL`], for transports that
+/// advertise it alongside the driver's own inventory.
+pub fn cancel_operation_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "name": CANCEL_OPERATION_TOOL,
+        "description": "Cancel an in-flight tool call on this connection. \
+    Pass request_id (the JSON-RPC id of the call to stop) or call_id. The cancelled \
+    call returns a cancelled error; input already delivered is not undone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "request_id": {
+                    "description": "JSON-RPC id of the in-flight tools/call to cancel.",
+                },
+                "call_id": {
+                    "type": "string",
+                    "description": "Driver call id, when the caller already knows it.",
+                },
+            },
+            "additionalProperties": false,
+        },
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        },
+        "capabilities": [],
+        "risk": crate::authorization::risk_metadata_json(CANCEL_OPERATION_TOOL),
+    })
+}
+
+fn cancel_operation_response(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    provider: &dyn ToolProvider,
+    transport_session: Option<&str>,
+) -> Response {
+    let call_id = match args.get("call_id").and_then(serde_json::Value::as_str) {
+        Some(call_id) if !call_id.is_empty() => call_id.to_owned(),
+        _ => match (args.get("request_id"), transport_session) {
+            (Some(request_id), Some(transport)) => transport_call_id(transport, request_id),
+            (Some(_), None) => {
+                return Response::ok(
+                    id,
+                    tool_error_result(
+                        "request_id cancellation needs a transport-owned session; pass call_id"
+                            .to_owned(),
+                        serde_json::json!({"code": "invalid_arguments"}),
+                    ),
+                )
+            }
+            (None, _) => {
+                return Response::ok(
+                    id,
+                    tool_error_result(
+                        format!("{CANCEL_OPERATION_TOOL} requires request_id or call_id"),
+                        serde_json::json!({"code": "invalid_arguments"}),
+                    ),
+                )
+            }
+        },
+    };
+    let cancelled = provider.cancel_call(&call_id);
+    Response::ok(
+        id,
+        serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": if cancelled {
+                    format!("Cancellation requested for {call_id}.")
+                } else {
+                    format!("No in-flight call {call_id}; it already finished or never ran.")
+                },
+            }],
+            "isError": false,
+            "structuredContent": {"call_id": call_id, "cancelled": cancelled},
+        }),
+    )
+}
+
 #[cfg(test)]
 mod observation_tests {
     use super::*;
@@ -1228,6 +1350,151 @@ mod observation_tests {
         assert_eq!(arguments["_transport_session_id"], "mcp-trusted-lease");
         assert_eq!(arguments["_cua_browser_download_mcp_host_approved"], true);
         assert!(arguments.get("_protected_process_fingerprint").is_none());
+    }
+
+    struct CancelRecordingProvider {
+        cancelled: Mutex<Vec<String>>,
+        live: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolProvider for CancelRecordingProvider {
+        fn tools_list(&self) -> serde_json::Value {
+            serde_json::json!({"tools": [cancel_operation_tool_def()]})
+        }
+
+        async fn invoke_tool(
+            &self,
+            name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            panic!("{name} must not reach the tool registry");
+        }
+
+        fn cancel_call(&self, call_id: &str) -> bool {
+            self.cancelled.lock().unwrap().push(call_id.to_owned());
+            self.live
+        }
+    }
+
+    fn cancel_request(id: i64, arguments: serde_json::Value) -> Request {
+        serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": CANCEL_OPERATION_TOOL, "arguments": arguments},
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_by_request_id_reaches_the_call_the_transport_named() {
+        let provider = CancelRecordingProvider {
+            cancelled: Mutex::new(Vec::new()),
+            live: true,
+        };
+        // The id an in-flight `tools/call` with JSON-RPC id 7 was registered under.
+        let named = transport_call_id("mcp-lease", &serde_json::json!(7));
+
+        let response = handle_request_with_transport_session(
+            cancel_request(8, serde_json::json!({"request_id": 7})),
+            serde_json::json!(8),
+            &provider,
+            "mcp-lease",
+        )
+        .await;
+
+        let ResponseBody::Result { result } = response.body else {
+            panic!("cancel must answer with a result");
+        };
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["cancelled"], true);
+        assert_eq!(result["structuredContent"]["call_id"], named);
+        assert_eq!(provider.cancelled.lock().unwrap().as_slice(), [named]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_finished_call_is_reported_not_failed() {
+        let provider = CancelRecordingProvider {
+            cancelled: Mutex::new(Vec::new()),
+            live: false,
+        };
+        let response = handle_request_with_transport_session(
+            cancel_request(9, serde_json::json!({"call_id": "cua-call-4"})),
+            serde_json::json!(9),
+            &provider,
+            "mcp-lease",
+        )
+        .await;
+        let ResponseBody::Result { result } = response.body else {
+            panic!("cancel must answer with a result");
+        };
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["cancelled"], false);
+        assert_eq!(
+            provider.cancelled.lock().unwrap().as_slice(),
+            ["cua-call-4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_carries_the_call_id_a_later_cancel_will_name() {
+        let provider = CapturingProvider {
+            arguments: Mutex::new(None),
+        };
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "call-a",
+            "method": "tools/call",
+            "params": {"name": "type_text", "arguments": {"pid": 1, "text": "hi"}},
+        }))
+        .unwrap();
+        let response = handle_request_with_transport_session(
+            request,
+            serde_json::json!("call-a"),
+            &provider,
+            "mcp-lease",
+        )
+        .await;
+        assert!(matches!(response.body, ResponseBody::Result { .. }));
+        let arguments = provider.arguments.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            arguments[CALL_ID_ARG],
+            transport_call_id("mcp-lease", &serde_json::json!("call-a"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_transport_cannot_name_or_cancel_another_connections_call() {
+        let provider = CapturingProvider {
+            arguments: Mutex::new(None),
+        };
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "type_text", "arguments": {"pid": 1, "text": "hi"}},
+        }))
+        .unwrap();
+        handle_request(request, serde_json::json!(1), &provider).await;
+        let arguments = provider.arguments.lock().unwrap().clone().unwrap();
+        assert!(arguments.get(CALL_ID_ARG).is_none());
+
+        let refusing = CancelRecordingProvider {
+            cancelled: Mutex::new(Vec::new()),
+            live: true,
+        };
+        let response = handle_request(
+            cancel_request(2, serde_json::json!({"request_id": 1})),
+            serde_json::json!(2),
+            &refusing,
+        )
+        .await;
+        let ResponseBody::Result { result } = response.body else {
+            panic!("cancel must answer with a result");
+        };
+        assert_eq!(result["isError"], true);
+        assert!(refusing.cancelled.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
