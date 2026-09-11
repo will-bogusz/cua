@@ -34,16 +34,6 @@ pub const DEFAULT_MAX_DEPTH: usize = 25;
 /// (issue #22865).
 pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
 
-/// Bound each native AX request. Tokio cannot cancel a blocked
-/// `AXUIElementCopyAttributeValue` after `spawn_blocking` starts, so the native
-/// messaging timeout is what keeps an unresponsive app from retaining a worker
-/// indefinitely.
-const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
-
-unsafe fn set_messaging_timeout(element: AXUIElementRef) {
-    let _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
-}
-
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
@@ -148,13 +138,17 @@ struct WalkScope {
 }
 
 pub struct TreeWalkResult {
+    /// Background capability classification is read under the same native budget.
     pub background_open_restricted: std::collections::HashSet<usize>,
     /// Separate attached surfaces discovered while walking this exact window.
     pub related_windows: Vec<RelatedWindow>,
     pub tree_markdown: String,
     pub nodes: Vec<AXNode>,
-    /// True when the walk was cut short by an element/depth cap.
+    /// True when the walk was cut short by an element/depth cap or deadline.
     pub truncated: bool,
+    /// The shared native-request budget expired. Omitted state remains unknown.
+    pub timed_out: bool,
+    pub stop_reason: Option<super::budget::StopReason>,
     /// Whether the requested `window_id` actually resolved to an AX surface,
     /// and if not, why. `None` when no `window_id` was requested.
     ///
@@ -205,6 +199,25 @@ pub fn walk_tree_bounded(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
+    walk_tree_with_timeout(
+        pid,
+        window_id,
+        query,
+        max_elements,
+        max_depth,
+        super::budget::WALK_TIMEOUT,
+    )
+}
+
+pub(crate) fn walk_tree_with_timeout(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+    timeout: std::time::Duration,
+) -> TreeWalkResult {
+    let _budget = super::budget::WalkBudget::new(timeout);
     let mut scope = WalkScope {
         pid,
         window_id,
@@ -230,12 +243,13 @@ pub fn walk_tree_bounded(
                 tree_markdown: String::new(),
                 nodes,
                 truncated: false,
+                timed_out: super::budget::exhausted(),
+                stop_reason: super::budget::stop_reason(),
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
             };
         }
-        set_messaging_timeout(app_elem);
 
         // Chromium/Electron apps (Arc, VS Code, Electron shells) ship their
         // web-content AX tree OFF and only build it once an assistive client
@@ -260,6 +274,10 @@ pub fn walk_tree_bounded(
 
         let mut top_level = from_children;
         for w in from_windows {
+            if super::budget::exhausted() {
+                CFRelease(w as CFTypeRef);
+                continue;
+            }
             // AXChildren and AXWindows can return different proxy pointers for
             // the same native window. CFEqual compares their AX identity;
             // pointer equality alone duplicates the whole subtree and can turn
@@ -283,8 +301,8 @@ pub fn walk_tree_bounded(
         let walk_these: Vec<AXUIElementRef> = if let Some(wid) = window_id {
             let candidates: Vec<TopLevelCandidate> = top_level
                 .iter()
+                .take_while(|_| !super::budget::exhausted())
                 .map(|&child| {
-                    set_messaging_timeout(child);
                     let role = copy_string_attr(child, "AXRole").unwrap_or_default();
                     let subrole = copy_string_attr(child, "AXSubrole");
                     let identifier = copy_string_attr(child, "AXIdentifier");
@@ -343,7 +361,9 @@ pub fn walk_tree_bounded(
         CFRelease(app_elem as CFTypeRef);
     }
 
-    let truncated_flag = truncated;
+    let stop_reason = super::budget::stop_reason();
+    let timed_out = stop_reason == Some(super::budget::StopReason::Deadline);
+    let truncated_flag = truncated || stop_reason.is_some();
     let raw_markdown = render_lines(&lines);
     let mut tree_markdown = if let Some(q) = query {
         filter_tree(&raw_markdown, q)
@@ -351,7 +371,11 @@ pub fn walk_tree_bounded(
         raw_markdown
     };
 
-    if truncated_flag {
+    if timed_out {
+        tree_markdown.push_str("\nAX observation deadline reached. This is partial state; omitted controls and values remain unknown. The native walk has settled.\n");
+    } else if let Some(reason) = stop_reason {
+        tree_markdown.push_str(&format!("\nAX observation stopped because a native request could not complete ({reason:?}). This is partial state; omitted controls and values remain unknown. The native walk has settled.\n"));
+    } else if truncated_flag {
         tree_markdown.push_str(&format!(
             "\nAX tree reached its element/depth limit ({max_elements} nodes, depth {max_depth}). \
              This is partial state; omitted controls and values remain unknown."
@@ -364,6 +388,8 @@ pub fn walk_tree_bounded(
         tree_markdown,
         nodes,
         truncated: truncated_flag,
+        timed_out,
+        stop_reason,
         window_scope,
     }
 }
@@ -383,7 +409,8 @@ unsafe fn walk_element(
     max_elements: usize,
     max_depth: usize,
 ) {
-    if depth > max_depth {
+    if depth > max_depth || super::budget::exhausted() {
+        *truncated = true;
         return;
     }
     // Enforce total-node cap — mirrors Swift's maxElements guard.
@@ -393,10 +420,6 @@ unsafe fn walk_element(
         return;
     }
     *visited_count += 1;
-
-    // Messaging timeouts are per AX object, not inherited from the application
-    // element, so every descendant must be bounded before any attribute read.
-    set_messaging_timeout(element);
 
     let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
 
@@ -559,6 +582,12 @@ unsafe fn walk_element(
         && super::exact_target::is_file_panel_element(element_ptr)
     {
         scope.background_open_restricted.insert(element_ptr);
+    }
+    // Do not publish a half-read node as an actionable capability. Earlier
+    // fully read nodes remain useful in the explicitly partial observation.
+    if super::budget::exhausted() {
+        *truncated = true;
+        return;
     }
     let node = if is_actionable {
         let idx = *counter;
@@ -816,6 +845,24 @@ fn leading_indent_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn expired_native_walk_returns_no_capabilities_and_does_not_leave_a_thread_budget() {
+        let start = std::time::Instant::now();
+        let result = walk_tree_with_timeout(
+            std::process::id() as i32,
+            Some(123),
+            None,
+            20,
+            5,
+            std::time::Duration::ZERO,
+        );
+        assert!(result.timed_out && result.truncated);
+        assert!(result.nodes.is_empty());
+        assert!(!result.window_scope.unwrap().is_matched());
+        assert!(!super::super::budget::exhausted());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn rendered_raw_values_cannot_add_tree_rows_or_become_placeholders() {

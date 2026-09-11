@@ -1750,6 +1750,8 @@ mod tests {
             tree_markdown: String::new(),
             nodes,
             truncated: false,
+            timed_out: false,
+            stop_reason: None,
             window_scope: Some(crate::ax::WindowScope::Matched),
         }
     }
@@ -1880,6 +1882,8 @@ mod tests {
             tree_markdown: String::new(),
             nodes: Vec::new(),
             truncated: true,
+            timed_out: false,
+            stop_reason: None,
             window_scope: Some(crate::ax::WindowScope::Matched),
         };
         assert!(

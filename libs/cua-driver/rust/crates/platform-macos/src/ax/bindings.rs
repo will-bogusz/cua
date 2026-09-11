@@ -50,7 +50,8 @@ pub const kAXValueIllegalType: AXValueType = 1_000;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
-    pub fn AXUIElementCopyAttributeValue(
+    #[link_name = "AXUIElementCopyAttributeValue"]
+    fn AXUIElementCopyAttributeValue_native(
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: *mut CFTypeRef,
@@ -59,7 +60,11 @@ extern "C" {
         element: AXUIElementRef,
         names: *mut CFArrayRef,
     ) -> AXError;
-    pub fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
+    #[link_name = "AXUIElementCopyActionNames"]
+    fn AXUIElementCopyActionNames_native(
+        element: AXUIElementRef,
+        names: *mut CFArrayRef,
+    ) -> AXError;
     pub fn AXUIElementCopyElementAtPosition(
         application: AXUIElementRef,
         x: f32,
@@ -67,12 +72,14 @@ extern "C" {
         element: *mut AXUIElementRef,
     ) -> AXError;
     pub fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
-    pub fn AXUIElementSetAttributeValue(
+    #[link_name = "AXUIElementSetAttributeValue"]
+    fn AXUIElementSetAttributeValue_native(
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> AXError;
-    pub fn AXUIElementIsAttributeSettable(
+    #[link_name = "AXUIElementIsAttributeSettable"]
+    fn AXUIElementIsAttributeSettable_native(
         element: AXUIElementRef,
         attribute: CFStringRef,
         settable: *mut u8,
@@ -93,7 +100,71 @@ extern "C" {
 
     /// Private SPI: maps an AX window element to its CGWindowID.
     /// Stable since macOS 10.9; used by yabai, Hammerspoon, Accessibility Inspector.
-    pub fn _AXUIElementGetWindow(element: AXUIElementRef, window_id: *mut u32) -> AXError;
+    #[link_name = "_AXUIElementGetWindow"]
+    fn _AXUIElementGetWindow_native(element: AXUIElementRef, window_id: *mut u32) -> AXError;
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn AXUIElementCopyAttributeValue(
+    element: AXUIElementRef,
+    attribute: CFStringRef,
+    value: *mut CFTypeRef,
+) -> AXError {
+    super::budget::request(element, || {
+        AXUIElementCopyAttributeValue_native(element, attribute, value)
+    })
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn AXUIElementCopyActionNames(
+    element: AXUIElementRef,
+    names: *mut CFArrayRef,
+) -> AXError {
+    super::budget::request(element, || {
+        AXUIElementCopyActionNames_native(element, names)
+    })
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn AXUIElementSetAttributeValue(
+    element: AXUIElementRef,
+    attribute: CFStringRef,
+    value: CFTypeRef,
+) -> AXError {
+    super::budget::request(element, || {
+        AXUIElementSetAttributeValue_native(element, attribute, value)
+    })
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn AXUIElementIsAttributeSettable(
+    element: AXUIElementRef,
+    attribute: CFStringRef,
+    settable: *mut u8,
+) -> AXError {
+    super::budget::request(element, || {
+        AXUIElementIsAttributeSettable_native(element, attribute, settable)
+    })
+}
+
+/// Deadline-aware AX call; pointers follow the native API lifetime contract.
+///
+/// # Safety
+/// All input and output pointers must be valid for this native request.
+pub unsafe fn _AXUIElementGetWindow(element: AXUIElementRef, window_id: *mut u32) -> AXError {
+    super::budget::request(element, || _AXUIElementGetWindow_native(element, window_id))
 }
 
 /// Read a hosted element's backing PID, not its presenter's PID.

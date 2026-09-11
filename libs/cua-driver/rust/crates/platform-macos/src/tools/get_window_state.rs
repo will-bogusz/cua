@@ -302,7 +302,10 @@ impl Tool for GetWindowStateTool {
         // which skips the expensive walk and returns screenshot + metadata).
         let tree_result = if want_tree {
             let q = query.clone();
-            let walk_future = tokio::task::spawn_blocking(move || {
+            // The walk shares one deadline across native requests. Await its
+            // actual completion: dropping a timed-out blocking JoinHandle would
+            // leave AX work running after the tool reported that it had stopped.
+            let walk_future = cua_driver_core::operation::spawn_blocking(move || {
                 crate::ax::tree::walk_tree_bounded(
                     pid,
                     Some(window_id),
@@ -323,6 +326,30 @@ impl Tool for GetWindowStateTool {
         // process, between the pre-flight and the walk. Re-apply the same
         // refusals against what the walk actually observed.
         let window_scope = tree_result.as_ref().and_then(|r| r.window_scope.clone());
+        if tree_result
+            .as_ref()
+            .is_some_and(|r| r.stop_reason.is_some())
+            && window_scope
+                .as_ref()
+                .is_none_or(|scope| !scope.is_matched())
+        {
+            if !observation_only {
+                self.state.element_cache.update(pid, window_id, &[]);
+                cua_driver_core::element_token::global().register_snapshot(pid, window_id, 0);
+            }
+            return ToolResult::error(format!(
+                "AX observation stopped before window {window_id} for pid={pid} \
+                 could be resolved. The native walk has settled; no controls from another \
+                 window were substituted. Capture this window without the accessibility \
+                 tree, or observe again when the app is responsive."
+            ))
+            .with_structured(serde_json::json!({
+                "error": if tree_result.as_ref().is_some_and(|r| r.timed_out) { "AX_OBSERVATION_TIMEOUT" } else { "AX_OBSERVATION_INCOMPLETE" },
+                "stop_reason": tree_result.as_ref().and_then(|r| r.stop_reason),
+                "pid": pid, "window_id": window_id,
+                "observation_complete": false, "walk_settled": true
+            }));
+        }
         if let Some(ref scope) = window_scope {
             if let Some(refusal) = window_scope_refusal(pid, window_id, scope) {
                 return refusal;
@@ -627,6 +654,9 @@ impl Tool for GetWindowStateTool {
             "returned_element_count": filtered_element_count,
             "elements_complete": elements_complete,
             "element_double_click": "left_center_v1",
+            "ax_walk_timed_out": tree_result.as_ref().is_some_and(|r| r.timed_out),
+            "ax_walk_stop_reason": tree_result.as_ref().and_then(|r| r.stop_reason),
+            "ax_walk_settled": tree_result.is_some(),
             "tree_markdown": tree_md,
             "elements": elements_json,
             "related_windows": tree_result.as_ref().map(|r| &r.related_windows),
