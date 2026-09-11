@@ -14,9 +14,10 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "launch_app".into(),
         description:
-            "Launch a macOS app in the background — the target does NOT come to the foreground.\n\n\
-             Provide either `bundle_id` (preferred — unambiguous, e.g. `com.apple.calculator`) \
-             or `name` (e.g. \"Calculator\"). If both are given, bundle_id wins.\n\n\
+            "Request a non-activating launch for a new macOS app instance, or reuse an already-running instance without changing its visibility.\n\n\
+             Provide either `bundle_id` (e.g. `com.apple.calculator`) \
+             or `name` (e.g. \"Calculator\" or an exact absolute .app bundle path). If both are given, bundle_id wins. An explicit path is verified against the running bundle; \
+             a different running copy returns APP_PATH_CONFLICT without dispatch.\n\n\
              Optional `urls` are handed to the app as open targets — for Finder, pass a folder \
              path to open a backgrounded Finder window there.\n\n\
              Browser DevTools setup belongs to `browser_prepare`, which can prove that a \
@@ -25,31 +26,28 @@ fn def() -> &'static ToolDef {
              port (sets WEBKIT_INSPECTOR_SERVER=127.0.0.1:N + TAURI_WEBVIEW_AUTOMATION=1). \
              Use this for Tauri/WebKit-based apps.\n\n\
              Optional `creates_new_application_instance`: when true, forces a new app instance \
-             even if one is already running (passes -n to open). Reach for this when another \
-             agent or session may drive the SAME app concurrently — it returns a fresh pid + \
-             window so each session acts on its own isolated window instead of clobbering one \
-             shared instance. Without it, single-instance apps (Calculator, many utilities) hand \
-             every caller the same window, so two sessions fight over it.\n\n\
+             even if one is already running. Use this to request a specific installation when another \
+             copy is running. App-specific singleton behavior may still prevent an independent instance; \
+             inspect the returned identity and readiness.\n\n\
              Optional `additional_arguments`: extra argv strings appended after --args.\n\n\
              Returns the launched app's pid, bundle_id, name, and a `windows` array \
              (same shape as `list_windows`) so callers can skip an extra round-trip before \
              `get_window_state(pid, window_id)`. `launch_state` distinguishes whether the \
-             request was sent, the process is running, and a window is ready. When the \
-             focus-steal belt-and-braces \
-             demotion check ran (target pid ≠ prior frontmost), the response also includes \
-             `self_activation_suppressed: bool` — true if focus stayed with the prior \
-             frontmost, false if the launched app held focus despite the re-demote attempt."
+             request was sent, the process is running, and a window is ready. Visibility metadata \
+             reports the requested policy and observed active/onscreen state; apps may override \
+             launch policy. The driver never restores a previous foreground app or suppresses \
+             intentional user activation after launch."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "bundle_id": {
                     "type": "string",
-                    "description": "App bundle identifier, e.g. com.apple.calculator. Preferred over name."
+                    "description": "App bundle identifier, e.g. com.apple.calculator. Takes precedence over name; use an explicit name path without bundle_id to select an installation."
                 },
                 "name": {
                     "type": "string",
-                    "description": "App display name. Used only when bundle_id is absent."
+                    "description": "App display name or exact absolute .app bundle path (also accepts ~/). Used only when bundle_id is absent."
                 },
                 "urls": {
                     "type": "array",
@@ -62,7 +60,7 @@ fn def() -> &'static ToolDef {
                 },
                 "creates_new_application_instance": {
                     "type": "boolean",
-                    "description": "When true, force a new app instance even if already running (open -n). Use for concurrent multi-agent/multi-session work so each session gets an isolated instance + window instead of sharing one — on single-instance apps (e.g. Calculator) every caller otherwise gets the same window and the sessions clobber each other."
+                    "description": "Request a new app instance, including an exact installation when another copy is running. Inspect the returned identity and readiness; application singleton behavior may prevent independent instances."
                 },
                 "additional_arguments": {
                     "type": "array",
@@ -90,6 +88,7 @@ impl Tool for LaunchAppTool {
         let bundle_id = args.opt_str("bundle_id");
         let name = args.opt_str("name");
         let mut response_bundle_id = bundle_id.clone();
+        let mut application_ref = bundle_id.clone();
         let response_requested_name = name.clone();
         let urls: Vec<String> = args
             .str_array("urls")
@@ -143,7 +142,8 @@ impl Tool for LaunchAppTool {
                     serde_json::json!({ "name": n }),
                 );
             };
-            let (_, resolved_bundle_id) = locator.app_ref_and_bundle_id();
+            let (resolved_ref, resolved_bundle_id) = locator.app_ref_and_bundle_id();
+            application_ref = Some(resolved_ref);
             response_bundle_id = resolved_bundle_id.clone();
             if resolved_bundle_id
                 .as_deref()
@@ -174,286 +174,128 @@ impl Tool for LaunchAppTool {
             s
         };
 
-        // ── Layer-3 focus-steal suppression (3-phase wrap) ───────────────
-        //
-        // Captures the prior frontmost pid, arms a wildcard suppression
-        // BEFORE the launch (covers self-activations the target fires
-        // synchronously during `open()`), then upgrades to a targeted
-        // suppression keyed to the actual launched pid. Briefly holds
-        // BOTH leases so a self-activation arriving in the wildcard→
-        // targeted gap is still caught — that race is what hoang17's
-        // Swift PR #1521 explicitly fixes; we do not regress it here.
-        //
-        // After 500ms (enough for `applicationDidFinishLaunching` +
-        // any reflex `NSApp.activate(...)` to fire and get suppressed)
-        // both leases are dropped. The belt-and-braces step at the end
-        // re-activates the prior frontmost if the target is still
-        // frontmost — handles the intra-`open()` synchronous activation
-        // that fired before we could arm with the real pid.
-        let prior_frontmost = crate::apps::frontmost_pid();
-        let finder_folder_handoff = response_bundle_id.as_deref().is_some_and(|bundle_id| {
-            additional_arguments.is_empty()
-                && env.is_empty()
-                && !creates_new_instance
-                && crate::apps::finder_folder_handoff(bundle_id, &urls)
-        });
-
-        // Finder's synchronous folder-open selector must be allowed to activate
-        // long enough to perform the request. Use the ordinary targeted
-        // post-launch guard to restore the prior foreground app immediately.
-        let wildcard_lease = prior_frontmost
-            .filter(|_| !finder_folder_handoff)
-            .map(|prior| {
-                crate::focus_steal::FocusStealPreventer::begin_suppression(
-                    None,
-                    prior,
-                    "LaunchAppTool.pre",
+        // A background request must not restore an old foreground app after
+        // the user switches tasks. New instances request non-activating launch; plain
+        // acquisition of a running instance performs no reopen/hide/activation.
+        let existing = response_bundle_id
+            .as_deref()
+            .map(crate::apps::running_apps_for_bundle)
+            .unwrap_or_default();
+        let exact_path = if bundle_id.is_none()
+            && name
+                .as_deref()
+                .is_some_and(|name| name.starts_with('/') || name.starts_with("~/"))
+        {
+            match application_ref
+                .as_deref()
+                .map(std::fs::canonicalize)
+                .transpose()
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    return structured_launch_error(
+                        "APP_PATH_UNAVAILABLE",
+                        error.to_string(),
+                        serde_json::json!({"path":application_ref,"launch_state":launch_state(false,false,false)}),
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        let existing_pids = if creates_new_instance {
+            Vec::new()
+        } else {
+            match matching_running_instances(&existing, exact_path.as_deref()) {
+                Ok(pids) => pids,
+                Err(reason) => {
+                    return structured_launch_error(
+                        "APP_PATH_CONFLICT",
+                        reason.into(),
+                        serde_json::json!({"path":exact_path,"running_instances":existing,"launch_state":launch_state(false,true,false)}),
+                    )
+                }
+            }
+        };
+        let has_handoff = !urls.is_empty() || !additional_arguments.is_empty() || !env.is_empty();
+        // NSWorkspace URL delivery is not PID-addressed. Do not send a file to
+        // one of multiple same-bundle instances on the strength of path selection.
+        if has_handoff && !creates_new_instance && existing.len() > 1 {
+            return structured_launch_error("AMBIGUOUS_APP_HANDOFF",
+                "Multiple running copies make URL/argument delivery ambiguous; use the intended window or an explicit new instance.".into(),
+                serde_json::json!({"running_instances":existing,"launch_state":launch_state(false,true,false)}));
+        }
+        let reuse_pid = match launch_plan(&existing_pids, creates_new_instance, has_handoff) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                return structured_launch_error(
+                    "AMBIGUOUS_RUNNING_APP",
+                    reason.into(),
+                    serde_json::json!({"pids":existing_pids,"bundle_id":response_bundle_id}),
                 )
-            });
-
-        // Predicate captured BEFORE moving inputs into spawn_blocking.
-        // Same condition that selects the `openURLs:withApplicationAtURL:`
-        // chain over the simpler `openApplicationAtURL:` path. Used after
-        // the spawn returns to size the suppression window — the slow
-        // path triggers a SECOND activation when the file-open delivers,
-        // which lands AFTER the bundle-only-launch activation window.
-        let slow_launch_path = !urls.is_empty()
-            || !additional_arguments.is_empty()
-            || !env.is_empty()
-            || creates_new_instance;
-
-        // Move the launch closure inputs into spawn_blocking. The
-        // blocking task returns (pid, app_info, windows). Suppression
-        // upgrade happens AFTER the blocking call returns (back on the
-        // async runtime), then we sleep holding the targeted lease.
+            }
+        };
+        let launch_requested = reuse_pid.is_none();
+        let launch_bundle_id = response_bundle_id.clone();
         let launch_result = tokio::task::spawn_blocking(move || {
-            let pid = if let Some(ref bid) = bundle_id {
-                if urls.is_empty()
-                    && additional_arguments.is_empty()
-                    && env.is_empty()
-                    && !creates_new_instance
-                {
-                    crate::apps::launch_app(bid)?
-                } else {
-                    crate::apps::launch_with_urls_by_bundle(
-                        bid,
-                        &urls,
-                        &additional_arguments,
-                        &env,
-                        creates_new_instance,
-                    )?
-                }
+            let pid = if let Some(pid) = reuse_pid {
+                pid
             } else {
-                let n = name.as_deref().unwrap();
-                if urls.is_empty()
-                    && additional_arguments.is_empty()
-                    && env.is_empty()
-                    && !creates_new_instance
-                {
-                    crate::apps::launch_app_by_name(n)?
+                let config = crate::apps::nsworkspace::OpenConfig {
+                    // Hidden AppKit panels can accept AX selection but never enable
+                    // their commit button. Keep normal window lifecycle without activation.
+                    hides: false,
+                    arguments: additional_arguments,
+                    environment: env,
+                    creates_new_instance,
+                    apple_event_bundle_id: if urls.is_empty() {
+                        launch_bundle_id
+                    } else {
+                        None
+                    },
+                };
+                let app_ref = application_ref
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Missing resolved application"))?;
+                let running = if urls.is_empty() {
+                    crate::apps::nsworkspace::open_application(app_ref, &config)
                 } else {
-                    crate::apps::launch_with_urls_by_name(
-                        n,
-                        &urls,
-                        &additional_arguments,
-                        &env,
-                        creates_new_instance,
-                    )?
-                }
+                    crate::apps::nsworkspace::open_urls_with_application(&urls, app_ref, &config)
+                }?;
+                unsafe { running.processIdentifier() }
             };
-
-            // Retry loop: LaunchServices returns before WindowServer has
-            // registered the new windows. Poll up to 5x100ms.
             let windows = resolve_windows_for_pid(pid);
-
-            let app_info: Option<crate::apps::AppInfo> = {
-                let apps = crate::apps::list_running_apps();
-                apps.into_iter().find(|a| a.pid == pid)
-            };
-
+            let app_info = crate::apps::running_app_by_pid(pid);
             Ok::<_, anyhow::Error>((pid, app_info, windows))
         })
         .await;
 
-        // Upgrade to targeted suppression now that we know the real pid.
-        // Keep the wildcard lease alive until immediately AFTER we've
-        // armed the targeted one — that's the PR #1521 overlap window.
-        //
-        // `self_activation_suppressed` is the outcome of the belt-and-
-        // braces demotion check: `None` when the check didn't run
-        // (no prior frontmost / launch failed / pid == prior), `Some(true)`
-        // when the target was NOT frontmost after the suppression window
-        // (or we successfully re-demoted it), `Some(false)` when the
-        // re-demote failed and the target is still stealing focus.
-        // Surfaced in the structured response so callers can observe
-        // whether focus-steal prevention actually held.
-        let mut self_activation_suppressed: Option<bool> = None;
-        if let Ok(Ok((pid, _, _))) = &launch_result {
-            if let Some(prior) = prior_frontmost {
-                if *pid != prior {
-                    let targeted_lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
-                        Some(*pid),
-                        prior,
-                        "LaunchAppTool.post",
-                    );
-                    // Now safe to drop the wildcard — targeted is armed.
-                    drop(wildcard_lease);
-                    // Hold the targeted lease long enough to cover the
-                    // ENTIRE post-launch activation window.
-                    //
-                    // - Fast path (bundle-only launch, no urls/args/env):
-                    //   500ms covers `applicationDidFinishLaunching` plus
-                    //   any reflex `NSApp.activate(...)`. Matches Swift
-                    //   LaunchAppTool.swift exactly.
-                    //
-                    // - Slow path (urls / additional_arguments / env /
-                    //   creates_new_instance): 2500ms. The slow-path
-                    //   `openURLs:withApplicationAtURL:` chain triggers a
-                    //   second activation when the file-open delivers to
-                    //   the just-launched app — Electron apps (VSCode,
-                    //   Cursor, Slack) re-`app.focus()` from inside their
-                    //   `open-file` JS handler, AFTER our 500ms window
-                    //   would have already closed. Empirically VSCode's
-                    //   late activation can land anywhere from ~700ms to
-                    //   ~2000ms after the openURLs return. The observer-
-                    //   based lease catches any activation that lands
-                    //   WHILE held, so widening the window converts the
-                    //   late activation from a contract violation into
-                    //   another auto-demote.
-                    let window_ms: u64 = if slow_launch_path { 2500 } else { 500 };
-                    tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
-                    drop(targeted_lease);
-
-                    // Belt-and-braces LOOP: if the target ever pops back
-                    // to the foreground after the lease drops (rare —
-                    // observer already covered the suppression window —
-                    // but happens when the activation fires literally on
-                    // the same tokio tick the lease dropped), demote it.
-                    // Loop 5x200ms = 1s of post-window coverage. Each
-                    // iteration is cheap (one frontmost_pid + maybe one
-                    // activate_pid call) so this stays well under the
-                    // RPC budget even when the demote keeps working.
-                    let mut demotion_succeeded = true;
-                    for _ in 0..5 {
-                        let frontmost_now = crate::apps::frontmost_pid();
-                        if frontmost_now != Some(*pid) {
-                            // Not frontmost — nothing to do this tick.
-                            continue;
-                        }
-                        let activated = crate::apps::activate_pid(prior);
-                        let still_frontmost = crate::apps::frontmost_pid() == Some(*pid);
-                        if still_frontmost {
-                            tracing::warn!(
-                                target: "platform_macos::tools::launch_app",
-                                launched_pid = *pid,
-                                prior_pid = prior,
-                                activate_pid_returned = activated,
-                                "belt-and-braces demotion iteration failed: \
-                                 launched app remained frontmost after \
-                                 re-activating prior — will retry"
-                            );
-                            demotion_succeeded = false;
-                        } else {
-                            demotion_succeeded = true;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                    // Final in-call state determines the structured response.
-                    let final_frontmost = crate::apps::frontmost_pid();
-                    self_activation_suppressed =
-                        Some(final_frontmost != Some(*pid) && demotion_succeeded);
-
-                    // Detached late-activation watchdog (slow path only).
-                    //
-                    // Why: Electron apps with no workspace open (cold-
-                    // launched VSCode / Cursor / Slack with a file URL)
-                    // re-activate AGAIN when their Welcome window
-                    // finishes loading — empirically 4-8 seconds after
-                    // the `openURLs:withApplicationAtURL:` call returns.
-                    // That's well past the in-call suppression window
-                    // and any reasonable extension of it that an agent
-                    // workflow would tolerate as caller latency.
-                    //
-                    // Solution: hold a fresh observer-backed lease in
-                    // the background for ~8s, demoting if the launched
-                    // pid pops back. The caller doesn't wait — the tool
-                    // already returned its honest `self_activation_
-                    // suppressed` for the in-call window. The detached
-                    // task just keeps the no-foreground-steal contract
-                    // honored past the RPC boundary.
-                    //
-                    // Note on process lifecycle: this watchdog only runs
-                    // when the tokio runtime stays alive — i.e. in the
-                    // long-running `cua-driver mcp` / `cua-driver serve`
-                    // daemon modes. The one-shot `cua-driver call` mode
-                    // exits as soon as the tool returns, taking the
-                    // detached task with it. Acceptable because the
-                    // contract is "no foreground steal during a session
-                    // the agent is driving" — `cua-driver call` doesn't
-                    // have a session that outlives the call.
-                    //
-                    // Tradeoffs:
-                    // - Caller latency unchanged (~2.5s for slow path).
-                    // - Total observer coverage: ~10.5s post-launch.
-                    // - CPU: the observer fires per activation event,
-                    //   not per poll; the 250ms tick is just for the
-                    //   manual belt-and-braces demote. Cheap.
-                    // - If a legitimate user click activates Code while
-                    //   the watchdog is alive, we'll demote them. Worst
-                    //   case ~10s of "I clicked Code and it didn't come
-                    //   forward" — acceptable trade for an automation
-                    //   scenario where the agent just launched it.
-                    if slow_launch_path {
-                        let launched_pid = *pid;
-                        let prior_pid = prior;
-                        tokio::spawn(async move {
-                            let _lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
-                                Some(launched_pid),
-                                prior_pid,
-                                "LaunchAppTool.watchdog",
-                            );
-                            let mut late_activations = 0u32;
-                            for _ in 0..32 {
-                                // 32 × 250ms = 8s
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                if crate::apps::frontmost_pid() == Some(launched_pid) {
-                                    late_activations += 1;
-                                    let _ = crate::apps::activate_pid(prior_pid);
-                                }
-                            }
-                            if late_activations > 0 {
-                                tracing::warn!(
-                                    target: "platform_macos::tools::launch_app",
-                                    launched_pid,
-                                    prior_pid,
-                                    late_activations,
-                                    "watchdog demoted post-RPC late activations \
-                                     — slow-path window may need tuning"
-                                );
-                            }
-                        });
-                    }
-                } else {
-                    // pid == prior frontmost (re-launch of an already-
-                    // frontmost app). Just drop the wildcard.
-                    drop(wildcard_lease);
-                }
-            }
-        } else {
-            // Launch failed; just drop the lease.
-            drop(wildcard_lease);
-        }
-
         match launch_result {
             Ok(Ok((pid, app_info, windows))) => {
+                if !returned_identity_matches(
+                    app_info.as_ref(),
+                    response_bundle_id.as_deref(),
+                    exact_path.as_deref(),
+                ) {
+                    return structured_launch_error("LAUNCH_TARGET_CHANGED",
+                        format!("App identity for PID {pid} does not confirm the requested bundle/path; no further control was performed."),
+                        serde_json::json!({"pid":pid,"requested_bundle_id":response_bundle_id,"requested_path":exact_path,
+                            "observed":app_info,"launch_state":launch_state(launch_requested,app_info.is_some(),!windows.is_empty())}));
+                }
+
                 let (app_name, bid) = response_identity(
                     app_info.as_ref(),
                     response_bundle_id.as_deref(),
                     response_requested_name.as_deref(),
                 );
 
-                let mut summary =
-                    format!("Launched {app_name} (pid {pid}) in background.{port_summary}");
+                let mut summary = if launch_requested {
+                    format!(
+                        "Requested non-activating launch of {app_name} (pid {pid}).{port_summary}"
+                    )
+                } else {
+                    format!("Using running {app_name} (pid {pid}); visibility unchanged.")
+                };
 
                 if !windows.is_empty() {
                     summary.push_str("\n\nWindows:");
@@ -475,27 +317,82 @@ impl Tool for LaunchAppTool {
                     .map(super::list_windows::window_record_json)
                     .collect();
 
-                let mut structured = serde_json::json!({
+                let structured = serde_json::json!({
                     "pid": pid,
                     "bundle_id": bid,
                     "name": app_name,
+                    "launch_path": app_info.as_ref().and_then(|app| app.launch_path.as_deref()),
                     "windows": windows_json,
-                    "launch_state": launch_state(true, true, !windows.is_empty()),
+                    "launch_state": launch_state(launch_requested, true, !windows.is_empty()),
+                    "visibility": {
+                        "requested": if launch_requested {"background"} else {"preserve"},
+                        "observed_active": app_info.as_ref().map(|app| app.active),
+                        "observed_onscreen_window_ids": windows.iter().filter(|w|w.is_on_screen).map(|w|w.window_id).collect::<Vec<_>>(),
+                    },
                 });
-                // Only emit `self_activation_suppressed` when the
-                // belt-and-braces demotion check actually ran. `None`
-                // means the launch didn't enter the focus-steal path
-                // (no prior frontmost, or pid == prior) — surfacing
-                // a stale `false` would be misleading.
-                if let Some(suppressed) = self_activation_suppressed {
-                    structured["self_activation_suppressed"] = serde_json::Value::Bool(suppressed);
-                }
                 ToolResult::text(summary).with_structured(structured)
             }
             Ok(Err(e)) => structured_launch_failure(&e),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+fn matching_running_instances(
+    existing: &[crate::apps::AppInfo],
+    requested_path: Option<&std::path::Path>,
+) -> Result<Vec<i32>, &'static str> {
+    let Some(path) = requested_path else {
+        return Ok(existing.iter().map(|app| app.pid).collect());
+    };
+    let matches: Vec<i32> = existing
+        .iter()
+        .filter(|app| running_path_matches(app, path))
+        .map(|app| app.pid)
+        .collect();
+    if !existing.is_empty() && matches.is_empty() {
+        return Err("A different or unverified copy of this bundle is running. The exact requested installation was not reused or launched; explicitly request a new instance to launch that copy.");
+    }
+    Ok(matches)
+}
+
+fn running_path_matches(app: &crate::apps::AppInfo, path: &std::path::Path) -> bool {
+    app.launch_path
+        .as_deref()
+        .and_then(|value| std::fs::canonicalize(value).ok())
+        .as_deref()
+        == Some(path)
+}
+
+fn returned_identity_matches(
+    app: Option<&crate::apps::AppInfo>,
+    bundle_id: Option<&str>,
+    path: Option<&std::path::Path>,
+) -> bool {
+    app.is_some_and(|app| {
+        app.running
+            && app.pid > 0
+            && bundle_id.is_none_or(|bundle| app.bundle_id.as_deref() == Some(bundle))
+            && path.is_none_or(|path| running_path_matches(app, path))
+    })
+}
+
+fn launch_plan(
+    existing_pids: &[i32],
+    new_instance: bool,
+    handoff: bool,
+) -> Result<Option<i32>, &'static str> {
+    if new_instance || existing_pids.is_empty() {
+        return Ok(None);
+    }
+    if existing_pids.len() != 1 {
+        return Err("Multiple running instances; select an exact window/PID or explicitly request a new instance.");
+    }
+    Ok(if handoff {
+        None
+    } else {
+        Some(existing_pids[0])
+    })
 }
 
 fn contains_remote_debugging_flag(value: &str) -> bool {
@@ -517,10 +414,9 @@ fn protected_host_launch_refusal() -> ToolResult {
 
 // ── Blocking helpers ──────────────────────────────────────────────────────────
 
-/// Poll for the pid's layer-0 windows, retrying up to 5x100ms to absorb
-/// LaunchServices → WindowServer latency (mirrors the Swift reference).
+/// Bound readiness waiting to five seconds; launching can finish before the UI exists.
 fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
-    for attempt in 0..5 {
+    for attempt in 0..50 {
         let found: Vec<_> = crate::windows::all_windows()
             .into_iter()
             .filter(|w| w.pid == pid && w.layer == 0)
@@ -529,7 +425,7 @@ fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
         if !found.is_empty() {
             return found;
         }
-        if attempt < 4 {
+        if attempt < 49 {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
@@ -717,6 +613,82 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_plan_preserves_existing_visibility_and_refuses_ambiguous_instances() {
+        assert_eq!(super::launch_plan(&[], false, false), Ok(None));
+        assert_eq!(super::launch_plan(&[101], false, false), Ok(Some(101)));
+        assert_eq!(super::launch_plan(&[101], false, true), Ok(None));
+        assert!(super::launch_plan(&[101, 102], false, false).is_err());
+        assert_eq!(super::launch_plan(&[101, 102], true, false), Ok(None));
+    }
+
+    #[test]
+    fn explicit_installation_selects_its_process_and_rejects_other_or_unknown_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("First.app");
+        let second = root.path().join("Second.app");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let alias = root.path().join("Alias.app");
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let canonical = std::fs::canonicalize(&first).unwrap();
+        let app = crate::apps::AppInfo {
+            name: "Fixture".into(),
+            pid: 101,
+            bundle_id: Some("test.fixture".into()),
+            running: true,
+            active: false,
+            launch_path: Some(alias.to_string_lossy().into_owned()),
+            kind: None,
+            last_used: None,
+        };
+        let other = crate::apps::AppInfo {
+            pid: 102,
+            launch_path: Some(second.to_string_lossy().into_owned()),
+            ..app.clone()
+        };
+        let unknown = crate::apps::AppInfo {
+            pid: 103,
+            launch_path: None,
+            ..app.clone()
+        };
+        assert_eq!(
+            super::matching_running_instances(&[app.clone(), other.clone()], Some(&canonical)),
+            Ok(vec![101])
+        );
+        assert!(
+            super::matching_running_instances(std::slice::from_ref(&other), Some(&canonical))
+                .is_err()
+        );
+        assert!(super::matching_running_instances(&[unknown], Some(&canonical)).is_err());
+        assert_eq!(
+            super::matching_running_instances(&[app.clone(), other.clone()], None),
+            Ok(vec![101, 102])
+        );
+        assert!(super::returned_identity_matches(
+            Some(&app),
+            Some("test.fixture"),
+            Some(&canonical)
+        ));
+        assert!(!super::returned_identity_matches(
+            Some(&other),
+            Some("test.fixture"),
+            Some(&canonical)
+        ));
+        assert!(!super::returned_identity_matches(
+            Some(&app),
+            Some("other.bundle"),
+            Some(&canonical)
+        ));
+        assert!(!super::returned_identity_matches(
+            None,
+            Some("test.fixture"),
+            Some(&canonical)
+        ));
+        std::fs::remove_dir(&first).unwrap();
+        assert!(super::matching_running_instances(&[app], Some(&canonical)).is_err());
+    }
+
     use super::{
         contains_remote_debugging_flag, is_cua_driver_bundle_id, local_file_target,
         normalize_launch_url, preflight_file_urls, response_identity, structured_launch_failure,
@@ -843,6 +815,22 @@ mod tests {
                 Some("/Applications/Example Editor.app"),
             ),
             ("Example Editor".to_owned(), "com.example.Editor".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_app_path_preserves_protected_host_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("Protected Host.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.trycua.driver</string></dict></plist>"#).unwrap();
+        let result = LaunchAppTool
+            .invoke(json!({ "name": app.to_str().unwrap() }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["error"],
+            "PROTECTED_HOST_ENTRYPOINT"
         );
     }
 

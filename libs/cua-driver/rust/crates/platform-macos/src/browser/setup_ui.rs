@@ -1717,6 +1717,7 @@ mod tests {
             role: role.to_owned(),
             title: title.map(str::to_owned),
             value: value.map(str::to_owned),
+            placeholder: None,
             description: None,
             identifier: None,
             help: None,
@@ -1744,6 +1745,8 @@ mod tests {
 
     fn tree(nodes: Vec<AXNode>) -> TreeWalkResult {
         TreeWalkResult {
+            background_open_restricted: std::collections::HashSet::new(),
+            related_windows: Vec::new(),
             tree_markdown: String::new(),
             nodes,
             truncated: false,
@@ -1872,6 +1875,8 @@ mod tests {
     #[test]
     fn pixel_fallback_requires_committed_navigation_and_complete_ax_proof() {
         let truncated = TreeWalkResult {
+            background_open_restricted: std::collections::HashSet::new(),
+            related_windows: Vec::new(),
             tree_markdown: String::new(),
             nodes: Vec::new(),
             truncated: true,
