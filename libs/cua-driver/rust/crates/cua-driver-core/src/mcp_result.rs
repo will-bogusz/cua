@@ -384,6 +384,38 @@ mod tests {
         );
     }
 
+    /// The window snapshot schema is open (`additionalProperties: true`) and
+    /// its typed validator only checks the count invariants, so fields a
+    /// platform adds beyond the portable struct — document identity, capture
+    /// lease state, walk budget outcome — must reach the client untouched.
+    #[test]
+    fn a_window_state_with_platform_fields_beyond_the_contract_is_untouched() {
+        let tool = "get_window_state";
+        let structured = json!({
+            "pid": 7,
+            "window_id": 9,
+            "elements": [],
+            "returned_element_count": 0,
+            "total_element_count": 0,
+            "document_path": "/tmp/notes.txt",
+            "document_edited": true,
+            "screenshot_capture_backend": "sck_screenshot",
+            "screenshot_rendering_lease": {"state": "active", "frames_per_second": 2},
+            "ax_walk_timed_out": false,
+            "ax_walk_stop_reason": null,
+        });
+        let success = json!({
+            "content": [{"type": "text", "text": "snapshot"}],
+            "isError": false,
+            "structuredContent": structured,
+        });
+
+        let result = conforming_tool_result(tool, success.clone());
+
+        assert_conforms(tool, &result);
+        assert_eq!(result, success);
+    }
+
     /// A cancelled call answers with its own typed code. The boundary must not
     /// relabel it as an invocation failure or an output mismatch, or the
     /// caller loses the `partial` evidence it has to reconcile.
