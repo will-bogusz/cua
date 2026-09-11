@@ -59,7 +59,13 @@ fn def() -> &'static ToolDef {
             `include_accessibility_tree:false` and `include_screenshot:false` is an \
             error (nothing to return). Optional `max_dimension` caps the returned \
             screenshot's long edge in pixels (aspect preserved) for a cheap \
-            thumbnail.\n\n\
+            thumbnail. Window screenshots maintain a session-owned, display-filtered \
+            rendering stream for this exact window (16x16 at 2 fps, no audio/cursor, \
+            all stream frames discarded). `screenshot_rendering_lease` reports its \
+            actual identity. It is stopped when switching this session's window or \
+            ending the session; the screenshot remains a separate exact-window image. \
+            Stream setup or identity failure omits the screenshot, with no activation \
+            fallback.\n\n\
             The snapshot is SCOPED to `window_id`: a window_id that no longer exists is \
             refused with `window_id_not_found`, and one owned by another process is \
             refused with `window_owner_pid_mismatch` naming the real `owner_pid` to retry \
@@ -354,8 +360,10 @@ impl Tool for GetWindowStateTool {
         // downscale source width, the WindowServer bounds it was validated
         // against, and the raw capture's backing scale.
         let mut screenshot_frame_error = None;
+        let mut screenshot_rendering_lease = None;
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
+            let rendering_leases = self.state.rendering_leases.clone();
             let res = tokio::task::spawn_blocking(move || -> Result<
                 (
                     Option<String>,
@@ -366,6 +374,7 @@ impl Tool for GetWindowStateTool {
                     crate::windows::WindowBounds,
                     f64,
                     &'static str,
+                    serde_json::Value,
                 ),
                 super::px_frame::PxFrameError,
             > {
@@ -373,10 +382,18 @@ impl Tool for GetWindowStateTool {
                 let bounds = crate::windows::window_bounds_by_id(window_id)
                     .filter(|b| b.width > 0.0 && b.height > 0.0)
                     .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
-                let capture = crate::capture::capture_window_image(window_id).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
+                let (capture, lease_metadata) = rendering_leases.capture(
+                    session_id.as_deref(), pid, window_id,
+                    || crate::capture::capture_window_image(window_id).map_err(|e| e.to_string()),
+                ).map_err(|e| match e {
+                    crate::capture_lease::LeaseError::StartTimeout { waited_ms } => {
+                        super::px_frame::PxFrameError::CaptureTimeout {
+                            window_id,
+                            waited_ms,
+                        }
+                    }
+                    crate::capture_lease::LeaseError::Failed(reason) => {
+                        super::px_frame::PxFrameError::CaptureUnavailable { window_id, reason }
                     }
                 })?;
                 let after = crate::windows::window_info_by_id(window_id)
@@ -430,6 +447,7 @@ impl Tool for GetWindowStateTool {
                         bounds,
                         scale,
                         capture.backend,
+                        lease_metadata,
                     ))
                 } else {
                     Ok((
@@ -441,11 +459,13 @@ impl Tool for GetWindowStateTool {
                         bounds,
                         scale,
                         capture.backend,
+                        lease_metadata,
                     ))
                 }
             }).await;
             match res {
-                Ok(Ok((b64, file_path, w, h, orig_w, bounds, scale, backend))) => {
+                Ok(Ok((b64, file_path, w, h, orig_w, bounds, scale, backend, lease_metadata))) => {
+                    screenshot_rendering_lease = Some(lease_metadata);
                     // Record resize ratio so ClickTool can scale coordinates back
                     // up. Keyed per window: two windows of one pid can carry
                     // different ratios (only the large one downscales), and a
@@ -719,6 +739,9 @@ impl Tool for GetWindowStateTool {
         if let Some(error) = screenshot_frame_error {
             structured["screenshot_frame_valid"] = serde_json::json!(false);
             structured["screenshot_error"] = super::px_frame::error_structured(&error);
+        }
+        if let Some(metadata) = screenshot_rendering_lease {
+            structured["screenshot_rendering_lease"] = metadata;
         }
         if let Some(ref fp) = screenshot_file_path {
             structured["screenshot_file_path"] = serde_json::json!(fp);

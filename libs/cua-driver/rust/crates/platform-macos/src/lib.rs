@@ -17,6 +17,8 @@ pub mod browser;
 #[cfg(target_os = "macos")]
 pub mod capture;
 #[cfg(target_os = "macos")]
+mod capture_lease;
+#[cfg(target_os = "macos")]
 pub mod cursor;
 #[cfg(target_os = "macos")]
 pub mod focus_guard;

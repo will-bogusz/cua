@@ -730,6 +730,7 @@ impl Default for SessionConfigRegistry {
 
 /// Shared state passed to all tools.
 pub struct ToolState {
+    pub(crate) rendering_leases: Arc<crate::capture_lease::WindowRenderingLeases>,
     pub element_cache: Arc<ElementCache>,
     pub cursor_registry: Arc<CursorRegistry>,
     pub zoom_registry: Arc<ZoomRegistry>,
@@ -770,6 +771,7 @@ impl ToolState {
     ) -> Self {
         Self {
             element_cache: Arc::new(ElementCache::new()),
+            rendering_leases: Arc::new(crate::capture_lease::WindowRenderingLeases::default()),
             cursor_registry: Arc::new(CursorRegistry::new()),
             zoom_registry: Arc::new(ZoomRegistry::new()),
             resize_registry: Arc::new(ResizeRegistry::new()),
@@ -815,6 +817,19 @@ pub fn register_all(
         host_owns_permission_ux,
         host_bundle_id,
     ));
+    {
+        let leases = state.rendering_leases.clone();
+        registry.retain_session_end_hook(
+            cua_driver_core::session::register_scoped_fallible_session_end_hook(
+                "macos_window_rendering_lease",
+                move |session| leases.end(session),
+            ),
+        );
+        let leases = state.rendering_leases.clone();
+        registry.retain_fallible_runtime_cleanup("macos_window_rendering_leases", move || {
+            leases.close()
+        });
+    }
     let cursor_outcome_reader = {
         let cursor_registry = state.cursor_registry.clone();
         cua_driver_core::session::register_scoped_cursor_outcome_reader(std::sync::Arc::new(
