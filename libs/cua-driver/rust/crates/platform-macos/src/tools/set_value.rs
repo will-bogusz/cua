@@ -179,10 +179,11 @@ impl Tool for SetValueTool {
 
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         let center_ptr = element_ptr as usize;
-        if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-            crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
-        })
-        .await
+        if let Ok(Some((screen_x, screen_y))) =
+            cua_driver_core::operation::spawn_blocking(move || unsafe {
+                crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
+            })
+            .await
         {
             crate::cursor::overlay::send_command(
                 cursor_key.clone(),
@@ -216,7 +217,7 @@ impl Tool for SetValueTool {
             prior_front,
             "set_value.AXValue",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::operation::spawn_blocking(move || {
                     set_value_blocking(element_ptr, element_index, pid, &value)
                 })
                 .await

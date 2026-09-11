@@ -15,6 +15,7 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
 };
+use cua_driver_core::operation;
 use foreign_types::ForeignType;
 
 #[derive(Clone, Copy)]
@@ -39,6 +40,25 @@ impl WindowClickDelivery {
     }
 }
 
+/// Prepare both event halves before pressing a button. Keep the existing
+/// bounded down/up dwell so AppKit can enter its tracking loop, then observe
+/// cancellation before another click can begin. Unwind also releases the pair.
+fn post_click_pair<E>(
+    mut prepare: impl FnMut(bool) -> anyhow::Result<E>,
+    post: impl Fn(&E),
+    dwell: std::time::Duration,
+) -> anyhow::Result<()> {
+    operation::check()?;
+    let down = prepare(true)?;
+    let up = prepare(false)?;
+    operation::check()?;
+    let release = operation::ReleaseOnDrop::new(|| post(&up));
+    post(&down);
+    std::thread::sleep(dwell);
+    drop(release);
+    operation::check()?;
+    Ok(())
+}
 /// Left-click at `(x, y)` screen coordinates, posted to `pid`.
 ///
 /// Window-local coordinates for backgrounded targets: if `window_local` is
@@ -109,6 +129,7 @@ fn click_at_xy_desktop_inner(
     modifiers: &[&str],
     preserve_cursor: bool,
 ) -> anyhow::Result<()> {
+    operation::check()?;
     use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEventTapLocation;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -145,6 +166,12 @@ fn click_at_xy_desktop_inner(
     // cursor, and AppKit hit-tests some clicks against the actual cursor
     // position, so without the warp the down/up can miss the target. Desktop
     // scope is the foreground modality, so moving the visible cursor is expected.
+    let restore_cursor = operation::ReleaseOnDrop::new(|| {
+        if let Some(prior) = prior {
+            let _ = CGDisplay::warp_mouse_cursor_position(prior);
+            unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+        }
+    });
     let _ = CGDisplay::warp_mouse_cursor_position(point);
     // Re-couple cursor + mouse-delta so the synthesized click hit-tests at the
     // warped point, not the pre-warp one.
@@ -152,25 +179,27 @@ fn click_at_xy_desktop_inner(
     std::thread::sleep(std::time::Duration::from_millis(40));
     let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         for pair_index in 0..count.max(1) {
-            let down = CGEvent::new_mouse_event(source.clone(), down_ty, point, btn)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
-            down.set_flags(flags);
-            down.set_integer_value_field(
-                core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
-                (pair_index + 1) as i64,
-            );
-            down.post(CGEventTapLocation::HID);
-            std::thread::sleep(std::time::Duration::from_millis(28));
-            let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
-            up.set_flags(flags);
-            up.set_integer_value_field(
-                core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
-                (pair_index + 1) as i64,
-            );
-            up.post(CGEventTapLocation::HID);
+            post_click_pair(
+                |down| {
+                    let event = CGEvent::new_mouse_event(
+                        source.clone(),
+                        if down { down_ty } else { up_ty },
+                        point,
+                        btn,
+                    )
+                    .map_err(|_| anyhow::anyhow!("mouse click event preparation failed"))?;
+                    event.set_flags(flags);
+                    event.set_integer_value_field(
+                        core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
+                        (pair_index + 1) as i64,
+                    );
+                    Ok(event)
+                },
+                |event| event.post(CGEventTapLocation::HID),
+                std::time::Duration::from_millis(28),
+            )?;
             if count > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                operation::sleep(std::time::Duration::from_millis(80))?;
             }
         }
         Ok(())
@@ -179,10 +208,7 @@ fn click_at_xy_desktop_inner(
     // Let AppKit consume the up event before the pointer is restored. The
     // exact foreground guard remains active around this entire helper.
     std::thread::sleep(std::time::Duration::from_millis(40));
-    if let Some(prior) = prior {
-        let _ = CGDisplay::warp_mouse_cursor_position(prior);
-        unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
-    }
+    drop(restore_cursor);
     result
 }
 
@@ -308,6 +334,7 @@ fn click_at_xy_inner(
     modifiers: &[&str],
     post_mode: MousePostMode,
 ) -> anyhow::Result<()> {
+    operation::check()?;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -343,58 +370,44 @@ fn click_at_xy_inner(
         for pair_index in 0..count {
             let click_state = (pair_index + 1) as i64;
 
-            let down = CGEvent::new_mouse_event(
-                source.clone(),
-                CGEventType::LeftMouseDown,
-                point,
-                CGMouseButton::Left,
-            )
-            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
-            if flags != CGEventFlags::CGEventFlagNull {
-                down.set_flags(flags);
-            }
-
-            post_mouse_event_with_mode(
-                pid,
-                &down,
-                window_local,
-                wid,
-                click_group_id,
-                click_state,
-                0,
-                3,
-                post_mode,
-            );
             // 28 ms down→up gap: an NSButton's mouseDown enters a modal
             // tracking loop that polls for the matching mouseUp; too tight a
             // gap can race the loop's first poll and the click is dropped.
-            std::thread::sleep(std::time::Duration::from_millis(28));
-
-            let up = CGEvent::new_mouse_event(
-                source.clone(),
-                CGEventType::LeftMouseUp,
-                point,
-                CGMouseButton::Left,
-            )
-            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
-            if flags != CGEventFlags::CGEventFlagNull {
-                up.set_flags(flags);
-            }
-
-            post_mouse_event_with_mode(
-                pid,
-                &up,
-                window_local,
-                wid,
-                click_group_id,
-                click_state,
-                0,
-                3,
-                post_mode,
-            );
-
+            post_click_pair(
+                |down| {
+                    let event = CGEvent::new_mouse_event(
+                        source.clone(),
+                        if down {
+                            CGEventType::LeftMouseDown
+                        } else {
+                            CGEventType::LeftMouseUp
+                        },
+                        point,
+                        CGMouseButton::Left,
+                    )
+                    .map_err(|_| anyhow::anyhow!("mouse click event preparation failed"))?;
+                    if flags != CGEventFlags::CGEventFlagNull {
+                        event.set_flags(flags);
+                    }
+                    Ok(event)
+                },
+                |event| {
+                    post_mouse_event_with_mode(
+                        pid,
+                        event,
+                        window_local,
+                        wid,
+                        click_group_id,
+                        click_state,
+                        0,
+                        3,
+                        post_mode,
+                    )
+                },
+                std::time::Duration::from_millis(28),
+            )?;
             if count > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                operation::sleep(std::time::Duration::from_millis(80))?;
             }
         }
         Ok(())
@@ -454,6 +467,7 @@ pub fn click_at_xy_chromium(
     count: usize,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
+    operation::check()?;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -513,59 +527,54 @@ pub fn click_at_xy_chromium(
 
     // Step 2: off-screen primer click — opens Chromium user-activation gate
     // at an off-screen coordinate that can't hit any DOM element.
-    let primer_down = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::LeftMouseDown,
-        off_screen,
-        CGMouseButton::Left,
-    )
-    .map_err(|_| anyhow::anyhow!("primer down event creation failed"))?;
-    stamp(&primer_down, off_local, 1, 1);
-    post(&primer_down);
-    std::thread::sleep(std::time::Duration::from_millis(1));
-
-    let primer_up = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::LeftMouseUp,
-        off_screen,
-        CGMouseButton::Left,
-    )
-    .map_err(|_| anyhow::anyhow!("primer up event creation failed"))?;
-    stamp(&primer_up, off_local, 1, 2);
-    post(&primer_up);
-    // ≥1 frame so Chromium sees primer + target as separate gestures, not run-on.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    post_click_pair(
+        |down| {
+            let event = CGEvent::new_mouse_event(
+                source.clone(),
+                if down {
+                    CGEventType::LeftMouseDown
+                } else {
+                    CGEventType::LeftMouseUp
+                },
+                off_screen,
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow::anyhow!("primer click event preparation failed"))?;
+            stamp(&event, off_local, 1, if down { 1 } else { 2 });
+            Ok(event)
+        },
+        post,
+        std::time::Duration::from_millis(1),
+    )?;
+    // Keep primer and target in separate renderer frames.
+    operation::sleep(std::time::Duration::from_millis(100))?;
 
     // Step 3: target click pair(s) with clickState stepped 1→N for double-click
     // coalescing (Chromium renderer coalesces pairs into dblclick when state=1→2).
     for pair_index in 1..=click_pairs {
         let click_state = pair_index as i64;
 
-        let down = CGEvent::new_mouse_event(
-            source.clone(),
-            CGEventType::LeftMouseDown,
-            target,
-            CGMouseButton::Left,
-        )
-        .map_err(|_| anyhow::anyhow!("target down event creation failed"))?;
-        stamp(&down, win_local, click_state, 3);
-        post(&down);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-
-        let up = CGEvent::new_mouse_event(
-            source.clone(),
-            CGEventType::LeftMouseUp,
-            target,
-            CGMouseButton::Left,
-        )
-        .map_err(|_| anyhow::anyhow!("target up event creation failed"))?;
-        stamp(&up, win_local, click_state, 3);
-        post(&up);
-
+        post_click_pair(
+            |down| {
+                let event = CGEvent::new_mouse_event(
+                    source.clone(),
+                    if down {
+                        CGEventType::LeftMouseDown
+                    } else {
+                        CGEventType::LeftMouseUp
+                    },
+                    target,
+                    CGMouseButton::Left,
+                )
+                .map_err(|_| anyhow::anyhow!("target click event preparation failed"))?;
+                stamp(&event, win_local, click_state, 3);
+                Ok(event)
+            },
+            post,
+            std::time::Duration::from_millis(1),
+        )?;
         if pair_index < click_pairs {
-            // ~80 ms between pairs — under the system double-click threshold,
-            // clear of coalescing back into pair N.
-            std::thread::sleep(std::time::Duration::from_millis(80));
+            operation::sleep(std::time::Duration::from_millis(80))?;
         }
     }
 
@@ -641,6 +650,7 @@ pub fn drag_at_xy_observed<F>(
 where
     F: FnMut(f64, f64),
 {
+    operation::check()?;
     use core_graphics::event::CGEventTapLocation;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -696,6 +706,11 @@ where
     if flags != CGEventFlags::CGEventFlagNull {
         down.set_flags(flags);
     }
+    let up = CGEvent::new_mouse_event(source.clone(), up_type, from_pt, cg_button)
+        .map_err(|_| anyhow::anyhow!("drag mouseUp preparation failed"))?;
+    up.set_flags(flags);
+    let release_location = std::cell::Cell::new((from_x, from_y, from_local));
+    operation::check()?;
     post_mouse_event(
         pid,
         &down,
@@ -706,11 +721,21 @@ where
         button_number,
         0,
     );
+    let release = operation::ReleaseOnDrop::new(|| {
+        let (x, y, local) = release_location.get();
+        unsafe { CGEventSetLocation(up.as_ptr() as *mut std::ffi::c_void, x, y) };
+        post_mouse_event(pid, &up, local, wid, click_group_id, 1, button_number, 0);
+        if foreground_release {
+            up.post(CGEventTapLocation::HID);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
     observe(from_x, from_y);
-    std::thread::sleep(std::time::Duration::from_millis(16));
+    operation::sleep(std::time::Duration::from_millis(16))?;
 
     // Interpolated drag steps.
     for i in 1..=steps {
+        operation::check()?;
         let t = i as f64 / steps as f64;
         let ix = from_x + (to_x - from_x) * t;
         let iy = from_y + (to_y - from_y) * t;
@@ -724,34 +749,15 @@ where
             drag.set_flags(flags);
         }
         post_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number, 0);
+        release_location.set((ix, iy, il));
         observe(ix, iy);
         if step_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+            operation::sleep(std::time::Duration::from_millis(step_delay_ms))?;
         }
     }
 
-    // MouseUp at end.
-    // Give Chromium one run-loop turn to process the final dragged event at
-    // the drop point before releasing pointer capture.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let to_pt = CGPoint::new(to_x, to_y);
-    let up = CGEvent::new_mouse_event(source.clone(), up_type, to_pt, cg_button)
-        .map_err(|_| anyhow::anyhow!("drag mouseUp failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
-    post_mouse_event(pid, &up, to_local, wid, click_group_id, 1, button_number, 0);
-    if foreground_release {
-        // A frontmost Chromium surface can consume PID-routed down/move
-        // events yet filter the synthetic release. Re-post only the release
-        // through the HID tap while the foreground assist still holds focus.
-        up.post(CGEventTapLocation::HID);
-    }
-    // Chromium may process the final pointerup on the next run-loop turn. In
-    // the foreground rung the caller restores the previous app immediately
-    // after this function returns, so let the target consume the release and
-    // complete pointer capture before that restore.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    operation::sleep(std::time::Duration::from_millis(50))?;
+    drop(release);
 
     Ok(())
 }
@@ -807,6 +813,7 @@ pub fn drag_at_xy_foreground_observed<F>(
 where
     F: FnMut(f64, f64),
 {
+    operation::check()?;
     use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEventTapLocation;
 
@@ -848,7 +855,7 @@ where
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(from_x, from_y));
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     observe(from_x, from_y);
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    operation::sleep(std::time::Duration::from_millis(40))?;
 
     // Prime the renderer's tracking state with a genuine HID mouse move.
     if let Ok(move_event) = CGEvent::new_mouse_event(
@@ -859,7 +866,7 @@ where
     ) {
         post(&move_event);
     }
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    operation::sleep(std::time::Duration::from_millis(30))?;
 
     let down = CGEvent::new_mouse_event(
         source.clone(),
@@ -872,10 +879,28 @@ where
         down.set_flags(flags);
     }
     down.set_integer_value_field(core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE, 1);
+    let up = CGEvent::new_mouse_event(
+        source.clone(),
+        up_type,
+        CGPoint::new(from_x, from_y),
+        cg_button,
+    )
+    .map_err(|_| anyhow::anyhow!("foreground drag mouseUp preparation failed"))?;
+    up.set_flags(flags);
+    up.set_integer_value_field(core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE, 1);
+    let release_location = std::cell::Cell::new((from_x, from_y));
+    operation::check()?;
     down.post(CGEventTapLocation::HID);
-    std::thread::sleep(std::time::Duration::from_millis(16));
+    let release = operation::ReleaseOnDrop::new(|| {
+        let (x, y) = release_location.get();
+        unsafe { CGEventSetLocation(up.as_ptr() as *mut std::ffi::c_void, x, y) };
+        post(&up);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+    operation::sleep(std::time::Duration::from_millis(16))?;
 
     for i in 1..=steps {
+        operation::check()?;
         let t = i as f64 / steps as f64;
         let x = from_x + (to_x - from_x) * t;
         let y = from_y + (to_y - from_y) * t;
@@ -887,23 +912,14 @@ where
         }
         event.set_integer_value_field(core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE, 1);
         post(&event);
+        release_location.set((x, y));
         observe(x, y);
         if step_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+            operation::sleep(std::time::Duration::from_millis(step_delay_ms))?;
         }
     }
 
-    let up = CGEvent::new_mouse_event(source, up_type, CGPoint::new(to_x, to_y), cg_button)
-        .map_err(|_| anyhow::anyhow!("foreground drag mouseUp failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
-    up.set_integer_value_field(core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE, 1);
-    post(&up);
-    // The foreground wrapper restores the previous app immediately after this
-    // function returns. Let the target's run loop consume the queued HID
-    // gesture, including pointer-capture release, before that restore happens.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    drop(release);
     Ok(())
 }
 
@@ -944,37 +960,31 @@ fn middle_click_at_xy_inner(
     window_local: Option<(f64, f64)>,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
+    operation::check()?;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let point = CGPoint::new(x, y);
     let flags = parse_modifier_flags(modifiers);
 
-    let down = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::OtherMouseDown,
-        point,
-        CGMouseButton::Center,
+    post_click_pair(
+        |down| {
+            let event = CGEvent::new_mouse_event(
+                source.clone(),
+                if down {
+                    CGEventType::OtherMouseDown
+                } else {
+                    CGEventType::OtherMouseUp
+                },
+                point,
+                CGMouseButton::Center,
+            )
+            .map_err(|_| anyhow::anyhow!("mouse click event preparation failed"))?;
+            event.set_flags(flags);
+            Ok(event)
+        },
+        |event| post_mouse_event(pid, event, window_local, None, None, 1, 2, 3),
+        std::time::Duration::from_millis(16),
     )
-    .map_err(|_| anyhow::anyhow!("middle mouse down failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        down.set_flags(flags);
-    }
-    post_mouse_event(pid, &down, window_local, None, None, 1, 2, 3);
-    std::thread::sleep(std::time::Duration::from_millis(16));
-
-    let up = CGEvent::new_mouse_event(
-        source,
-        CGEventType::OtherMouseUp,
-        point,
-        CGMouseButton::Center,
-    )
-    .map_err(|_| anyhow::anyhow!("middle mouse up failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
-    post_mouse_event(pid, &up, window_local, None, None, 1, 2, 3);
-
-    Ok(())
 }
 
 /// Right-click at `(x, y)` with optional modifier keys (no window routing).
@@ -1011,6 +1021,7 @@ fn right_click_at_xy_inner(
     wid: Option<u32>,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
+    operation::check()?;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -1038,34 +1049,25 @@ fn right_click_at_xy_inner(
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
 
-    let down = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::RightMouseDown,
-        point,
-        CGMouseButton::Right,
+    post_click_pair(
+        |down| {
+            let event = CGEvent::new_mouse_event(
+                source.clone(),
+                if down {
+                    CGEventType::RightMouseDown
+                } else {
+                    CGEventType::RightMouseUp
+                },
+                point,
+                CGMouseButton::Right,
+            )
+            .map_err(|_| anyhow::anyhow!("mouse click event preparation failed"))?;
+            event.set_flags(flags);
+            Ok(event)
+        },
+        |event| post_mouse_event(pid, event, window_local, wid, click_group_id, 1, 1, 3),
+        std::time::Duration::from_millis(28),
     )
-    .map_err(|_| anyhow::anyhow!("right mouse down failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        down.set_flags(flags);
-    }
-    // button_number = 1 (right). Stamping 0 here routes the event as a left
-    // button-number on the receiving side even though the type is rightMouseDown.
-    post_mouse_event(pid, &down, window_local, wid, click_group_id, 1, 1, 3);
-    std::thread::sleep(std::time::Duration::from_millis(28));
-
-    let up = CGEvent::new_mouse_event(
-        source,
-        CGEventType::RightMouseUp,
-        point,
-        CGMouseButton::Right,
-    )
-    .map_err(|_| anyhow::anyhow!("right mouse up failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
-    post_mouse_event(pid, &up, window_local, wid, click_group_id, 1, 1, 3);
-
-    Ok(())
 }
 
 /// Post a mouse event to `pid`.
@@ -1344,8 +1346,80 @@ fn parse_modifier_flags(modifiers: &[&str]) -> CGEventFlags {
 
 #[cfg(test)]
 mod tests {
-    use super::dispatch_mouse_event;
+    use super::{dispatch_mouse_event, post_click_pair};
+    use cua_driver_core::operation;
     use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn failed_release_preparation_sends_no_mouse_down() {
+        let journal = RefCell::new(Vec::new());
+        let result = post_click_pair(
+            |down| {
+                journal
+                    .borrow_mut()
+                    .push(if down { "prepare-down" } else { "prepare-up" });
+                if !down {
+                    anyhow::bail!("release allocation failed");
+                }
+                Ok(down)
+            },
+            |_| journal.borrow_mut().push("posted"),
+            Duration::ZERO,
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("release allocation failed"));
+        assert_eq!(*journal.borrow(), ["prepare-down", "prepare-up"]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_the_pressed_button_and_stops_repeated_clicks() {
+        let journal = RefCell::new(Vec::new());
+        let cancellation = Arc::new(operation::Cancellation::default());
+        let result = operation::scope(cancellation.clone(), async {
+            for _ in 0..2 {
+                post_click_pair(
+                    Ok,
+                    |down| {
+                        journal.borrow_mut().push(*down);
+                        if *down {
+                            cancellation.cancel();
+                        }
+                    },
+                    Duration::ZERO,
+                )?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        assert!(result
+            .unwrap_err()
+            .downcast_ref::<operation::Cancelled>()
+            .is_some());
+        assert_eq!(*journal.borrow(), [true, false]);
+    }
+
+    #[test]
+    fn mouse_release_is_preserved_during_unwind() {
+        let journal = RefCell::new(Vec::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_click_pair(
+                Ok,
+                |down| {
+                    journal.borrow_mut().push(*down);
+                    if *down {
+                        panic!("posting callback unwound");
+                    }
+                },
+                Duration::ZERO,
+            )
+        }));
+        assert!(result.is_err());
+        assert_eq!(*journal.borrow(), [true, false]);
+    }
 
     // A receiver that accepts either transport must see the requested event
     // stream once, including repeated click pairs and drag/wheel updates.
