@@ -139,6 +139,14 @@ fn count_competing_keyboard_destinations(
         .count()
 }
 
+fn window_owner_pid(pid: i32, window_id: u32) -> Option<i32> {
+    match resolve_window_owner(pid, window_id) {
+        WindowOwner::SamePid => Some(pid),
+        WindowOwner::ForeignPid { owner_pid, .. } => Some(owner_pid),
+        WindowOwner::Unknown => None,
+    }
+}
+
 /// Gather fresh background-input facts for one `(pid, window_id)` target.
 ///
 /// `element_ptr` is an optional retained `AXUIElementRef` (as `usize`) for an
@@ -177,7 +185,10 @@ pub fn gather_background_facts(
             let app_hidden = copy_bool_attr(app, "AXHidden");
             let element = element_ptr.map(|ptr| match element_window_id(ptr as AXUIElementRef) {
                 Some(id) if id == window_id => ElementAncestry::ProvenDescendant,
-                Some(_) => ElementAncestry::OutsideTargetWindow,
+                Some(other) => ElementAncestry::OutsideTargetWindow {
+                    pid: window_owner_pid(pid, other),
+                    window_id: other,
+                },
                 None => ElementAncestry::Unproven,
             });
             CFRelease(app as CFTypeRef);
