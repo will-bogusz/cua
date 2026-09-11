@@ -3,6 +3,7 @@
 mod bring_to_front;
 mod click;
 mod clipboard;
+pub(crate) mod delivery_probe;
 mod double_click;
 mod drag;
 mod get_window_state;
