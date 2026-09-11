@@ -133,11 +133,22 @@ static MPX_NAME_COUNTER: AtomicU64 = AtomicU64::new(1);
 const EVDEV_UINPUT_NAME_MAX_BYTES: usize = 78;
 const UINPUT_POINTER_SUFFIX: &str = " uinput pointer";
 pub const UINPUT_UNAVAILABLE_CODE: &str = "uinput_unavailable";
+pub const FOREGROUND_UNAVAILABLE_CODE: &str = "foreground_unavailable";
 
 #[derive(Debug, thiserror::Error)]
 #[error("Linux uinput pointer unavailable: {reason}")]
 struct UinputUnavailable {
     reason: String,
+}
+
+/// The foreground rung could not be established: the target never held the
+/// X11 active-window *and* input focus, so no input was sent. Typed so tools
+/// can return the same `{code, detail}` envelope the Hyprland foreground path
+/// returns instead of an untyped error string.
+#[derive(Debug, thiserror::Error)]
+#[error("foreground_unavailable: {detail}")]
+struct ForegroundUnavailable {
+    detail: String,
 }
 
 fn mpx_pointers() -> &'static Mutex<HashMap<String, MasterPointerIds>> {
@@ -205,6 +216,13 @@ pub(crate) fn uinput_unavailable(reason: impl Into<String>) -> anyhow::Error {
     .into()
 }
 
+pub(crate) fn foreground_unavailable(detail: impl Into<String>) -> anyhow::Error {
+    ForegroundUnavailable {
+        detail: detail.into(),
+    }
+    .into()
+}
+
 fn guarded_uinput_creation<T>(name: &str, create: impl FnOnce(&str) -> Result<T>) -> Result<T> {
     let name = normalize_uinput_device_name(name);
     match catch_unwind(AssertUnwindSafe(|| create(&name))) {
@@ -219,6 +237,14 @@ fn guarded_uinput_creation<T>(name: &str, create: impl FnOnce(&str) -> Result<T>
 
 pub fn is_uinput_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UinputUnavailable>().is_some()
+}
+
+/// The refusal detail when `error` is a foreground-acquisition failure, for
+/// the `{code: "foreground_unavailable", detail}` structured envelope.
+pub fn foreground_unavailable_detail(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<ForegroundUnavailable>()
+        .map(|error| error.detail.as_str())
 }
 
 fn master_pointer_device_name(master_name: &str) -> String {
@@ -1121,7 +1147,9 @@ pub fn with_x11_foreground<T>(
 ) -> Result<T> {
     let display = unsafe { x11::xlib::XOpenDisplay(ptr::null()) };
     if display.is_null() {
-        bail!("foreground_unavailable: cannot open DISPLAY to verify exact X11 input focus");
+        return Err(foreground_unavailable(
+            "cannot open DISPLAY to verify exact X11 input focus",
+        ));
     }
     let prior = ewmh_active_window(display);
     let mut prior_core_focus: x11::xlib::Window = 0;
@@ -1170,11 +1198,10 @@ pub fn with_x11_foreground<T>(
         body()
     } else {
         let active = ewmh_active_window(display).unwrap_or(0);
-        Err(anyhow::anyhow!(
-            "foreground_unavailable: X11 did not confirm active window and input focus within \
-             exact target 0x{xid:x} before the {:?} deadline (active=0x{active:x}); no input was sent",
-            timeout
-        ))
+        Err(foreground_unavailable(format!(
+            "X11 did not confirm active window and input focus within \
+             exact target 0x{xid:x} before the {timeout:?} deadline (active=0x{active:x}); no input was sent"
+        )))
     };
 
     // Restore both the EWMH active toplevel and the exact prior core focus.

@@ -2196,6 +2196,13 @@ fn linux_input_error(error: anyhow::Error) -> ToolResult {
         ToolResult::error(error.to_string()).with_structured(json!({
             "code": crate::input::UINPUT_UNAVAILABLE_CODE,
         }))
+    } else if let Some(detail) = crate::input::foreground_unavailable_detail(&error) {
+        // Same typed envelope the Hyprland foreground path returns, so a
+        // caller branches on `code` instead of parsing the message.
+        ToolResult::error(error.to_string()).with_structured(json!({
+            "code": crate::input::FOREGROUND_UNAVAILABLE_CODE,
+            "detail": detail,
+        }))
     } else {
         ToolResult::error(error.to_string())
     }
@@ -2857,6 +2864,32 @@ fn uinput_failure_has_a_stable_structured_code() {
             .and_then(Value::as_str),
         Some(crate::input::UINPUT_UNAVAILABLE_CODE)
     );
+}
+
+#[cfg(test)]
+#[test]
+fn x11_foreground_failure_has_a_stable_structured_code() {
+    let result = linux_input_error(crate::input::foreground_unavailable(
+        "X11 did not confirm active window and input focus",
+    ));
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.as_ref().expect("structured");
+    assert_eq!(
+        structured["code"].as_str(),
+        Some(crate::input::FOREGROUND_UNAVAILABLE_CODE)
+    );
+    assert_eq!(
+        structured["detail"].as_str(),
+        Some("X11 did not confirm active window and input focus")
+    );
+    // The message an agent reads is unchanged by the typing.
+    match &result.content[0] {
+        cua_driver_core::protocol::Content::Text { text, .. } => assert_eq!(
+            text,
+            "foreground_unavailable: X11 did not confirm active window and input focus"
+        ),
+        other => panic!("expected text content, got {other:?}"),
+    }
 }
 
 fn x11_pixel_click_no_focus_steal_modifiers(
