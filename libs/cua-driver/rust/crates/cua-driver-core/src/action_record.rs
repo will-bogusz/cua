@@ -475,6 +475,17 @@ impl ActionExecutionRecord {
                     .to_owned(),
             });
         }
+        // A background action can prove *delivery* without proving its intended
+        // postcondition: the platform's post-dispatch probe saw the target
+        // react (element state, app focus, window contents, a new window).
+        // Publish that as window-change evidence — it stays weaker than a
+        // read-back, so the effect it accompanies is still `unverifiable`.
+        for kind in legacy_observed_change_evidence(structured) {
+            record.evidence.push(ActionEvidence {
+                kind,
+                detail: "observed change after dispatch".to_owned(),
+            });
+        }
         if let Some(escalation) = structured.get("escalation") {
             let recommendation = escalation
                 .get("recommended")
@@ -504,9 +515,19 @@ impl ActionExecutionRecord {
         if effect == ActionEffect::Partial && record.delivered_count.is_none() {
             return None;
         }
-        if effect == ActionEffect::Confirmed && projected_evidence(&record.evidence).is_none() {
+        if effect == ActionEffect::Confirmed
+            && !record.evidence.iter().any(|evidence| {
+                matches!(
+                    evidence.kind,
+                    EvidenceKind::AccessibilityReadback
+                        | EvidenceKind::BrowserReadback
+                        | EvidenceKind::ValueReadback
+                )
+            })
+        {
             // A legacy string claiming "confirmed" without a trusted readback
-            // is not enough to preserve that stronger statement.
+            // is not enough to preserve that stronger statement. A weaker
+            // observed-change row does not qualify, publishable or not.
             record.effect = ActionEffect::Unverifiable;
         }
         record.validate().ok()?;
@@ -647,6 +668,26 @@ fn legacy_has_publishable_readback(tool_name: &str, structured: &serde_json::Val
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         && structured.get("effect").and_then(serde_json::Value::as_str) == Some("confirmed")
+}
+
+/// Evidence rows a platform may declare for an observed post-dispatch change.
+/// Only `window_change` is accepted here: a read-back claim has to go through
+/// [`legacy_has_publishable_readback`], which also demands `verified` and
+/// `confirmed`, so this weaker signal can never launder itself into one.
+fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<EvidenceKind> {
+    structured
+        .get("evidence")
+        .and_then(serde_json::Value::as_array)
+        .map(|evidence| {
+            evidence
+                .iter()
+                .filter(|item| {
+                    item.get("kind").and_then(serde_json::Value::as_str) == Some("window_change")
+                })
+                .map(|_| EvidenceKind::WindowChange)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn transport_from_legacy(
@@ -1767,6 +1808,76 @@ mod tests {
         assert_eq!(
             record.delivered_count, None,
             "legacy request-count echoes are not delivery evidence"
+        );
+    }
+
+    #[test]
+    fn observed_change_after_dispatch_publishes_window_change_evidence() {
+        let record = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"delivery_mode": "background"}),
+            &serde_json::json!({
+                "path": "ax",
+                "verified": false,
+                "effect": "unverifiable",
+                "evidence": [{ "kind": "window_change", "detail": "app_focus" }],
+            }),
+        )
+        .expect("background click with observed change should normalize");
+        assert_eq!(record.effect, ActionEffect::Unverifiable);
+        let public = record.public_result().expect("public ActionResult");
+        assert_eq!(
+            public.evidence.as_deref().map(<[_]>::len),
+            Some(1),
+            "an observed change is publishable delivery evidence"
+        );
+    }
+
+    #[test]
+    fn observed_change_cannot_launder_itself_into_a_confirmation() {
+        let record = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"delivery_mode": "background"}),
+            &serde_json::json!({
+                "path": "ax",
+                "verified": true,
+                "effect": "confirmed",
+                "evidence": [{ "kind": "window_change" }],
+            }),
+        )
+        .expect("background click should normalize");
+        assert_eq!(
+            record.effect,
+            ActionEffect::Unverifiable,
+            "only a declared read-back may keep `confirmed`"
+        );
+    }
+
+    #[test]
+    fn probe_reported_noop_escalates_to_the_foreground_rung() {
+        let record = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"delivery_mode": "background"}),
+            &serde_json::json!({
+                "path": "ax",
+                "verified": false,
+                "effect": "suspected_noop",
+                "escalation": {
+                    "recommended": "foreground",
+                    "reason": "background delivery produced no observable change",
+                },
+            }),
+        )
+        .expect("background click should normalize");
+        let public = record.public_result().expect("public ActionResult");
+        assert_eq!(
+            public.effect,
+            cua_driver_contract::ActionEffect::SuspectedNoop
+        );
+        let escalation = public.escalation.expect("noop verdict names a rung");
+        assert_eq!(
+            escalation.target,
+            cua_driver_contract::ActionEscalationTarget::Foreground
         );
     }
 
