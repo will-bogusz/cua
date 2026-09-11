@@ -19,7 +19,7 @@ use foreign_types::ForeignType;
 
 #[derive(Clone, Copy)]
 enum MousePostMode {
-    Both,
+    SkyLightFirst,
     PublicOnly,
 }
 
@@ -51,7 +51,16 @@ pub fn click_at_xy(
     count: usize,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_inner(pid, x, y, None, None, count, modifiers, MousePostMode::Both)
+    click_at_xy_inner(
+        pid,
+        x,
+        y,
+        None,
+        None,
+        count,
+        modifiers,
+        MousePostMode::SkyLightFirst,
+    )
 }
 
 /// Screen-absolute click posted to the GLOBAL HID tap (`CGEventTapLocation::HID`),
@@ -431,8 +440,8 @@ pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
 ///  - f58 = constant click-group ID across all events (gesture coalescing)
 ///  - `CGEventSetWindowLocation` per-event (window-local point)
 ///
-/// Uses the SkyLight route required by Chromium-compatible targets, with the
-/// public API only as a fallback when the private symbol is unavailable.
+/// Prefers SkyLight `SLEventPostToPid`, falling back to `CGEvent::post_to_pid`
+/// only when the private entry point is unavailable.
 // The flattened arguments mirror the native event fields used by existing callers.
 #[allow(clippy::too_many_arguments)]
 pub fn click_at_xy_chromium(
@@ -488,12 +497,7 @@ pub fn click_at_xy_chromium(
         }
     };
 
-    let post = |event: &CGEvent| {
-        let ptr = event.as_ptr() as *mut std::ffi::c_void;
-        if !crate::input::skylight::post_to_pid(pid as libc::pid_t, ptr, false) {
-            event.post_to_pid(pid as libc::pid_t);
-        }
-    };
+    let post = |event: &CGEvent| post_mouse_to_pid(pid, event);
 
     // Step 1: mouseMoved at target (phase=2, clickState=0).
     let move_event = CGEvent::new_mouse_event(
@@ -914,7 +918,7 @@ pub enum DragButton {
 /// Middle-click at `(x, y)` with optional modifier keys.
 ///
 /// Posts an `OtherMouseDown` / `OtherMouseUp` pair with `CGMouseButton::Center`
-/// to the target pid through the same SkyLight + public-API postBoth path the
+/// to the target pid through the same SkyLight / public-API fallback path the
 /// left- and right-click primitives use. Window-local stamping mirrors
 /// `right_click_at_xy_with_window_local`.
 pub fn middle_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyhow::Result<()> {
@@ -1030,7 +1034,7 @@ fn right_click_at_xy_inner(
         window_local,
         wid,
         click_group_id,
-        MousePostMode::Both,
+        MousePostMode::SkyLightFirst,
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
 
@@ -1066,12 +1070,9 @@ fn right_click_at_xy_inner(
 
 /// Post a mouse event to `pid`.
 ///
-/// Matches Swift's `MouseInput.postBoth(_:toPid:)`:
-/// - Fires `SLEventPostToPid` (SkyLight path — reaches backgrounded Chromium/Catalyst).
-/// - Also fires `CGEvent::post_to_pid` (public path — lands on AppKit targets where
-///   SkyLight mouse delivery drops).
-///
-/// Both are always posted in sequence regardless of whether the other succeeded.
+/// Uses `SLEventPostToPid` when available, otherwise `CGEvent::post_to_pid`.
+/// These are alternative transports, not two parts of a single delivery:
+/// posting through both can deliver two downs and two ups for one click.
 ///
 /// Field stamps applied (always):
 /// - f40 = `pid`  (Chromium's synthetic-event filter)
@@ -1110,7 +1111,7 @@ pub(super) fn post_mouse_event(
         click_state,
         button_number,
         subtype,
-        MousePostMode::Both,
+        MousePostMode::SkyLightFirst,
     );
 }
 
@@ -1152,12 +1153,30 @@ fn post_mouse_event_with_mode(
     crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
 
     match mode {
-        MousePostMode::Both => {
-            // Preserve the established transport for non-left-click callers.
-            crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
-            event.post_to_pid(pid as libc::pid_t);
-        }
+        MousePostMode::SkyLightFirst => post_mouse_to_pid(pid, event),
         MousePostMode::PublicOnly => event.post_to_pid(pid as libc::pid_t),
+    }
+}
+
+fn post_mouse_to_pid(pid: i32, event: &CGEvent) {
+    // Mouse events skip the auth envelope so Chromium sees the annotated tap.
+    dispatch_mouse_event(
+        || {
+            crate::input::skylight::post_to_pid(
+                pid as libc::pid_t,
+                event.as_ptr() as *mut std::ffi::c_void,
+                false,
+            )
+        },
+        || event.post_to_pid(pid as libc::pid_t),
+    );
+}
+
+fn dispatch_mouse_event(try_skylight: impl FnOnce() -> bool, post_public: impl FnOnce()) {
+    // `true` means the SPI was called, not that the application consumed the
+    // event. There is no delivery acknowledgement that would make replay safe.
+    if !try_skylight() {
+        post_public();
     }
 }
 
@@ -1253,7 +1272,7 @@ pub fn scroll_wheel_at_xy(
                 .unwrap_or_default()
                 .subsec_nanos() as i64,
         ),
-        MousePostMode::Both,
+        MousePostMode::SkyLightFirst,
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
 
@@ -1292,10 +1311,7 @@ pub fn scroll_wheel_at_xy(
         // f40 = target pid (Chromium synthetic-event filter).
         crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
 
-        // Belt+suspenders post: SkyLight reaches backgrounded Chromium/Catalyst;
-        // the public path lands on AppKit/WKWebView. Mouse-class → no auth envelope.
-        crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
-        event.post_to_pid(pid as libc::pid_t);
+        post_mouse_to_pid(pid, &event);
 
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
@@ -1324,4 +1340,46 @@ fn parse_modifier_flags(modifiers: &[&str]) -> CGEventFlags {
         }
     }
     flags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch_mouse_event;
+    use std::cell::RefCell;
+
+    // A receiver that accepts either transport must see the requested event
+    // stream once, including repeated click pairs and drag/wheel updates.
+    const EVENTS: &[&str] = &["move", "down:1", "up:1", "down:2", "up:2", "drag", "wheel"];
+
+    #[test]
+    fn skylight_mouse_dispatch_does_not_duplicate_receiver_events() {
+        let received = RefCell::new(Vec::new());
+        for event in EVENTS {
+            dispatch_mouse_event(
+                || {
+                    received.borrow_mut().push(*event);
+                    true
+                },
+                || received.borrow_mut().push(*event),
+            );
+        }
+        assert_eq!(*received.borrow(), EVENTS);
+    }
+
+    #[test]
+    fn unavailable_skylight_preserves_event_order_through_public_fallback() {
+        let received = RefCell::new(Vec::new());
+        for event in EVENTS {
+            dispatch_mouse_event(|| false, || received.borrow_mut().push(*event));
+        }
+        assert_eq!(*received.borrow(), EVENTS);
+    }
+
+    #[test]
+    fn attempted_mouse_dispatch_is_not_replayed_without_acknowledgement() {
+        dispatch_mouse_event(
+            || true,
+            || panic!("An attempted SkyLight post cannot safely be replayed"),
+        );
+    }
 }
