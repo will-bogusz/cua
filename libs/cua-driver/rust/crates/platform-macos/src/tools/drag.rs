@@ -122,8 +122,11 @@ impl Tool for DragTool {
                 Err(result) => return result,
             };
             let (from_x, from_y, to_x, to_y) = (input.from_x, input.from_y, input.to_x, input.to_y);
-            let (from_x, from_y) = super::desktop_screenshot_point(from_x, from_y).await;
-            let (to_x, to_y) = super::desktop_screenshot_point(to_x, to_y).await;
+            let [(from_x, from_y), (to_x, to_y)] =
+                match super::desktop_screenshot_points([(from_x, from_y), (to_x, to_y)]).await {
+                    Ok(points) => points,
+                    Err(error) => return error,
+                };
             let duration_ms = input.duration_ms.unwrap_or(500).min(10_000);
             let steps = input.steps.unwrap_or(20).clamp(1, 200) as usize;
             let modifiers = input.modifier.unwrap_or_default();

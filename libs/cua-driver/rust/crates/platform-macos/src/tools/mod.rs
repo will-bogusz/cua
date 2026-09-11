@@ -604,24 +604,33 @@ pub fn load_driver_config() -> DriverConfig {
     cfg
 }
 
-/// Convert native pixels from `get_desktop_state` into the logical point space
-/// used by CoreGraphics input APIs. Retina scaled modes cannot rely on the
-/// nominal backing factor alone, so derive the ratio from the actual PNG.
-pub async fn desktop_screenshot_point(x: f64, y: f64) -> (f64, f64) {
-    let ratio = tokio::task::spawn_blocking(|| {
-        let logical_w = get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
-        let shot_w = crate::capture::screenshot_display_bytes()
-            .ok()
-            .and_then(|png| crate::capture::png_dimensions(&png).ok())
-            .map(|(w, _)| w as f64);
-        match (shot_w, logical_w) {
-            (Some(sw), Some(lw)) if lw > 0.0 && sw > lw => sw / lw,
-            _ => 1.0,
-        }
-    })
-    .await
-    .unwrap_or(1.0);
-    (x / ratio, y / ratio)
+/// Convert a desktop action's points with one verified primary-display frame.
+/// The observation validates its PNG against this same native mode geometry;
+/// no hidden capture or guessed 1x fallback is needed during input delivery.
+pub async fn desktop_screenshot_points<const N: usize>(
+    points: [(f64, f64); N],
+) -> Result<[(f64, f64); N], cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::protocol::ToolResult;
+    let screen = tokio::task::spawn_blocking(get_screen_size::main_screen_geometry)
+        .await
+        .map_err(|error| ToolResult::error(format!("Desktop geometry task failed: {error}")))?
+        .ok_or_else(|| ToolResult::error("Primary display identity or geometry unavailable; observe again before desktop input."))?;
+    let mut logical = points;
+    for point in &mut logical {
+        *point = screen.logical_point(point.0, point.1).ok_or_else(|| {
+            ToolResult::error(
+                "Desktop coordinates must be finite and inside the current primary display PNG.",
+            )
+        })?;
+    }
+    Ok(logical)
+}
+
+pub async fn desktop_screenshot_point(
+    x: f64,
+    y: f64,
+) -> Result<(f64, f64), cua_driver_core::protocol::ToolResult> {
+    Ok(desktop_screenshot_points([(x, y)]).await?[0])
 }
 
 /// Persist a single key/value pair to `~/.cua-driver/config.json`.

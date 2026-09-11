@@ -44,11 +44,12 @@ pub use outputs::{
     ActionEscalationReason, ActionEscalationTarget, ActionEvidence, ActionEvidenceKind,
     ActionResult, ActionResultValidationError, ActionRoute, ClipboardReadOutput,
     ClipboardWriteOutput, CursorMotionOutput, CursorPointOutput, CursorPositionOutput,
-    CursorThemeOutput, CursorVisualOutput, DesktopStateOutput, EffectiveScope, EndSessionOutput,
-    GetAgentCursorStateOutput, ListSessionsOutput, ScreenSizeOutput, SessionClientKindOutput,
-    SessionLifecycleState, SessionOutput, SessionStateOutput, SessionTransportOutput,
-    SetAgentCursorEnabledOutput, SetAgentCursorMotionOutput, SetAgentCursorThemeOutput,
-    StartSessionOutput, ToolOutput, TOOL_INVOCATION_FAILED_CODE,
+    CursorThemeOutput, CursorVisualOutput, DesktopStateOutput, DisplayIdentityOutput,
+    EffectiveScope, EndSessionOutput, GetAgentCursorStateOutput, ListSessionsOutput,
+    ScreenOriginOutput, ScreenSizeOutput, SessionClientKindOutput, SessionLifecycleState,
+    SessionOutput, SessionStateOutput, SessionTransportOutput, SetAgentCursorEnabledOutput,
+    SetAgentCursorMotionOutput, SetAgentCursorThemeOutput, StartSessionOutput, ToolOutput,
+    TOOL_INVOCATION_FAILED_CODE,
 };
 pub use verification::{
     BoundsExpectation, ElementPredicate, ElementSelector, PredicateOutcome, StatePredicate,

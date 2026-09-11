@@ -146,7 +146,10 @@ impl Tool for ScrollTool {
                 ScrollDirection::Right => (0, -step),
                 ScrollDirection::Left => (0, step),
             };
-            let (x, y) = super::desktop_screenshot_point(x, y).await;
+            let (x, y) = match super::desktop_screenshot_point(x, y).await {
+                Ok(point) => point,
+                Err(error) => return error,
+            };
             let result = tokio::task::spawn_blocking(move || {
                 crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
             })

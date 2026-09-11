@@ -252,36 +252,10 @@ impl Tool for ClickTool {
             let sx_shot = input.x;
             let sy_shot = input.y;
             // ── Desktop-screenshot pixels → logical screen points ──────────────
-            // The vision invariant: the pixel an agent reads off the screenshot it
-            // was handed is the pixel that gets clicked. `get_desktop_state`
-            // returns the display at NATIVE pixels (e.g. 3024×1964 on a 2× Retina
-            // display whose logical size is 1512×982), but everything below — the
-            // window-under-point hit test (logical CGWindow bounds), the cursor
-            // warp, and the CGEvent post — operates in LOGICAL screen points. So
-            // x,y arrive in desktop-SCREENSHOT space (what the agent reads off the
-            // PNG) and must be divided by the screenshot↔logical ratio, or a
-            // center-pixel pick warps to the corner (off by the backing scale).
-            //
-            // Derive the ratio the same way `get_desktop_state` reports it: native
-            // screenshot width / logical screen width. This is robust even when
-            // CGDisplayPixelsWide under-reports the backing scale (it returns the
-            // scaled-mode point width on some Retina configs → a bogus 1.0).
-            let desktop_ratio = tokio::task::spawn_blocking(|| {
-                let logical_w =
-                    super::get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
-                let shot_w = crate::capture::screenshot_display_bytes()
-                    .ok()
-                    .and_then(|png| crate::capture::png_dimensions(&png).ok())
-                    .map(|(w, _)| w as f64);
-                match (shot_w, logical_w) {
-                    (Some(sw), Some(lw)) if lw > 0.0 && sw > lw => sw / lw,
-                    _ => 1.0,
-                }
-            })
-            .await
-            .unwrap_or(1.0);
-            let sx = sx_shot / desktop_ratio;
-            let sy = sy_shot / desktop_ratio;
+            let (sx, sy) = match super::desktop_screenshot_point(sx_shot, sy_shot).await {
+                Ok(point) => point,
+                Err(error) => return error,
+            };
             let button = match input.button.unwrap_or(ClickButton::Left) {
                 ClickButton::Left => "left",
                 ClickButton::Right => "right",

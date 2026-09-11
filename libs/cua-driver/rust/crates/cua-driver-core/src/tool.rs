@@ -1815,12 +1815,7 @@ impl ToolRegistry {
                 )
             })?;
             (
-                serde_json::json!({
-                    "kind": "display",
-                    "width": display.get("width").and_then(Value::as_u64),
-                    "height": display.get("height").and_then(Value::as_u64),
-                    "scale_factor": display.get("scale_factor").and_then(Value::as_f64),
-                }),
+                desktop_display_resource("display", &display, None),
                 "Allow Cua to observe the current desktop".to_owned(),
             )
         };
@@ -1918,13 +1913,7 @@ impl ToolRegistry {
                 )
             })?;
             (
-                serde_json::json!({
-                    "kind": "display_input",
-                    "width": display.get("width").and_then(Value::as_u64),
-                    "height": display.get("height").and_then(Value::as_u64),
-                    "scale_factor": display.get("scale_factor").and_then(Value::as_f64),
-                    "delivery_mode_ceiling": delivery_mode,
-                }),
+                desktop_display_resource("display_input", &display, Some(delivery_mode)),
                 format!("Allow Cua to control the current desktop in {delivery_mode} mode"),
             )
         };
@@ -2348,6 +2337,26 @@ impl ToolRegistry {
     }
 }
 
+fn desktop_display_resource(kind: &str, display: &Value, delivery_mode: Option<&str>) -> Value {
+    let mut resource = serde_json::json!({
+        "kind": kind,
+        "width": display.get("width").and_then(Value::as_u64),
+        "height": display.get("height").and_then(Value::as_u64),
+        "scale_factor": display.get("scale_factor").and_then(Value::as_f64),
+    });
+    // Keep old platform payloads compatible, but bind new grants to the actual
+    // source when the platform supplies it, even for equal-sized displays.
+    for key in ["display_identity", "screen_origin"] {
+        if let Some(value) = display.get(key) {
+            resource[key] = value.clone();
+        }
+    }
+    if let Some(mode) = delivery_mode {
+        resource["delivery_mode_ceiling"] = Value::String(mode.into());
+    }
+    resource
+}
+
 fn history_observation_resource(tool_name: &str) -> Option<(Value, &'static str)> {
     match tool_name {
         "history_status" => Some((
@@ -2359,6 +2368,45 @@ fn history_observation_resource(tool_name: &str) -> Option<(Value, &'static str)
             "Allow Cua to read encrypted Computer History metadata",
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod display_resource_tests {
+    use super::desktop_display_resource;
+    use serde_json::json;
+
+    #[test]
+    fn display_grants_distinguish_same_size_source_and_origin_changes() {
+        let original = json!({"width":1920,"height":1080,"scale_factor":2.0,
+            "display_identity":{"uuid":"display-a","native_id":7},"screen_origin":{"x":0.0,"y":0.0}});
+        for kind in ["display", "display_input"] {
+            let before = desktop_display_resource(kind, &original, Some("foreground"));
+            for changed in [
+                json!({"display_identity":{"uuid":"display-b","native_id":7}}),
+                json!({"display_identity":{"uuid":"display-a","native_id":8}}),
+                json!({"screen_origin":{"x":10.0,"y":0.0}}),
+            ] {
+                let mut current = original.clone();
+                current
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(changed.as_object().unwrap().clone());
+                assert_ne!(
+                    before,
+                    desktop_display_resource(kind, &current, Some("foreground"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn display_grants_keep_legacy_platform_geometry_shape() {
+        let display = json!({"width":1920,"height":1080,"scale_factor":1.0});
+        assert_eq!(
+            desktop_display_resource("display", &display, None),
+            json!({"kind":"display","width":1920,"height":1080,"scale_factor":1.0})
+        );
     }
 }
 
