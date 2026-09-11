@@ -158,6 +158,13 @@ pub struct TreeWalkResult {
     /// [`WindowScope::Matched`] comes with an EMPTY walk, so `nodes` never
     /// describes a window other than the requested one.
     pub window_scope: Option<WindowScope>,
+    /// The requested window's document URL (`AXDocument`), when it has one.
+    /// `None` when no window was requested, the window resolved to nothing, or
+    /// the app exposes no document for it (non-document windows, web content).
+    pub document: Option<String>,
+    /// The app's own unsaved-changes flag for the requested window. `None` when
+    /// the app reports it nowhere — absence is unknown, never "saved".
+    pub document_edited: Option<bool>,
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -233,6 +240,9 @@ pub(crate) fn walk_tree_with_timeout(
     // avoids a false-positive when the tree naturally ends on exactly the cap.
     let mut truncated = false;
     let mut window_scope: Option<WindowScope> = None;
+    // Document state of the requested window, read off that one element below.
+    let mut document: Option<String> = None;
+    let mut document_edited: Option<bool> = None;
 
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid);
@@ -248,6 +258,8 @@ pub(crate) fn walk_tree_with_timeout(
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
+                document: None,
+                document_edited: None,
             };
         }
 
@@ -330,6 +342,19 @@ pub(crate) fn walk_tree_with_timeout(
                 .map(|&index| top_level[index])
                 .collect();
             window_scope = Some(decision.scope);
+            // Document state of the exact target window: two AX reads on ONE
+            // element (never the whole walk), so the cost is per-window, not
+            // per-element. Guarded by the same native budget as the walk, so a
+            // wedged app cannot extend the deadline here.
+            if !super::budget::exhausted() {
+                if let Some(&index) = decision
+                    .walk
+                    .iter()
+                    .find(|&&index| candidates[index].ax_window_id == Some(wid))
+                {
+                    (document, document_edited) = read_document_state(top_level[index]);
+                }
+            }
             walk
         } else {
             top_level.to_vec()
@@ -391,7 +416,32 @@ pub(crate) fn walk_tree_with_timeout(
         timed_out,
         stop_reason,
         window_scope,
+        document,
+        document_edited,
     }
+}
+
+/// Read one window element's document identity and dirty bit.
+///
+/// `AXDocument` is the window's `NSWindow.representedFilename` as a `file://`
+/// URL — the "where would a save land" half.
+///
+/// The dirty bit is `NSWindow.isDocumentEdited`, and AppKit does NOT expose it
+/// on the window: every AppKit window measured returns
+/// `kAXErrorAttributeUnsupported` for `AXEdited`, while the window's
+/// `AXCloseButton` mirrors the flag live. Try the window first for the apps
+/// that do answer there, then the close button. `None` from both means the app
+/// reports it nowhere; that is unknown, not "no unsaved changes".
+unsafe fn read_document_state(window: AXUIElementRef) -> (Option<String>, Option<bool>) {
+    let document = copy_string_attr(window, "AXDocument").filter(|s| !s.is_empty());
+    let edited = copy_bool_attr(window, "AXEdited").or_else(|| {
+        copy_element_attr(window, "AXCloseButton").and_then(|close_button| {
+            let edited = copy_bool_attr(close_button, "AXEdited");
+            CFRelease(close_button as CFTypeRef);
+            edited
+        })
+    });
+    (document, edited)
 }
 
 #[allow(clippy::too_many_arguments)]
