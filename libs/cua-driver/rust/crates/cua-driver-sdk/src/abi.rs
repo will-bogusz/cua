@@ -974,7 +974,10 @@ pub unsafe extern "C" fn cua_driver_shutdown_v1(
         *out_operation = spawn_completion(
             executor,
             async move {
-                runtime.shutdown().await;
+                runtime
+                    .shutdown()
+                    .await
+                    .map_err(|reason| AbiFailure::new(CuaDriverStatus::Internal, reason))?;
                 Ok("null".into())
             },
             callback,
@@ -1462,8 +1465,10 @@ impl NativeAbiDriver {
                     .clone()
             }
         };
-        runtime.shutdown().await;
-        Ok(())
+        runtime
+            .shutdown()
+            .await
+            .map_err(|reason| DriverError::Protocol { reason })
     }
 }
 

@@ -560,6 +560,44 @@ impl Drop for RuntimeCleanup {
     }
 }
 
+type FallibleRuntimeCleanup = (String, Box<dyn Fn() -> Result<(), String> + Send + Sync>);
+
+#[derive(Default)]
+struct RuntimeResources(std::sync::Mutex<Vec<FallibleRuntimeCleanup>>);
+
+impl RuntimeResources {
+    fn drain(&self) -> Result<(), String> {
+        let mut callbacks = self.0.lock().map_err(|_| "runtime cleanup lock poisoned")?;
+        let mut failures = Vec::new();
+        callbacks.retain(|(name, cleanup)| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup)) {
+                Ok(Ok(())) => false,
+                Ok(Err(error)) => {
+                    failures.push(format!("{name}: {error}"));
+                    true
+                }
+                Err(_) => {
+                    failures.push(format!("{name}: cleanup panicked"));
+                    true
+                }
+            }
+        });
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+impl Drop for RuntimeResources {
+    fn drop(&mut self) {
+        if let Err(error) = self.drain() {
+            tracing::error!(%error, "native runtime resources did not drain before final release");
+        }
+    }
+}
+
 /// Transport evidence admitted only through a trusted protocol adapter.
 ///
 /// The values are extracted from the adapter's private argument envelope and
@@ -634,6 +672,7 @@ pub struct ToolRegistry {
     cursor_outcome_readers: Vec<crate::session::CursorOutcomeReaderRegistration>,
     _recording_state_readers: Vec<crate::session::RecordingStateReaderRegistration>,
     runtime_cleanups: Vec<RuntimeCleanup>,
+    runtime_resources: RuntimeResources,
     /// Runtime-owned protected-consent broker shared by every resource
     /// adapter. Keeping it at the canonical dispatch boundary prevents
     /// browser, desktop, and file adapters from growing independent provider
@@ -701,6 +740,7 @@ impl ToolRegistry {
             cursor_outcome_readers: Vec::new(),
             _recording_state_readers: vec![recording_state_reader],
             runtime_cleanups: Vec::new(),
+            runtime_resources: RuntimeResources::default(),
             approval_broker,
             protected_resource_grants,
             protected_resource_ownership,
@@ -815,6 +855,25 @@ impl ToolRegistry {
     pub fn retain_runtime_cleanup(&mut self, cleanup: impl FnOnce() + Send + Sync + 'static) {
         self.runtime_cleanups
             .push(RuntimeCleanup(Some(Box::new(cleanup))));
+    }
+
+    /// Own native resources that must drain during explicit shutdown, including
+    /// resources left by an already-ended session with incomplete cleanup.
+    /// Successful callbacks are removed; failures remain owned for retry.
+    pub fn retain_fallible_runtime_cleanup(
+        &self,
+        name: impl Into<String>,
+        cleanup: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.runtime_resources
+            .0
+            .lock()
+            .unwrap()
+            .push((name.into(), Box::new(cleanup)));
+    }
+
+    pub fn drain_runtime_resources(&self) -> Result<(), String> {
+        self.runtime_resources.drain()
     }
 
     /// Register the four platform-independent recording/replay tools.
@@ -1515,6 +1574,9 @@ impl ToolRegistry {
         } else {
             None
         };
+        if let Err(error) = crate::operation::check() {
+            return ToolResult::error(error.to_string());
+        }
         let pending_turn = should_record
             .then(|| {
                 if private_consent_turn {
