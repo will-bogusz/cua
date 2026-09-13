@@ -524,6 +524,10 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool() != 24493:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool_with_id() != 14167:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cua_driver_sdk_checksum_method_cuadriver_cancel_call() != 33184:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cua_driver_sdk_checksum_method_cuadriver_click() != 22807:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cua_driver_sdk_checksum_method_cuadriver_clipboard_read() != 58238:
@@ -1260,6 +1264,19 @@ _UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool.argtypes = (
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool_with_id.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool_with_id.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_cancel_call.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_cancel_call.restype = ctypes.c_int8
 _UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_click.argtypes = (
     ctypes.c_uint64,
     cua_driver._native_contract._UniffiRustBuffer,
@@ -1756,6 +1773,12 @@ _UniffiLib.uniffi_cua_driver_sdk_checksum_constructor_cuadriver_create_with_clie
 _UniffiLib.uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool.argtypes = (
 )
 _UniffiLib.uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool_with_id.argtypes = (
+)
+_UniffiLib.uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool_with_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cua_driver_sdk_checksum_method_cuadriver_cancel_call.argtypes = (
+)
+_UniffiLib.uniffi_cua_driver_sdk_checksum_method_cuadriver_cancel_call.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cua_driver_sdk_checksum_method_cuadriver_click.argtypes = (
 )
 _UniffiLib.uniffi_cua_driver_sdk_checksum_method_cuadriver_click.restype = ctypes.c_uint16
@@ -5565,6 +5588,27 @@ class CuaDriverProtocol(typing.Protocol):
         remain downstream of the same public SDK runtime.
 """
         raise NotImplementedError
+    async def call_tool_with_id(self, call_id: str,name: str,arguments_json: str) -> ToolResult:
+        """
+        Invoke a tool under a caller-chosen call id so a later
+        [`Self::cancel_call`] can stop exactly this call.
+
+        The id is transport identity, never a tool argument: caller-supplied
+        reserved arguments are stripped first, exactly as [`Self::call_tool`]
+        does, and only this id is added.
+"""
+        raise NotImplementedError
+    def cancel_call(self, call_id: str) -> bool:
+        """
+        Request cancellation of one in-flight call by its call id.
+
+        Returns whether a live operation carried that id — a cancel always
+        races the call it targets, so an unknown id means "already finished",
+        not "failed". Cancellation is cooperative: the call stops at its next
+        checkpoint, releases any held input, and reports a `cancelled` error
+        whose `partial` describes what had already been delivered.
+"""
+        raise NotImplementedError
     async def click(self, input: cua_driver._native_contract.ClickInput) -> cua_driver._native_contract.ActionResult:
         raise NotImplementedError
     async def clipboard_read(self, input: cua_driver._native_contract.ClipboardReadInput) -> ToolResult:
@@ -6018,6 +6062,61 @@ class CuaDriver(CuaDriverProtocol):
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
+    async def call_tool_with_id(self, call_id: str,name: str,arguments_json: str) -> ToolResult:
+        """
+        Invoke a tool under a caller-chosen call id so a later
+        [`Self::cancel_call`] can stop exactly this call.
+
+        The id is transport identity, never a tool argument: caller-supplied
+        reserved arguments are stripped first, exactly as [`Self::call_tool`]
+        does, and only this id is added.
+"""
+
+        _UniffiFfiConverterString.check_lower(call_id)
+
+        _UniffiFfiConverterString.check_lower(name)
+
+        _UniffiFfiConverterString.check_lower(arguments_json)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(call_id),
+            _UniffiFfiConverterString.lower(name),
+            _UniffiFfiConverterString.lower(arguments_json),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeToolResult.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeDriverError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool_with_id(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cua_driver_sdk_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_cua_driver_sdk_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_cua_driver_sdk_rust_future_free_rust_buffer,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    def cancel_call(self, call_id: str) -> bool:
+        """
+        Request cancellation of one in-flight call by its call id.
+
+        Returns whether a live operation carried that id — a cancel always
+        races the call it targets, so an unknown id means "already finished",
+        not "failed". Cancellation is cooperative: the call stops at its next
+        checkpoint, releases any held input, and reports a `cancelled` error
+        whose `partial` describes what had already been delivered.
+"""
+
+        _UniffiFfiConverterString.check_lower(call_id)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(call_id),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeDriverError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cua_driver_sdk_fn_method_cuadriver_cancel_call,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     async def click(self, input: cua_driver._native_contract.ClickInput) -> cua_driver._native_contract.ActionResult:
 
         cua_driver._native_contract._UniffiFfiConverterTypeClickInput.check_lower(input)

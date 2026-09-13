@@ -473,6 +473,16 @@ const DEFINITIONS = {
       ret: FfiType.Handle,
       hasRustCallStatus: false,
     },
+    "uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool_with_id": {
+      args: [FfiType.Handle, FfiType.RustBuffer, FfiType.RustBuffer, FfiType.RustBuffer],
+      ret: FfiType.Handle,
+      hasRustCallStatus: false,
+    },
+    "uniffi_cua_driver_sdk_fn_method_cuadriver_cancel_call": {
+      args: [FfiType.Handle, FfiType.RustBuffer],
+      ret: FfiType.Int8,
+      hasRustCallStatus: true,
+    },
     "uniffi_cua_driver_sdk_fn_method_cuadriver_click": {
       args: [FfiType.Handle, FfiType.RustBuffer],
       ret: FfiType.Handle,
@@ -1019,6 +1029,16 @@ const DEFINITIONS = {
       hasRustCallStatus: false,
     },
     "uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool": {
+      args: [],
+      ret: FfiType.UInt16,
+      hasRustCallStatus: false,
+    },
+    "uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool_with_id": {
+      args: [],
+      ret: FfiType.UInt16,
+      hasRustCallStatus: false,
+    },
+    "uniffi_cua_driver_sdk_checksum_method_cuadriver_cancel_call": {
       args: [],
       ret: FfiType.UInt16,
       hasRustCallStatus: false,
@@ -1706,6 +1726,8 @@ interface NativeModuleInterface {
     uniffi_cua_driver_sdk_fn_constructor_cuadriver_create_private_worker_with_client_kind(options: Uint8Array, clientKind: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
     uniffi_cua_driver_sdk_fn_constructor_cuadriver_create_with_client_kind(options: Uint8Array, clientKind: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
     uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool(uniffiSelf: bigint, name: Uint8Array, argumentsJson: Uint8Array): bigint;
+    uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool_with_id(uniffiSelf: bigint, callId: Uint8Array, name: Uint8Array, argumentsJson: Uint8Array): bigint;
+    uniffi_cua_driver_sdk_fn_method_cuadriver_cancel_call(uniffiSelf: bigint, callId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): number;
     uniffi_cua_driver_sdk_fn_method_cuadriver_click(uniffiSelf: bigint, input: Uint8Array): bigint;
     uniffi_cua_driver_sdk_fn_method_cuadriver_clipboard_read(uniffiSelf: bigint, input: Uint8Array): bigint;
     uniffi_cua_driver_sdk_fn_method_cuadriver_clipboard_write(uniffiSelf: bigint, input: Uint8Array): bigint;
@@ -1816,6 +1838,8 @@ interface NativeModuleInterface {
     uniffi_cua_driver_sdk_checksum_constructor_cuadriver_create_private_worker_with_client_kind(): number;
     uniffi_cua_driver_sdk_checksum_constructor_cuadriver_create_with_client_kind(): number;
     uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool(): number;
+    uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool_with_id(): number;
+    uniffi_cua_driver_sdk_checksum_method_cuadriver_cancel_call(): number;
     uniffi_cua_driver_sdk_checksum_method_cuadriver_click(): number;
     uniffi_cua_driver_sdk_checksum_method_cuadriver_clipboard_read(): number;
     uniffi_cua_driver_sdk_checksum_method_cuadriver_clipboard_write(): number;

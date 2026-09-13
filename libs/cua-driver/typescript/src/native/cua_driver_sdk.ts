@@ -3781,6 +3781,25 @@ export interface CuaDriverLike {
  * remain downstream of the same public SDK runtime.
  */
     callTool(name: string, argumentsJson: string, asyncOpts_?: { signal: AbortSignal }) /*throws*/: Promise<ToolResult>;
+/**
+ * Invoke a tool under a caller-chosen call id so a later
+ * [`Self::cancel_call`] can stop exactly this call.
+ *
+ * The id is transport identity, never a tool argument: caller-supplied
+ * reserved arguments are stripped first, exactly as [`Self::call_tool`]
+ * does, and only this id is added.
+ */
+    callToolWithId(callId: string, name: string, argumentsJson: string, asyncOpts_?: { signal: AbortSignal }) /*throws*/: Promise<ToolResult>;
+/**
+ * Request cancellation of one in-flight call by its call id.
+ *
+ * Returns whether a live operation carried that id — a cancel always
+ * races the call it targets, so an unknown id means "already finished",
+ * not "failed". Cancellation is cooperative: the call stops at its next
+ * checkpoint, releases any held input, and reports a `cancelled` error
+ * whose `partial` describes what had already been delivered.
+ */
+    cancelCall(callId: string) /*throws*/: boolean;
     click(input: ClickInput, asyncOpts_?: { signal: AbortSignal }) /*throws*/: Promise<ActionResult>;
     clipboardRead(input: ClipboardReadInput, asyncOpts_?: { signal: AbortSignal }) /*throws*/: Promise<ToolResult>;
     clipboardWrite(input: ClipboardWriteInput, asyncOpts_?: { signal: AbortSignal }) /*throws*/: Promise<ToolResult>;
@@ -4133,6 +4152,68 @@ private constructor(pointer: UniffiHandle) {
         }
         throw __error;
     }
+    }
+
+/**
+ * Invoke a tool under a caller-chosen call id so a later
+ * [`Self::cancel_call`] can stop exactly this call.
+ *
+ * The id is transport identity, never a tool argument: caller-supplied
+ * reserved arguments are stripped first, exactly as [`Self::call_tool`]
+ * does, and only this id is added.
+ */
+    async callToolWithId(callId: string, name: string, argumentsJson: string, asyncOpts_?: { signal: AbortSignal }): Promise<ToolResult> /*throws*/ {
+    const __stack = uniffiIsDebug ? new Error().stack : undefined;
+    try {
+        return await uniffiRustCallAsync(
+            /*rustCaller:*/ uniffiCaller,
+            /*rustFutureFunc:*/ () => {
+                return nativeModule().uniffi_cua_driver_sdk_fn_method_cuadriver_call_tool_with_id(
+                    uniffiTypeCuaDriverObjectFactory.clonePointer(this),FfiConverterString.lower(callId, nativeModule().rustbuffer_alloc),FfiConverterString.lower(name, nativeModule().rustbuffer_alloc),FfiConverterString.lower(argumentsJson, nativeModule().rustbuffer_alloc)
+                );
+            },
+            /*pollFunc:*/ nativeModule().ffi_cua_driver_sdk_rust_future_poll_rust_buffer,
+            /*cancelFunc:*/ nativeModule().ffi_cua_driver_sdk_rust_future_cancel_rust_buffer,
+            /*completeFunc:*/ nativeModule().ffi_cua_driver_sdk_rust_future_complete_rust_buffer,
+            /*freeFunc:*/ nativeModule().ffi_cua_driver_sdk_rust_future_free_rust_buffer,
+            // Async returns always go through the JS-side converter: the
+            // FFI symbol returns the future handle (u64), and the user-level
+            // RustBuffer comes back via the shared `rust_future_complete_*`
+            // export. The bytes the runtime hands back must be deserialized
+            // here using the per-callable return-type converter.
+            /*liftFunc:*/ FfiConverterTypeToolResult.lift.bind(FfiConverterTypeToolResult),
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+            /*asyncOpts:*/ asyncOpts_,
+            /*errorHandler:*/ FfiConverterTypeDriverError.lift.bind(FfiConverterTypeDriverError)
+        );
+    } catch (__error: any) {
+        if (uniffiIsDebug && __error instanceof Error) {
+            __error.stack = __stack;
+        }
+        throw __error;
+    }
+    }
+
+/**
+ * Request cancellation of one in-flight call by its call id.
+ *
+ * Returns whether a live operation carried that id — a cancel always
+ * races the call it targets, so an unknown id means "already finished",
+ * not "failed". Cancellation is cooperative: the call stops at its next
+ * checkpoint, releases any held input, and reports a `cancelled` error
+ * whose `partial` describes what had already been delivered.
+ */
+    cancelCall(callId: string): boolean /*throws*/ {
+    return FfiConverterBool.lift(uniffiCaller.rustCallWithError(
+            /*liftError:*/ FfiConverterTypeDriverError.lift.bind(FfiConverterTypeDriverError),
+            /*caller:*/ (callStatus) => {
+                return nativeModule().uniffi_cua_driver_sdk_fn_method_cuadriver_cancel_call(
+                uniffiTypeCuaDriverObjectFactory.clonePointer(this),
+        FfiConverterString.lower(callId, nativeModule().rustbuffer_alloc),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    ));
     }
 
     async click(input: ClickInput, asyncOpts_?: { signal: AbortSignal }): Promise<ActionResult> /*throws*/ {
@@ -7592,6 +7673,12 @@ function uniffiEnsureInitialized() {
     }
     if (nativeModule().uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool() !== 24493) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool");
+    }
+    if (nativeModule().uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool_with_id() !== 14167) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_driver_sdk_checksum_method_cuadriver_call_tool_with_id");
+    }
+    if (nativeModule().uniffi_cua_driver_sdk_checksum_method_cuadriver_cancel_call() !== 33184) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_driver_sdk_checksum_method_cuadriver_cancel_call");
     }
     if (nativeModule().uniffi_cua_driver_sdk_checksum_method_cuadriver_click() !== 22807) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_driver_sdk_checksum_method_cuadriver_click");
