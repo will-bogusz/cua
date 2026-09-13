@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How long to wait for an NSMenu to materialize after `AXShowMenu` returns.
+const MENU_APPEARANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+const MENU_APPEARANCE_POLL: std::time::Duration = std::time::Duration::from_millis(40);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowBounds {
     pub x: f64,
@@ -330,6 +334,39 @@ pub fn window_info_by_id(window_id: u32) -> Option<WindowInfo> {
     all_windows_any_layer()
         .into_iter()
         .find(|w| w.window_id == window_id)
+}
+
+/// CGWindowIDs of the accessory (`layer != 0`) windows `pid` currently shows.
+///
+/// An open NSMenu is one of them, so sampling this set across an `AXShowMenu`
+/// answers whether a menu actually appeared: the action returns
+/// `kAXErrorSuccess` on controls that never open one.
+pub fn accessory_window_ids(pid: i32) -> Vec<u32> {
+    all_windows_any_layer()
+        .into_iter()
+        .filter(|window| window.pid == pid && window.layer != 0 && window.is_on_screen)
+        .map(|window| window.window_id)
+        .collect()
+}
+
+/// Whether `pid` opened an accessory window it did not have in `before`.
+///
+/// An NSMenu materializes asynchronously after `AXShowMenu` returns, so this
+/// polls for a bounded interval before answering no.
+pub fn menu_appeared_since(pid: i32, before: &[u32]) -> bool {
+    let deadline = std::time::Instant::now() + MENU_APPEARANCE_TIMEOUT;
+    loop {
+        if accessory_window_ids(pid)
+            .into_iter()
+            .any(|window_id| !before.contains(&window_id))
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(MENU_APPEARANCE_POLL);
+    }
 }
 
 /// Look up a window's bounds by its CGWindowID.

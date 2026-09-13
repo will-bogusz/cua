@@ -827,7 +827,10 @@ impl Tool for ClickTool {
             } else {
                 false
             };
-            let mut selection_pixel = if selection_candidate {
+            // `show_menu` needs the same coordinate frame: AXShowMenu can
+            // report success without opening a menu, and only a real pointer
+            // right-click at the element centre reaches one then.
+            let mut element_pixel = if selection_candidate || effective_action == "show_menu" {
                 if let Some((cx, cy)) = center {
                     super::px_frame::resolve_or_refuse(wid)
                         .await
@@ -844,12 +847,12 @@ impl Tool for ClickTool {
             } else {
                 None
             };
-            // The selection fallback delivers a routed window-local pixel
-            // click — a stricter (WindowPointer) rung than the semantic gate
-            // above. In background, drop the fallback rather than silently
-            // escalate when the pointer rung would refuse (e.g. a
-            // minimized/hidden target); the semantic path still runs.
-            if selection_pixel.is_some()
+            // Both fallbacks deliver a routed window-local pixel event — a
+            // stricter (WindowPointer) rung than the semantic gate above. In
+            // background, drop the fallback rather than silently escalate when
+            // the pointer rung would refuse (e.g. a minimized/hidden target);
+            // the semantic path still runs.
+            if element_pixel.is_some()
                 && !delivery_mode.is_foreground()
                 && _mutation_lease
                     .as_ref()
@@ -862,8 +865,12 @@ impl Tool for ClickTool {
                     .await
                     .is_err()
             {
-                selection_pixel = None;
+                element_pixel = None;
             }
+            let selection_pixel = selection_candidate.then_some(element_pixel).flatten();
+            let menu_pixel = (effective_action == "show_menu")
+                .then_some(element_pixel)
+                .flatten();
 
             // Background delivery cannot produce trusted pointer events, so a
             // control driven by pointerdown ignores this press while AX still
@@ -920,6 +927,7 @@ impl Tool for ClickTool {
                                     &action_clone,
                                     &ck,
                                     selection_pixel,
+                                    menu_pixel,
                                     &selection_modifiers,
                                     foreground,
                                 )?);
@@ -953,6 +961,7 @@ impl Tool for ClickTool {
                                 &action_clone,
                                 &ck,
                                 selection_pixel,
+                                menu_pixel,
                                 &selection_modifiers,
                                 false,
                             )
@@ -1620,6 +1629,7 @@ fn perform_ax_click(
     action_str: &str,
     cursor_key: &str,
     selection_pixel: Option<SelectionPixelTarget>,
+    menu_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
@@ -1756,6 +1766,10 @@ fn perform_ax_click(
         }
     }
 
+    let menus_before = (ax_action == "AXShowMenu")
+        .then(|| crate::windows::accessory_window_ids(pid))
+        .unwrap_or_default();
+
     let reply = dispatch_ax_action(ax_action, || unsafe {
         crate::ax::bindings::perform_action(element, ax_action)
     });
@@ -1784,6 +1798,39 @@ fn perform_ax_click(
     }
 
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
+
+    // AXShowMenu returns success on controls that never open a menu, which
+    // left `click(button:"right")` with no way to reach a context menu at all.
+    // A real pointer right-click at the element centre is the actuation a user
+    // performs, so cross that rung once the AX action proved empty.
+    if ax_action == "AXShowMenu" && !crate::windows::menu_appeared_since(pid, &menus_before) {
+        match menu_pixel {
+            Some(target) => {
+                crate::input::mouse::right_click_at_xy_with_window_local(
+                    pid,
+                    target.screen_x,
+                    target.screen_y,
+                    target.window_x,
+                    target.window_y,
+                    window_id,
+                    &[],
+                )?;
+                summary = format!(
+                    "✅ Right-clicked [{idx}] {role} \"{title}\" at its centre \
+                     ({:.0}, {:.0}): AXShowMenu opened no menu, so a real pointer \
+                     right-click was delivered.",
+                    target.screen_x, target.screen_y
+                );
+                return Ok((summary, false, false, false, true));
+            }
+            None => summary.push_str(
+                "\n⚠️ AXShowMenu reported success but no menu appeared, and the pixel \
+                 right-click at the element centre was unavailable (no resolvable frame, \
+                 or the pointer rung is refused for this target). Re-observe, then \
+                 right-click by pixel with delivery_mode:\"foreground\".",
+            ),
+        }
+    }
 
     // AXPopUpButton: list available options, redirect to set_value.
     if role == "AXPopUpButton" {
