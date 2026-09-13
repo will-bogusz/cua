@@ -1719,6 +1719,12 @@
                     "null"
                   ]
                 },
+                "help": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "in_web_content": {
                   "type": [
                     "boolean",

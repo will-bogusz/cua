@@ -4429,6 +4429,17 @@ export type WindowElement = {
     depth: number,
     elementToken?: string,
     label?: string,
+    /**
+     * The element's own description (`AXDescription`), omitted when it is
+     * already the label. Not advertised in the generated schema: the
+     * manifest generator strips every object key named `description`.
+     */
+    description?: string,
+    /**
+     * The element's tooltip (`AXHelp`), where apps carry semantics the label
+     * does not: which calendar an event belongs to, what a toggle does.
+     */
+    help?: string,
     value?: string,
     valueDescription?: string,
     enabled?: boolean,
@@ -4467,6 +4478,8 @@ const FfiConverterTypeWindowElement = (() => {
                 depth: FfiConverterUInt32.read(from),
                 elementToken: FfiConverterOptionalString.read(from),
                 label: FfiConverterOptionalString.read(from),
+                description: FfiConverterOptionalString.read(from),
+                help: FfiConverterOptionalString.read(from),
                 value: FfiConverterOptionalString.read(from),
                 valueDescription: FfiConverterOptionalString.read(from),
                 enabled: FfiConverterOptionalBoolean.read(from),
@@ -4485,6 +4498,8 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterUInt32.write(value.depth, into);
             FfiConverterOptionalString.write(value.elementToken, into);
             FfiConverterOptionalString.write(value.label, into);
+            FfiConverterOptionalString.write(value.description, into);
+            FfiConverterOptionalString.write(value.help, into);
             FfiConverterOptionalString.write(value.value, into);
             FfiConverterOptionalString.write(value.valueDescription, into);
             FfiConverterOptionalBoolean.write(value.enabled, into);
@@ -4502,6 +4517,8 @@ const FfiConverterTypeWindowElement = (() => {
              FfiConverterUInt32.allocationSize(value.depth) +
              FfiConverterOptionalString.allocationSize(value.elementToken) +
              FfiConverterOptionalString.allocationSize(value.label) +
+             FfiConverterOptionalString.allocationSize(value.description) +
+             FfiConverterOptionalString.allocationSize(value.help) +
              FfiConverterOptionalString.allocationSize(value.value) +
              FfiConverterOptionalString.allocationSize(value.valueDescription) +
              FfiConverterOptionalBoolean.allocationSize(value.enabled) +

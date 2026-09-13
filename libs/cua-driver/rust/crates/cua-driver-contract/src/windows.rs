@@ -207,6 +207,15 @@ pub struct WindowElement {
     pub element_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The element's own description (`AXDescription`), omitted when it is
+    /// already the label. Not advertised in the generated schema: the
+    /// manifest generator strips every object key named `description`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The element's tooltip (`AXHelp`), where apps carry semantics the label
+    /// does not: which calendar an event belongs to, what a toggle does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
