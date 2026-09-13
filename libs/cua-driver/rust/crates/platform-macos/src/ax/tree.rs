@@ -144,7 +144,11 @@ pub struct TreeWalkResult {
     pub related_windows: Vec<RelatedWindow>,
     pub tree_markdown: String,
     pub nodes: Vec<AXNode>,
-    /// True when the walk was cut short by an element/depth cap or deadline.
+    /// True when the walk did not enumerate its whole scope: an element or
+    /// depth cap stopped a subtree, the native budget expired, or a child
+    /// list could not be read. `false` means every child of every visited
+    /// node was seen, so a control missing from `nodes` is missing from the
+    /// window.
     pub truncated: bool,
     /// The shared native-request budget expired. Omitted state remains unknown.
     pub timed_out: bool,
@@ -236,9 +240,9 @@ pub(crate) fn walk_tree_with_timeout(
     let mut index_counter = 0usize;
     // Shared visited-node counter passed into walk_element to enforce the cap.
     let mut visited_count = 0usize;
-    // Set to true only when walk_element actually stops early due to the cap —
-    // avoids a false-positive when the tree naturally ends on exactly the cap.
-    let mut truncated = false;
+    // Recorded only when the walk actually gives something up — a tree that
+    // naturally ends on exactly the cap is complete.
+    let mut truncation = WalkTruncation::default();
     let mut window_scope: Option<WindowScope> = None;
     // Document state of the requested window, read off that one element below.
     let mut document: Option<String> = None;
@@ -371,7 +375,7 @@ pub(crate) fn walk_tree_with_timeout(
                 &mut lines,
                 &mut index_counter,
                 &mut visited_count,
-                &mut truncated,
+                &mut truncation,
                 &mut scope,
                 max_elements,
                 max_depth,
@@ -388,7 +392,7 @@ pub(crate) fn walk_tree_with_timeout(
 
     let stop_reason = super::budget::stop_reason();
     let timed_out = stop_reason == Some(super::budget::StopReason::Deadline);
-    let truncated_flag = truncated || stop_reason.is_some();
+    let truncated_flag = truncation.any() || stop_reason.is_some();
     let raw_markdown = render_lines(&lines);
     let mut tree_markdown = if let Some(q) = query {
         filter_tree(&raw_markdown, q)
@@ -400,11 +404,17 @@ pub(crate) fn walk_tree_with_timeout(
         tree_markdown.push_str("\nAX observation deadline reached. This is partial state; omitted controls and values remain unknown. The native walk has settled.\n");
     } else if let Some(reason) = stop_reason {
         tree_markdown.push_str(&format!("\nAX observation stopped because a native request could not complete ({reason:?}). This is partial state; omitted controls and values remain unknown. The native walk has settled.\n"));
-    } else if truncated_flag {
+    } else if truncation.limit {
         tree_markdown.push_str(&format!(
             "\nAX tree reached its element/depth limit ({max_elements} nodes, depth {max_depth}). \
              This is partial state; omitted controls and values remain unknown."
         ));
+    } else if truncation.unreadable {
+        tree_markdown.push_str(
+            "\nAX tree is partial: an element's child list could not be read, so an \
+             unknown part of this window is missing. Re-observe before concluding a \
+             control is absent.",
+        );
     }
 
     TreeWalkResult {
@@ -444,6 +454,21 @@ unsafe fn read_document_state(window: AXUIElementRef) -> (Option<String>, Option
     (document, edited)
 }
 
+/// Why a walk stopped short of enumerating its whole scope.
+#[derive(Default)]
+struct WalkTruncation {
+    /// An element or depth cap (or the native budget) stopped a subtree.
+    limit: bool,
+    /// An `AXChildren` read hid descendants — see [`copy_children_checked`].
+    unreadable: bool,
+}
+
+impl WalkTruncation {
+    fn any(&self) -> bool {
+        self.limit || self.unreadable
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn walk_element(
     element: AXUIElementRef,
@@ -454,19 +479,19 @@ unsafe fn walk_element(
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
     visited_count: &mut usize,
-    truncated: &mut bool,
+    truncation: &mut WalkTruncation,
     scope: &mut WalkScope,
     max_elements: usize,
     max_depth: usize,
 ) {
     if depth > max_depth || super::budget::exhausted() {
-        *truncated = true;
+        truncation.limit = true;
         return;
     }
     // Enforce total-node cap — mirrors Swift's maxElements guard.
     // Set the truncated flag only when we actually stop early.
     if *visited_count >= max_elements {
-        *truncated = true;
+        truncation.limit = true;
         return;
     }
     *visited_count += 1;
@@ -517,7 +542,8 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
+        let (children, hid_descendants) = copy_children_checked(element);
+        truncation.unreadable |= hid_descendants;
         for child in children {
             walk_element(
                 child,
@@ -528,7 +554,7 @@ unsafe fn walk_element(
                 lines,
                 counter,
                 visited_count,
-                truncated,
+                truncation,
                 scope,
                 max_elements,
                 max_depth,
@@ -592,7 +618,8 @@ unsafe fn walk_element(
     );
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let children = copy_children(element);
+        let (children, hid_descendants) = copy_children_checked(element);
+        truncation.unreadable |= hid_descendants;
         for child in children {
             walk_element(
                 child,
@@ -603,7 +630,7 @@ unsafe fn walk_element(
                 lines,
                 counter,
                 visited_count,
-                truncated,
+                truncation,
                 scope,
                 max_elements,
                 max_depth,
@@ -636,7 +663,7 @@ unsafe fn walk_element(
     // Do not publish a half-read node as an actionable capability. Earlier
     // fully read nodes remain useful in the explicitly partial observation.
     if super::budget::exhausted() {
-        *truncated = true;
+        truncation.limit = true;
         return;
     }
     let node = if is_actionable {
@@ -717,7 +744,8 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
 
-    let children = copy_children(element);
+    let (children, hid_descendants) = copy_children_checked(element);
+    truncation.unreadable |= hid_descendants;
     for child in children {
         walk_element(
             child,
@@ -728,7 +756,7 @@ unsafe fn walk_element(
             lines,
             counter,
             visited_count,
-            truncated,
+            truncation,
             scope,
             max_elements,
             max_depth,
