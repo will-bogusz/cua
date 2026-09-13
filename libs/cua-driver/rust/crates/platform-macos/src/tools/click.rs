@@ -236,6 +236,7 @@ fn apply_delivery_evidence(
     evidence: delivery_probe::Evidence,
     probe_time: std::time::Duration,
     rung: NextRung,
+    chromium_family: bool,
 ) {
     let probe_ms = probe_time.as_millis();
     structured["delivery_probe"] = serde_json::json!({
@@ -257,16 +258,26 @@ fn apply_delivery_evidence(
             structured["effect"] = serde_json::json!("suspected_noop");
             structured["escalation"] = serde_json::json!({
                 "recommended": rung.recommended(),
-                "reason": "background delivery produced no observable change; it cannot \
-                           produce trusted pointer events, so controls driven by \
-                           pointerdown (Chromium/Electron UIs) ignore it"
+                "reason": if chromium_family {
+                    "no observable change after background delivery; it cannot produce \
+                     trusted pointer events, so controls driven by pointerdown \
+                     (Chromium/Electron UIs) ignore it"
+                } else {
+                    "no observable change after background delivery; the probe reads \
+                     element state, app focus, window contents and new windows only, so \
+                     an effect it cannot see is still possible"
+                }
             });
             msg.push_str(&format!(
-                "\n⚠️ No observable change in the target within {probe_ms} ms (element state, \
-                 app focus, window contents, new windows) — treat this as NOT delivered. A \
-                 control driven by pointerdown, common in Chromium/Electron UIs, ignores \
-                 background delivery. {} Do not simply repeat this call; if this control \
-                 legitimately changes nothing, confirm the postcondition yourself instead.",
+                "\n⚠️ Unverified: no change observed within {probe_ms} ms (element state, \
+                 app focus, window contents, new windows) — re-observe before repeating. \
+                 The dispatch may still have landed, so a second call could act twice.{} {}",
+                if chromium_family {
+                    " A control driven by pointerdown, common in Chromium/Electron UIs, \
+                     ignores background delivery."
+                } else {
+                    ""
+                },
                 rung.advice()
             ));
         }
@@ -1035,6 +1046,13 @@ impl Tool for ClickTool {
                         });
                     }
                     if let Some((evidence, probe_time)) = evidence {
+                        let chromium_family =
+                            matches!(evidence, delivery_probe::Evidence::Unchanged)
+                                && cua_driver_core::operation::spawn_blocking(move || {
+                                    crate::browser::is_chromium_family(pid)
+                                })
+                                .await
+                                .unwrap_or(false);
                         apply_delivery_evidence(
                             &mut msg,
                             &mut structured,
@@ -1048,6 +1066,7 @@ impl Tool for ClickTool {
                             } else {
                                 NextRung::PixelForeground
                             },
+                            chromium_family,
                         );
                     }
                     ToolResult::text(msg).with_structured(structured)
@@ -1554,12 +1573,20 @@ impl Tool for ClickTool {
                         "count": count
                     });
                     if let Some((evidence, probe_time)) = evidence {
+                        let chromium_family =
+                            matches!(evidence, delivery_probe::Evidence::Unchanged)
+                                && cua_driver_core::operation::spawn_blocking(move || {
+                                    crate::browser::is_chromium_family(pid)
+                                })
+                                .await
+                                .unwrap_or(false);
                         apply_delivery_evidence(
                             &mut msg,
                             &mut structured,
                             evidence,
                             probe_time,
                             NextRung::Foreground,
+                            chromium_family,
                         );
                     }
                     ToolResult::text(msg).with_structured(structured)
@@ -1878,6 +1905,8 @@ fn map_action(action: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The probe reads four signals; an effect outside them is invisible to
+    /// it, so an unobserved dispatch is unverified, never proven undelivered.
     #[test]
     fn unobserved_background_click_reports_a_suspected_noop_and_names_a_deliverable_rung() {
         let probe = std::time::Duration::from_millis(180);
@@ -1889,12 +1918,18 @@ mod tests {
             delivery_probe::Evidence::Unchanged,
             probe,
             NextRung::PixelForeground,
+            false,
         );
         assert_eq!(ax["effect"], "suspected_noop");
         // An AX press gains nothing from fronting the app: it never carries
         // pointer events, so the rung that can still deliver is pixels + HID.
         assert_eq!(ax["escalation"]["recommended"], "px");
-        assert!(ax_msg.contains("NOT delivered"), "{ax_msg}");
+        assert!(
+            ax_msg.contains("Unverified: no change observed"),
+            "{ax_msg}"
+        );
+        assert!(ax_msg.contains("re-observe before repeating"), "{ax_msg}");
+        assert!(!ax_msg.contains("NOT delivered"), "{ax_msg}");
         assert!(ax_msg.contains("delivery_mode:\"foreground\""), "{ax_msg}");
 
         let mut pixel_msg = "✅ Posted click to pid 1.".to_owned();
@@ -1905,8 +1940,46 @@ mod tests {
             delivery_probe::Evidence::Unchanged,
             probe,
             NextRung::Foreground,
+            false,
         );
         assert_eq!(pixel["escalation"]["recommended"], "foreground");
+    }
+
+    /// Pointerdown advice belongs to Chromium-family targets: on an AppKit app
+    /// it sent the model hunting a cause that does not exist there.
+    #[test]
+    fn pointerdown_advice_is_reserved_for_chromium_family_targets() {
+        let probe = std::time::Duration::from_millis(90);
+        let mut native_msg = String::new();
+        let mut native = serde_json::json!({ "path": "ax" });
+        apply_delivery_evidence(
+            &mut native_msg,
+            &mut native,
+            delivery_probe::Evidence::Unchanged,
+            probe,
+            NextRung::PixelForeground,
+            false,
+        );
+        assert!(!native_msg.contains("pointerdown"), "{native_msg}");
+        assert!(
+            !native["escalation"]["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("pointerdown"),
+            "{native}"
+        );
+
+        let mut chromium_msg = String::new();
+        let mut chromium = serde_json::json!({ "path": "ax" });
+        apply_delivery_evidence(
+            &mut chromium_msg,
+            &mut chromium,
+            delivery_probe::Evidence::Unchanged,
+            probe,
+            NextRung::PixelForeground,
+            true,
+        );
+        assert!(chromium_msg.contains("pointerdown"), "{chromium_msg}");
     }
 
     #[test]
@@ -1919,6 +1992,7 @@ mod tests {
             delivery_probe::Evidence::Changed("element_state"),
             std::time::Duration::from_millis(120),
             NextRung::PixelForeground,
+            false,
         );
         assert_eq!(structured["effect"], "unverifiable");
         assert_eq!(structured["evidence"][0]["kind"], "window_change");
@@ -1936,6 +2010,7 @@ mod tests {
             delivery_probe::Evidence::Unusable,
             std::time::Duration::from_millis(90),
             NextRung::PixelForeground,
+            false,
         );
         assert_eq!(structured["effect"], "suspected_noop");
         assert!(structured["evidence"].is_null());
