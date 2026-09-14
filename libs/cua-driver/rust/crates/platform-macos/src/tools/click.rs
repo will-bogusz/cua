@@ -1686,6 +1686,104 @@ struct AxClickOutcome {
     unverified: Option<AxActionReplyError>,
 }
 
+/// Roles whose click gesture is "put the caret here" rather than "activate".
+/// None of them advertise `AXPress`.
+fn is_text_entry_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXTextField"
+            | "AXTextArea"
+            | "AXSecureTextField"
+            | "AXSearchField"
+            | "AXComboBox"
+            | "AXDateField"
+            | "AXTimeField"
+    )
+}
+
+/// An `AXFocused` write can be accepted and then clobbered when AppKit
+/// installs the window's remembered first responder, so the write is read back
+/// rather than trusted.
+const FOCUS_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// Focus a text control, proving it through the application's own
+/// `AXFocusedUIElement`, and escalate to a pointer click at the control's
+/// centre when the `AXFocused` write does not stick.
+fn focus_text_entry(
+    element_ptr: usize,
+    idx: usize,
+    pid: i32,
+    window_id: u32,
+    role: &str,
+    title: &str,
+    pixel: Option<SelectionPixelTarget>,
+    foreground: bool,
+) -> anyhow::Result<AxClickOutcome> {
+    let ax_accepted = crate::input::ax_actions::focus_element(element_ptr).is_ok();
+    if ax_accepted {
+        std::thread::sleep(FOCUS_READBACK_SETTLE);
+        if crate::input::ax_actions::is_element_focused(pid, element_ptr) {
+            return Ok(AxClickOutcome {
+                summary: format!(
+                    "✅ Focused [{idx}] {role} \"{title}\": a text control does not advertise \
+                     AXPress, so the click set keyboard focus, confirmed through the \
+                     application's own AXFocusedUIElement."
+                ),
+                selection_verified: true,
+                ..AxClickOutcome::default()
+            });
+        }
+    }
+
+    let Some(target) = pixel else {
+        anyhow::bail!(
+            "{role} does not advertise AXPress, the AXFocused write {}, and no resolvable \
+             on-window frame was available for a pointer click; take a fresh snapshot and \
+             click by pixel",
+            if ax_accepted {
+                "did not stick"
+            } else {
+                "was rejected"
+            }
+        );
+    };
+    crate::input::mouse::click_at_xy_with_window_local(
+        pid,
+        target.screen_x,
+        target.screen_y,
+        target.window_x,
+        target.window_y,
+        window_id,
+        1,
+        &[],
+        crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
+    )?;
+    std::thread::sleep(FOCUS_READBACK_SETTLE);
+    if crate::input::ax_actions::is_element_focused(pid, element_ptr) {
+        return Ok(AxClickOutcome {
+            summary: format!(
+                "✅ Focused [{idx}] {role} \"{title}\" at its centre ({:.0}, {:.0}): the \
+                 AXFocused write did not stick, so a pointer click was delivered and \
+                 confirmed through the application's own AXFocusedUIElement.",
+                target.screen_x, target.screen_y
+            ),
+            selection_verified: true,
+            selection_via_pixel: true,
+            ..AxClickOutcome::default()
+        });
+    }
+    Ok(AxClickOutcome {
+        summary: format!(
+            "📨 Clicked [{idx}] {role} \"{title}\" at its centre ({:.0}, {:.0}): a text \
+             control does not advertise AXPress, so focus was written and a pointer click \
+             delivered, but the application still reports another element focused.",
+            target.screen_x, target.screen_y
+        ),
+        selection_via_pixel: true,
+        ..AxClickOutcome::default()
+    })
+}
+
 fn perform_ax_click(
     element_ptr: usize,
     idx: usize,
@@ -1824,6 +1922,23 @@ fn perform_ax_click(
                  transition while preserving the prior selection; \
                  before_selected={before}, last_readback={last_observation:?}; \
                  take a fresh snapshot before retrying"
+            );
+        }
+
+        // A text control's click gesture places the caret; AppKit text roles
+        // do not advertise AXPress, so dispatching one is a known no-op that
+        // reports itself as a probable failure. Establish keyboard focus
+        // instead, which is what the caller wanted the click for.
+        if modifiers.is_empty() && is_text_entry_role(&role) {
+            return focus_text_entry(
+                element_ptr,
+                idx,
+                pid,
+                window_id,
+                &role,
+                &title,
+                selection_pixel,
+                foreground,
             );
         }
     }
