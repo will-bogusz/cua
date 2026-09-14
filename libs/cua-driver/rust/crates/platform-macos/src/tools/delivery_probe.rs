@@ -42,7 +42,8 @@
 use std::time::{Duration, Instant};
 
 use crate::ax::bindings::{
-    copy_bool_attr, copy_string_attr, element_screen_rect, focused_element_of_pid, AXUIElementRef,
+    children_count, copy_bool_attr, copy_string_attr, element_screen_rect, focused_element_of_pid,
+    AXUIElementRef,
 };
 use core_foundation::base::{CFRelease, CFTypeRef};
 
@@ -55,6 +56,18 @@ const TREE_MAX_DEPTH: usize = 25;
 /// inside this budget yields no digest rather than a half-walk that would
 /// differ from its own predecessor for no reason.
 const TREE_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long the post-dispatch window is sampled before a verdict of "nothing
+/// reacted" is believed. An application answers an AX action on its own main
+/// loop, so the reaction is not in place when `AXUIElementPerformAction`
+/// returns: measured on Contacts, pressing the toolbar's add button grows the
+/// button's `AXMenu` child ~1.3 s after the dispatch. A single sample ~500 ms
+/// in called that a no-op and sent the caller to a pixel rung the app ignores.
+/// Matches the `type_text` delivery drain, which answers the same question
+/// about the same kind of latency.
+const SETTLE_BUDGET: Duration = Duration::from_secs(2);
+/// Gap between post-dispatch samples. Each sample already costs one or more
+/// native AX reads, so this only keeps a cheap sample set from spinning.
+const SETTLE_POLL: Duration = Duration::from_millis(50);
 
 /// One sample of the signals the probe can compare. `None` means "not
 /// readable", which is never treated as a change.
@@ -88,6 +101,18 @@ impl Evidence {
             Evidence::Unusable => "unavailable",
         }
     }
+}
+
+/// A verdict plus what it cost to reach it.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeOutcome {
+    pub evidence: Evidence,
+    /// Total AX cost of the probe, before and after the dispatch.
+    pub probe: Duration,
+    /// How long the post-dispatch window was sampled before this verdict.
+    /// This is the number a "nothing reacted" report has to publish: it is
+    /// the whole claim's scope.
+    pub waited: Duration,
 }
 
 /// Pre-dispatch capture. Hold it across the action, then `compare()`.
@@ -126,11 +151,36 @@ impl DeliveryProbe {
         }
     }
 
-    /// Sample again and classify. Blocking AX work — call from a blocking
-    /// thread. Returns the verdict and the total probe cost.
-    pub fn compare(self) -> (Evidence, Duration) {
+    /// Sample the target until something differs or the settle budget runs
+    /// out. Blocking AX work — call from a blocking thread.
+    ///
+    /// The first sample that differs ends the wait, so a responsive
+    /// application pays only its own latency; only a target that never
+    /// reacts pays the whole budget.
+    pub fn compare(self) -> ProbeOutcome {
+        self.compare_within(SETTLE_BUDGET)
+    }
+
+    fn compare_within(self, budget: Duration) -> ProbeOutcome {
         let start = Instant::now();
-        let after = Signals {
+        let deadline = start + budget;
+        loop {
+            let after = self.sample();
+            let evidence = classify(&self.before, &after, self.quiescent);
+            let expired = Instant::now() >= deadline;
+            if matches!(evidence, Evidence::Changed(_)) || expired {
+                return self.outcome(evidence, start.elapsed());
+            }
+            // A cancelled caller stops waiting on a target it no longer wants
+            // and keeps the verdict observed so far.
+            if cua_driver_core::operation::sleep(SETTLE_POLL).is_err() {
+                return self.outcome(evidence, start.elapsed());
+            }
+        }
+    }
+
+    fn sample(&self) -> Signals {
+        Signals {
             element: self.element_ptr.and_then(element_state),
             focus: focus_state(self.pid),
             tree: if self.quiescent {
@@ -138,14 +188,25 @@ impl DeliveryProbe {
             } else {
                 None
             },
-        };
-        let evidence = classify(&self.before, &after, self.quiescent);
-        (evidence, self.elapsed + start.elapsed())
+        }
     }
 
-    /// Probe cost already spent before the dispatch.
-    pub fn elapsed(&self) -> Duration {
-        self.elapsed
+    fn outcome(&self, evidence: Evidence, waited: Duration) -> ProbeOutcome {
+        ProbeOutcome {
+            evidence,
+            probe: self.elapsed + waited,
+            waited,
+        }
+    }
+
+    /// Verdict for a reaction that was already proven while the action ran —
+    /// a sheet or dialog the window observer caught — so nothing is waited for.
+    pub fn settled(&self, evidence: Evidence) -> ProbeOutcome {
+        ProbeOutcome {
+            evidence,
+            probe: self.elapsed,
+            waited: Duration::ZERO,
+        }
     }
 }
 
@@ -181,6 +242,12 @@ pub fn classify(before: &Signals, after: &Signals, quiescent: bool) -> Evidence 
 
 /// Identity + mutable state of one element. `None` when the element no longer
 /// answers AX reads at all (replaced/detached node).
+///
+/// The child count is part of that state because it is the only signal a
+/// menu-bearing control moves: a toolbar `AXMenuButton` whose menu opened
+/// keeps its role, title, value, focus, selection, enablement and frame, and
+/// gains one `AXMenu` child. Contacts' add button is exactly that control,
+/// and without this the probe called an opened menu a no-op.
 fn element_state(element_ptr: usize) -> Option<String> {
     let element = element_ptr as AXUIElementRef;
     unsafe {
@@ -191,8 +258,9 @@ fn element_state(element_ptr: usize) -> Option<String> {
         let selected = copy_bool_attr(element, "AXSelected");
         let enabled = copy_bool_attr(element, "AXEnabled");
         let rect = element_screen_rect(element);
+        let children = children_count(element);
         Some(format!(
-            "{role}|{title}|{value}|{focused:?}|{selected:?}|{enabled:?}|{rect:?}"
+            "{role}|{title}|{value}|{focused:?}|{selected:?}|{enabled:?}|{rect:?}|{children:?}"
         ))
     }
 }

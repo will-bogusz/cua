@@ -61,6 +61,12 @@ extern "C" {
         element: AXUIElementRef,
         names: *mut CFArrayRef,
     ) -> AXError;
+    #[link_name = "AXUIElementGetAttributeValueCount"]
+    fn AXUIElementGetAttributeValueCount_native(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        count: *mut isize,
+    ) -> AXError;
     #[link_name = "AXUIElementCopyActionNames"]
     fn AXUIElementCopyActionNames_native(
         element: AXUIElementRef,
@@ -609,6 +615,29 @@ pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
         CFRelease(window as CFTypeRef);
         window_id
     }
+}
+
+/// How many children an element reports, without copying or retaining any of
+/// them. One native request and no allocation, so it is cheap enough to
+/// sample repeatedly.
+///
+/// `None` when the count could not be read at all — including an element that
+/// does not carry `AXChildren`, which is indistinguishable here from one whose
+/// read failed and must therefore not be reported as "no children".
+///
+/// # Safety
+///
+/// `element` must be valid.
+pub unsafe fn children_count(element: AXUIElementRef) -> Option<usize> {
+    let attr = CFStr::new("AXChildren");
+    let mut count: isize = 0;
+    let err = super::budget::request(element, || {
+        AXUIElementGetAttributeValueCount_native(element, attr.as_concrete_TypeRef(), &mut count)
+    });
+    if err != kAXErrorSuccess || count < 0 {
+        return None;
+    }
+    Some(count as usize)
 }
 
 /// Get the children of an AX element.

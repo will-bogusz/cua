@@ -1226,6 +1226,55 @@ fn harness_appkit_type_text_waits_for_a_lagging_value_readback() {
     );
 }
 
+/// An application answers an AX action on its own main loop, so the effect is
+/// not in place when `AXUIElementPerformAction` returns. Contacts' toolbar add
+/// button opens its menu ~1.3 s later; a probe that sampled once at ~500 ms
+/// called that a no-op and escalated to a pixel rung the app ignores.
+#[test]
+#[ignore]
+fn harness_appkit_press_effect_after_the_first_sample_is_not_a_noop() {
+    run_background_case_with_env(
+        "press_late_effect",
+        Targeting::Ax,
+        DriverRoute::MacosAxAction,
+        &[("CUA_APPKIT_PRESS_LATENCY_MS", "1200")],
+        |pid, wid, driver| {
+            let snap_pre = snapshot_elements(driver, pid, wid);
+            assert!(
+                snap_pre.tree_text().contains("counter=0"),
+                "fixture did not start at zero:\n{}",
+                snap_pre.tree_text()
+            );
+            let idx = element_index_by_id(snap_pre.tree_text(), "btn-increment")
+                .expect("btn-increment element_index not found");
+            let resp = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid, "element_index": idx,
+                    "snapshot_id": snap_pre.snapshot_id()
+                }),
+            );
+            assert!(!resp.is_error(), "AppKit click failed: {}", resp.text());
+            assert_ne!(
+                resp.action_effect(),
+                Some("suspected_noop"),
+                "a press whose effect landed inside the settle budget was called a no-op: {}",
+                resp.raw
+            );
+            assert!(
+                resp.text().contains("Delivered:"),
+                "the reply must name the reaction it waited for: {}",
+                resp.text()
+            );
+            let post = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                post.contains("counter=1"),
+                "the fixture never published the press:\n{post}"
+            );
+        },
+    );
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_scroll_foreground() {

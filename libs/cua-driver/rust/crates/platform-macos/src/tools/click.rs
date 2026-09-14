@@ -285,17 +285,18 @@ impl NextRung {
 fn apply_delivery_evidence(
     msg: &mut String,
     structured: &mut serde_json::Value,
-    evidence: delivery_probe::Evidence,
-    probe_time: std::time::Duration,
+    outcome: delivery_probe::ProbeOutcome,
     rung: NextRung,
     chromium_family: bool,
 ) {
-    let probe_ms = probe_time.as_millis();
+    let probe_ms = outcome.probe.as_millis();
+    let waited_ms = outcome.waited.as_millis();
     structured["delivery_probe"] = serde_json::json!({
-        "signal": evidence.signal(),
+        "signal": outcome.evidence.signal(),
         "probe_ms": probe_ms,
+        "waited_ms": waited_ms,
     });
-    match evidence {
+    match outcome.evidence {
         delivery_probe::Evidence::Changed(signal) => {
             structured["evidence"] = serde_json::json!([
                 { "kind": "window_change", "detail": signal }
@@ -321,9 +322,10 @@ fn apply_delivery_evidence(
                 }
             });
             msg.push_str(&format!(
-                "\n⚠️ Unverified: no change observed within {probe_ms} ms (element state, \
-                 app focus, window contents, new windows) — re-observe before repeating. \
-                 The dispatch may still have landed, so a second call could act twice.{} {}",
+                "\n⚠️ Unverified: the target was watched for {waited_ms} ms after the \
+                 dispatch and nothing changed (element state, app focus, window contents, \
+                 new windows) — re-observe before repeating. The dispatch may still have \
+                 landed, so a second call could act twice.{} {}",
                 if chromium_family {
                     " A control driven by pointerdown, common in Chromium/Electron UIs, \
                      ignores background delivery."
@@ -1053,10 +1055,7 @@ impl Tool for ClickTool {
                         None
                     } else if changes.needs_restore() {
                         probe.map(|probe| {
-                            (
-                                delivery_probe::Evidence::Changed("window_change"),
-                                probe.elapsed(),
-                            )
+                            probe.settled(delivery_probe::Evidence::Changed("window_change"))
                         })
                     } else if let Some(probe) = probe {
                         cua_driver_core::operation::spawn_blocking(move || probe.compare())
@@ -1113,9 +1112,9 @@ impl Tool for ClickTool {
                                        screenshot from get_window_state."
                         });
                     }
-                    if let Some((evidence, probe_time)) = evidence {
+                    if let Some(outcome) = evidence {
                         let chromium_family =
-                            matches!(evidence, delivery_probe::Evidence::Unchanged)
+                            matches!(outcome.evidence, delivery_probe::Evidence::Unchanged)
                                 && cua_driver_core::operation::spawn_blocking(move || {
                                     crate::browser::is_chromium_family(pid)
                                 })
@@ -1124,8 +1123,7 @@ impl Tool for ClickTool {
                         apply_delivery_evidence(
                             &mut msg,
                             &mut structured,
-                            evidence,
-                            probe_time,
+                            outcome,
                             // The selection fallback already delivered real
                             // pixels; everything else on this branch is an AX
                             // action, which foreground cannot upgrade.
@@ -1615,10 +1613,7 @@ impl Tool for ClickTool {
                     };
                     let evidence = if changes.needs_restore() {
                         probe.map(|probe| {
-                            (
-                                delivery_probe::Evidence::Changed("window_change"),
-                                probe.elapsed(),
-                            )
+                            probe.settled(delivery_probe::Evidence::Changed("window_change"))
                         })
                     } else if let Some(probe) = probe {
                         cua_driver_core::operation::spawn_blocking(move || probe.compare())
@@ -1640,9 +1635,9 @@ impl Tool for ClickTool {
                         "targeting": if indexed_point.is_some() { "element_center" } else { "pixel" },
                         "count": count
                     });
-                    if let Some((evidence, probe_time)) = evidence {
+                    if let Some(outcome) = evidence {
                         let chromium_family =
-                            matches!(evidence, delivery_probe::Evidence::Unchanged)
+                            matches!(outcome.evidence, delivery_probe::Evidence::Unchanged)
                                 && cua_driver_core::operation::spawn_blocking(move || {
                                     crate::browser::is_chromium_family(pid)
                                 })
@@ -1651,8 +1646,7 @@ impl Tool for ClickTool {
                         apply_delivery_evidence(
                             &mut msg,
                             &mut structured,
-                            evidence,
-                            probe_time,
+                            outcome,
                             NextRung::Foreground,
                             chromium_family,
                         );
@@ -2040,18 +2034,27 @@ fn map_action(action: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    fn outcome(evidence: delivery_probe::Evidence, waited_ms: u64) -> delivery_probe::ProbeOutcome {
+        delivery_probe::ProbeOutcome {
+            evidence,
+            probe: std::time::Duration::from_millis(waited_ms + 250),
+            waited: std::time::Duration::from_millis(waited_ms),
+        }
+    }
+
     /// The probe reads four signals; an effect outside them is invisible to
     /// it, so an unobserved dispatch is unverified, never proven undelivered.
+    /// The claim is only as wide as the window it watched, so the report has
+    /// to name that window: a reader who knows the app reacts late can tell a
+    /// short watch from a real no-op.
     #[test]
     fn unobserved_background_click_reports_a_suspected_noop_and_names_a_deliverable_rung() {
-        let probe = std::time::Duration::from_millis(180);
         let mut ax_msg = "✅ Performed AXPress on [3] AXButton \"New Item\".".to_owned();
         let mut ax = serde_json::json!({ "path": "ax", "effect": "unverifiable" });
         apply_delivery_evidence(
             &mut ax_msg,
             &mut ax,
-            delivery_probe::Evidence::Unchanged,
-            probe,
+            outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             false,
         );
@@ -2059,8 +2062,9 @@ mod tests {
         // An AX press gains nothing from fronting the app: it never carries
         // pointer events, so the rung that can still deliver is pixels + HID.
         assert_eq!(ax["escalation"]["recommended"], "px");
+        assert_eq!(ax["delivery_probe"]["waited_ms"], 2000);
         assert!(
-            ax_msg.contains("Unverified: no change observed"),
+            ax_msg.contains("watched for 2000 ms after the dispatch"),
             "{ax_msg}"
         );
         assert!(ax_msg.contains("re-observe before repeating"), "{ax_msg}");
@@ -2072,8 +2076,7 @@ mod tests {
         apply_delivery_evidence(
             &mut pixel_msg,
             &mut pixel,
-            delivery_probe::Evidence::Unchanged,
-            probe,
+            outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::Foreground,
             false,
         );
@@ -2084,14 +2087,12 @@ mod tests {
     /// it sent the model hunting a cause that does not exist there.
     #[test]
     fn pointerdown_advice_is_reserved_for_chromium_family_targets() {
-        let probe = std::time::Duration::from_millis(90);
         let mut native_msg = String::new();
         let mut native = serde_json::json!({ "path": "ax" });
         apply_delivery_evidence(
             &mut native_msg,
             &mut native,
-            delivery_probe::Evidence::Unchanged,
-            probe,
+            outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             false,
         );
@@ -2109,8 +2110,7 @@ mod tests {
         apply_delivery_evidence(
             &mut chromium_msg,
             &mut chromium,
-            delivery_probe::Evidence::Unchanged,
-            probe,
+            outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             true,
         );
@@ -2124,8 +2124,7 @@ mod tests {
         apply_delivery_evidence(
             &mut msg,
             &mut structured,
-            delivery_probe::Evidence::Changed("element_state"),
-            std::time::Duration::from_millis(120),
+            outcome(delivery_probe::Evidence::Changed("element_state"), 120),
             NextRung::PixelForeground,
             false,
         );
@@ -2142,8 +2141,7 @@ mod tests {
         apply_delivery_evidence(
             &mut msg,
             &mut structured,
-            delivery_probe::Evidence::Unusable,
-            std::time::Duration::from_millis(90),
+            outcome(delivery_probe::Evidence::Unusable, 2000),
             NextRung::PixelForeground,
             false,
         );

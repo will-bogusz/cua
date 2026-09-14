@@ -395,8 +395,28 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     // MARK: - Actions
 
     @objc private func onIncrement() {
+        // Real applications answer an AX action on their own main loop and
+        // publish the result later: Contacts' toolbar add button opens its
+        // menu ~1.3 s after AXPress returns. CUA_APPKIT_PRESS_LATENCY_MS
+        // reproduces that so a driver that samples the target once, right
+        // after the dispatch, is caught calling a real effect a no-op.
+        let latency = HarnessWindowController.envSeconds("CUA_APPKIT_PRESS_LATENCY_MS")
         counterValue += 1
-        counterLabel.stringValue = "counter=\(counterValue)"
+        let published = "counter=\(counterValue)"
+        guard latency > 0 else {
+            counterLabel.stringValue = published
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + latency) { [weak counterLabel] in
+            counterLabel?.stringValue = published
+        }
+    }
+
+    /// Milliseconds from `name`, as seconds. Absent or unparseable is 0.
+    static func envSeconds(_ name: String) -> TimeInterval {
+        guard let raw = ProcessInfo.processInfo.environment[name],
+              let ms = Double(raw), ms > 0 else { return 0 }
+        return ms / 1000
     }
 
     @objc private func onReset() {
