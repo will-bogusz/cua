@@ -402,10 +402,33 @@ async fn resolve_write_plan(
             )
             .await
         {
-            return WritePlan::Blocked(keystroke_refusal_reason(&refusal));
+            return refused_keystroke_plan(&plan, &advertised, &refusal);
         }
     }
     plan
+}
+
+/// What is left when the keystroke rung is refused before dispatch.
+///
+/// The gate refuses process-scoped keys whenever the application owns another
+/// eligible top-level window, and an open save panel is exactly that: its own
+/// top-level window beside the document. `set_value` has no `delivery_mode`,
+/// so the refusal is final for this call. An advertised `AXConfirm` is then
+/// the only end-of-edit left, and on a save panel it is the panel's own
+/// confirm — measured on Automator: the write is saved to disk under the
+/// written name. Keeping the `AXValue` route in that case preserves a control
+/// the typed route cannot reach; the verdict stays `unproven`, because a
+/// read-back is all the evidence there is.
+fn refused_keystroke_plan(
+    plan: &WritePlan,
+    advertised: &[String],
+    refusal: &ToolResult,
+) -> WritePlan {
+    let confirms = advertised.iter().any(|action| action == "AXConfirm");
+    if matches!(plan, WritePlan::Retype(_)) && confirms {
+        return WritePlan::ValueThenConfirm;
+    }
+    WritePlan::Blocked(keystroke_refusal_reason(refusal))
 }
 
 fn keystroke_refusal_reason(refusal: &ToolResult) -> String {
@@ -443,25 +466,23 @@ fn commit_written_value(
                 let after = unsafe { copy_string_attr(element, "AXValue") };
                 value_matches(after.as_deref(), requested, numeric)
             };
-            // An `AXConfirm` leaves the control focused, so there is no ended
-            // edit session to observe: the value read back is the only
-            // evidence there is.
+            // An `AXConfirm` is not an end-of-edit the driver can read, and
+            // the value never went through the field editor, so the read-back
+            // is the only evidence there is.
             judge_commit(dispatched, survived, false, "AXConfirm")
         }
         WritePlan::ValueThenKey(key) => {
             let focused = crate::input::ax_actions::focus_element(element as usize).is_ok();
             let dispatched = focused && crate::input::keyboard::press_key(pid, key, &[]).is_ok();
-            let (survived, edit_ended) = if dispatched {
+            let survived = dispatched && {
                 std::thread::sleep(COMMIT_SETTLE);
                 let after = unsafe { copy_string_attr(element, "AXValue") };
-                (
-                    value_matches(after.as_deref(), requested, numeric),
-                    !crate::input::ax_actions::is_element_focused(pid, element as usize),
-                )
-            } else {
-                (false, false)
+                value_matches(after.as_deref(), requested, numeric)
             };
-            judge_commit(dispatched, survived, edit_ended, key)
+            // The key ends the edit session, but the value in it arrived
+            // through `AXValue` rather than the field editor, so the ended
+            // session is not evidence the app took it.
+            judge_commit(dispatched, survived, false, key)
         }
     }
 }
@@ -470,13 +491,22 @@ fn commit_written_value(
 ///
 /// An accessibility read-back is echoed by a bound control whether or not the
 /// application took the value, so it can only ever refute a commit. The one
-/// positive signal available is the edit session itself ending — which is what
+/// positive signal available is a *typed* edit session ending — which is what
 /// an AppKit binding commits on — observed as the control losing the app's own
 /// keyboard focus after a gesture that had established it.
+///
+/// `typed` is what makes the ended edit mean anything, and it is measured, not
+/// assumed. On Automator's "Save as:" action parameter (2026-09-14): an
+/// `AXValue` write, a proven `AXFocused` write and a Tab that demonstrably
+/// moved focus left the written string in the control's read-back and the
+/// application still kept its own value in `document.wflow`. An ended edit
+/// session over a value the field editor never saw proves nothing, so an
+/// `AXValue` route can reach `unproven` at best; the same sequence with the
+/// value typed through the keystroke rung committed.
 fn judge_commit(
     dispatched: bool,
     survived: bool,
-    edit_ended: bool,
+    typed_edit_ended: bool,
     gesture: &str,
 ) -> (Option<ActionCommit>, String) {
     if !dispatched {
@@ -493,10 +523,13 @@ fn judge_commit(
                 .to_owned(),
         );
     }
-    if edit_ended {
+    if typed_edit_ended {
         return (
             Some(ActionCommit::Committed),
-            format!(" Committed via {gesture}: the edit session ended with this value in place."),
+            format!(
+                " Committed via {gesture}: the typed edit session ended with this value in \
+                 place."
+            ),
         );
     }
     (
@@ -1097,7 +1130,7 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, commit_written_value,
-        judge_commit, write_plan, SetValueOutcome, WritePlan,
+        judge_commit, refused_keystroke_plan, write_plan, SetValueOutcome, ToolResult, WritePlan,
     };
     use cua_driver_contract::ActionCommit;
 
@@ -1210,13 +1243,23 @@ mod tests {
     }
 
     /// A read-back is echoed by a bound control whether or not the app took
-    /// the value, so surviving the gesture alone can never say `committed`.
+    /// the value, so surviving the gesture alone can never say `committed` —
+    /// and neither can an ended edit session over a value the field editor
+    /// never saw. Measured on Automator's "Save as:" action parameter: an
+    /// `AXValue` write plus a Tab that moved focus survived the read-back and
+    /// the app still kept its own value on disk.
     #[test]
-    fn a_surviving_value_without_an_ended_edit_is_unproven() {
+    fn only_a_typed_ended_edit_is_a_commit() {
         let (committed, detail) = judge_commit(true, true, false, "AXConfirm");
         assert_eq!(committed, Some(ActionCommit::Unproven));
         assert!(detail.contains("Commit unproven"), "{detail}");
 
+        // The AXValue + Tab route: dispatched, survived, and the edit really
+        // ended — but untyped, so the only honest verdict is unproven.
+        assert_eq!(
+            judge_commit(true, true, false, "tab").0,
+            Some(ActionCommit::Unproven)
+        );
         assert_eq!(
             judge_commit(true, true, true, "tab").0,
             Some(ActionCommit::Committed)
@@ -1229,6 +1272,37 @@ mod tests {
             judge_commit(false, false, false, "tab").0,
             Some(ActionCommit::NotCommitted)
         );
+    }
+
+    /// `set_value` has no `delivery_mode`, so a refused keystroke is final for
+    /// the call. A save panel is always a sibling top-level window, which is
+    /// exactly what the gate refuses on — dropping to the control's own
+    /// advertised `AXConfirm` keeps that control reachable instead of turning
+    /// the whole write into a refusal.
+    #[test]
+    fn a_refused_retype_falls_back_to_an_advertised_confirm() {
+        let refusal = ToolResult::error("refused".to_owned());
+        assert_eq!(
+            refused_keystroke_plan(
+                &WritePlan::Retype("tab"),
+                &["AXShowMenu".to_owned(), "AXConfirm".to_owned()],
+                &refusal,
+            ),
+            WritePlan::ValueThenConfirm
+        );
+        assert!(matches!(
+            refused_keystroke_plan(&WritePlan::Retype("tab"), &[], &refusal),
+            WritePlan::Blocked(_)
+        ));
+        // The AXValue routes have no second gesture to fall back to.
+        assert!(matches!(
+            refused_keystroke_plan(
+                &WritePlan::ValueThenKey("tab"),
+                &["AXConfirm".to_owned()],
+                &refusal,
+            ),
+            WritePlan::Blocked(_)
+        ));
     }
 
     #[test]
