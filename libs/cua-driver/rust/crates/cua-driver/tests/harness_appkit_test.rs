@@ -801,14 +801,16 @@ fn harness_appkit_text_input() {
 }
 
 /// set_value must reach the app's own editing pipeline, not just the AX tree.
-/// The fixture publishes `committed=<value>` from `controlTextDidEndEditing`,
-/// so this reads the app's state rather than the value the write echoes back.
+/// The fixture publishes `committed=<value>` from `controlTextDidEndEditing`
+/// and mirrors `controlTextDidChange` into `lbl-input-mirror`. AppKit raises
+/// neither notification for a programmatic `setStringValue:`, so the mirror is
+/// what separates a write the editor processed from an `AXValue` echo.
 #[test]
 #[ignore]
 fn harness_appkit_set_value_commits_the_edit() {
     run_background_case(
         "set_value_commit",
-        DriverRoute::MacosAxValue,
+        DriverRoute::MacosCgEventPid,
         |pid, wid, driver| {
             let before = snapshot_elements(driver, pid, wid);
             assert!(
@@ -828,8 +830,14 @@ fn harness_appkit_set_value_commits_the_edit() {
             assert!(!set.is_error(), "set_value failed: {}", set.text());
             assert_eq!(
                 set.structured()["committed"],
-                serde_json::json!(true),
+                serde_json::json!("committed"),
                 "set_value did not report a committed write: {}",
+                set.raw
+            );
+            assert_eq!(
+                set.action_route(),
+                Some("synthetic_events"),
+                "a bound field must be written through the keystroke rung: {}",
                 set.raw
             );
 
@@ -838,6 +846,130 @@ fn harness_appkit_set_value_commits_the_edit() {
             assert!(
                 after.tree_text().contains("committed=commit-cua"),
                 "the app never registered the write:\n{}",
+                after.tree_text()
+            );
+            let mirror = element_index_by_id(after.tree_text(), "lbl-input-mirror")
+                .expect("mirror label remains addressable");
+            let mirror_value = after.structured()["elements"]
+                .as_array()
+                .and_then(|elements| {
+                    elements
+                        .iter()
+                        .find(|element| element["element_index"].as_u64() == Some(mirror))
+                })
+                .and_then(|element| element["value"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            assert_eq!(
+                mirror_value,
+                "commit-cua",
+                "controlTextDidChange never fired, so the value was echoed rather than typed: {}",
+                after.tree_text()
+            );
+        },
+    );
+}
+
+/// `press_key` on the foreground rung built its events with a default source
+/// and no flags, so a chord's base key arrived bare: `cmd+a` typed a literal
+/// `a`. The fixture's accelerator requires the modifiers to be present on the
+/// event itself (`flags.contains([.control, .shift])`).
+#[test]
+#[ignore]
+fn harness_appkit_foreground_press_key_chord_carries_its_modifiers() {
+    run_case(
+        native_foreground_case(
+            "appkit",
+            "press_key_chord",
+            Targeting::Ax,
+            DriverRoute::MacosCgEventHid,
+        ),
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("accel_fired=0"),
+                "fixture did not start with an unfired accelerator:\n{}",
+                before.tree_text()
+            );
+            let chord = driver.call(
+                "press_key",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "key": "k",
+                    "modifiers": ["ctrl", "shift"],
+                    "delivery_mode": "foreground"
+                }),
+            );
+            assert!(
+                !chord.is_error(),
+                "foreground press_key chord failed: {}",
+                chord.text()
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let after = snapshot_elements(driver, pid, wid);
+                if after.tree_text().contains("accel_fired=1") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ctrl+shift+k arrived without its modifiers:\n{}",
+                    after.tree_text()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
+/// A text control does not advertise `AXPress`, so a click used to dispatch
+/// one anyway and report `-25206` plus "Action may have been a no-op" on the
+/// route that works. A click on a text role means "put the caret here": the
+/// proof is that the next unaddressed `type_text` lands in that field.
+#[test]
+#[ignore]
+fn harness_appkit_click_on_a_text_role_focuses_it() {
+    run_background_case(
+        "click_text_focus",
+        DriverRoute::MacosAxValue,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let clicked = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "txt-input")
+                }),
+            );
+            assert!(!clicked.is_error(), "click failed: {}", clicked.text());
+            assert!(
+                !clicked.text().contains("does not advertise"),
+                "a text role still had an AXPress dispatched at it: {}",
+                clicked.text()
+            );
+            assert_eq!(
+                clicked.action_effect(),
+                Some("confirmed"),
+                "focusing a text control is read-back verifiable: {}",
+                clicked.raw
+            );
+
+            let typed = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "text": "focus-cua"
+                }),
+            );
+            assert!(!typed.is_error(), "type_text failed: {}", typed.text());
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after.tree_text().contains("focus-cua"),
+                "the click did not leave the field focused:\n{}",
                 after.tree_text()
             );
         },
@@ -868,6 +1000,15 @@ fn harness_appkit_element_foreground_press_key_commits_edit() {
                 }),
             );
             assert!(!typed.is_error(), "type_text failed: {}", typed.text());
+            // The fixture is still `committed=none` at this point, so a
+            // read-back that shows the text must not read as an accepted
+            // value: type_text delivers no end-of-edit.
+            assert_eq!(
+                typed.structured()["committed"],
+                serde_json::json!("unproven"),
+                "type_text implied the app had taken the value: {}",
+                typed.raw
+            );
 
             let second = snapshot_elements(driver, pid, wid);
             assert!(
