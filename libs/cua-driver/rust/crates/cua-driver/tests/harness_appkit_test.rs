@@ -848,21 +848,15 @@ fn harness_appkit_set_value_commits_the_edit() {
                 "the app never registered the write:\n{}",
                 after.tree_text()
             );
-            let mirror = element_index_by_id(after.tree_text(), "lbl-input-mirror")
-                .expect("mirror label remains addressable");
-            let mirror_value = after.structured()["elements"]
-                .as_array()
-                .and_then(|elements| {
-                    elements
-                        .iter()
-                        .find(|element| element["element_index"].as_u64() == Some(mirror))
-                })
-                .and_then(|element| element["value"].as_str().map(str::to_owned))
-                .unwrap_or_default();
-            assert_eq!(
-                mirror_value,
-                "commit-cua",
-                "controlTextDidChange never fired, so the value was echoed rather than typed: {}",
+            // Labels carry no accessibility identifier in the published tree,
+            // so the mirror is read as the static-text row holding the typed
+            // value. `committed=commit-cua` is the commit label; a bare
+            // `commit-cua` static text can only be the mirror.
+            assert!(
+                after
+                    .tree_text()
+                    .contains("AXStaticText = \"commit-cua\""),
+                "controlTextDidChange never fired, so the value was echoed rather than typed:\n{}",
                 after.tree_text()
             );
         },
