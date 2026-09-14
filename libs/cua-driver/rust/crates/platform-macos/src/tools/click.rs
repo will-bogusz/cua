@@ -1725,8 +1725,8 @@ fn focus_text_entry(
         if crate::input::ax_actions::is_element_focused(pid, element_ptr) {
             return Ok(AxClickOutcome {
                 summary: format!(
-                    "✅ Focused [{idx}] {role} \"{title}\": a text control does not advertise \
-                     AXPress, so the click set keyboard focus, confirmed through the \
+                    "✅ Focused [{idx}] {role} \"{title}\": a text control has no AXPress \
+                     action, so the click set keyboard focus, confirmed through the \
                      application's own AXFocusedUIElement."
                 ),
                 selection_verified: true,
@@ -1737,7 +1737,7 @@ fn focus_text_entry(
 
     let Some(target) = pixel else {
         anyhow::bail!(
-            "{role} does not advertise AXPress, the AXFocused write {}, and no resolvable \
+            "{role} has no AXPress action, the AXFocused write {}, and no resolvable \
              on-window frame was available for a pointer click; take a fresh snapshot and \
              click by pixel",
             if ax_accepted {
@@ -1775,7 +1775,7 @@ fn focus_text_entry(
     Ok(AxClickOutcome {
         summary: format!(
             "📨 Clicked [{idx}] {role} \"{title}\" at its centre ({:.0}, {:.0}): a text \
-             control does not advertise AXPress, so focus was written and a pointer click \
+             control has no AXPress action, so focus was written and a pointer click \
              delivered, but the application still reports another element focused.",
             target.screen_x, target.screen_y
         ),
