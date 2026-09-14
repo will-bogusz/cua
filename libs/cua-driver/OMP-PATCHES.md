@@ -72,3 +72,30 @@ Behavioural fixes made while porting (not in the pre-0.28 fork):
   as `cancelled` (upstream's `shutdown_drains_an_already_admitted_call`); a
   cancel that arrives before its call registers (concurrent dispatch) is held
   briefly and applied at registration.
+
+# Bench fixes carried on `will/bench-fixes`
+
+`will/bench-fixes` is `will/omp` at `54a2437d8` plus the patches below, in
+stack order, one commit per row. Every one comes from a measured agent run
+(`trycua-omp/research/bench-set-20260911/`), so the "what the runs showed"
+column cites the transcripts rather than a design opinion. The rules above
+apply unchanged: generated files are regenerated, and each added result field
+rides through the 0.28.0 `conforming_tool_result` boundary.
+
+| # | Patch (commit title) | What the runs showed | Upstream PR? |
+|---|---|---|---|
+| B1 | `fix(macos): commit set_value writes through the app's editing pipeline` | An `AXValue` write reads back correctly while the app's editor never sees it; a Save-panel filename was discarded and the file landed as `Untitled.txt`. Adds the `committed` flag. | yes |
+| B2 | `fix(macos): report an unobserved click as unverified, not undelivered` | The four-signal probe cannot see every effect, yet the reply asserted "NOT delivered" and blamed `pointerdown` on AppKit targets, routing the model away from presses that had landed. | yes |
+| B3 | `fix(macos): clamp the scroll amount on the keystroke path` | The window path passed the raw `amount` into its keystroke loop: one `amount: 1100` call spent 82 s scrolling. | yes |
+| B4 | `fix(macos): read typed text back from the element that received it` | AppKit installs a field editor over the edited field, so the pinned pointer kept reading the pre-edit string and every complete insertion in Contacts was reported `type_text_incomplete`. | yes |
+| B5 | `fix(macos): right-click an element by pixel when AXShowMenu opens no menu` | `AXShowMenu` returns success on controls that open no menu, so `click(button:"right")` reported success with no menu anywhere. | yes |
+| B6 | `feat(macos): ship AXHelp and AXDescription in structured elements` | `label` collapses title/description/value, so a caller reading structured rows could not tell Reminders' completion toggle from an open action. | `help` yes; `description` blocked by the manifest generator stripping keys named `description` |
+| B7 | `fix(macos): report elements_complete from the AX walk's own verdict` | `elements_complete` was hard-coded `false`, so a predicate that matched nothing was never unsatisfied, only unknown. | yes |
+| B8 | `fix(linux): scope the AT-SPI element cap to the requested window` | `max_elements` was charged to every node of every window of the application, so asking for 10 elements of a second window returned no controls at all. | yes |
+| B9 | `fix(macos): report an AX action the app answered as dispatched, not failed` | `AXUIElementPerformAction` replying `-25200`/`-25205`/`-25206` was a tool-invocation failure, which aborts the caller's cell before the observe inside it — 17 steps across the Mac leg, on presses that had usually landed. Now `effect: "unverifiable"` with `delivery.mode: "unknown"`, the post-dispatch probe's evidence and the window-change suffix. | yes |
+
+B9 keeps the error contract for the framework-level codes (`-25201`
+illegal argument, `-25202` dead element, `-25204` messaging timeout, `-25211`
+API disabled): none of those is an application answering an action it
+received, and `-25204` in particular is the AX messaging deadline the walk
+budget also raises, where nothing having happened is the common case.

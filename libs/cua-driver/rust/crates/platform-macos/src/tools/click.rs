@@ -141,6 +141,34 @@ struct AxActionReplyError {
     code: crate::ax::bindings::AXError,
 }
 
+impl AxActionReplyError {
+    /// Replies AppKit applications return *from the action they performed*.
+    /// Contacts answers `AXPress` on its Edit/Done buttons with
+    /// `kAXErrorFailure` or `kAXErrorAttributeUnsupported` after saving the
+    /// card, and a text field answers with `kAXErrorActionUnsupported` after
+    /// taking focus; each of those presses is readable in the next snapshot.
+    /// The remaining codes are framework-level rejections — an illegal
+    /// argument, a dead element, disabled API, a messaging timeout — where
+    /// nothing is known to have reached the application at all.
+    fn outcome_unverifiable(&self) -> bool {
+        matches!(
+            self.code,
+            crate::ax::bindings::kAXErrorFailure
+                | crate::ax::bindings::kAXErrorAttributeUnsupported
+                | crate::ax::bindings::kAXErrorActionUnsupported
+        )
+    }
+
+    fn code_name(&self) -> &'static str {
+        match self.code {
+            crate::ax::bindings::kAXErrorFailure => "kAXErrorFailure",
+            crate::ax::bindings::kAXErrorAttributeUnsupported => "kAXErrorAttributeUnsupported",
+            crate::ax::bindings::kAXErrorActionUnsupported => "kAXErrorActionUnsupported",
+            _ => "AXError",
+        }
+    }
+}
+
 fn dispatch_ax_action(
     action: &'static str,
     dispatch: impl FnOnce() -> crate::ax::bindings::AXError,
@@ -150,6 +178,30 @@ fn dispatch_ax_action(
         Ok(())
     } else {
         Err(AxActionReplyError { action, code })
+    }
+}
+
+/// The opening line of an AX action's reply. An unverifiable reply claims a
+/// dispatch and nothing more: the post-dispatch probe, the window-change
+/// suffix and the caller's own next observation are what settle it, so the
+/// text must not send the agent to repeat an action that may have landed.
+fn ax_reply_summary(
+    unverified: Option<&AxActionReplyError>,
+    ax_action: &str,
+    idx: usize,
+    role: &str,
+    title: &str,
+) -> String {
+    match unverified {
+        None => format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\"."),
+        Some(reply) => format!(
+            "❔ Dispatched {ax_action} to [{idx}] {role} \"{title}\"; the app replied {} ({}), \
+             which does not say whether it acted — applications commonly answer this way *after* \
+             performing the action. Effect unverified: read the state below, or observe the \
+             window, before deciding. Do not repeat the action solely because of this reply.",
+            reply.code,
+            reply.code_name()
+        ),
     }
 }
 
@@ -978,13 +1030,14 @@ impl Tool for ClickTool {
 
             match result {
                 Ok(Ok((
-                    (
-                        mut msg,
+                    AxClickOutcome {
+                        summary: mut msg,
                         needs_webkit_delay,
                         suspected_noop,
                         selection_verified,
                         selection_via_pixel,
-                    ),
+                        unverified,
+                    },
                     fronted,
                 ))) => {
                     // For text inputs, wait 800ms for WebKit DOM focus to settle
@@ -1044,6 +1097,12 @@ impl Tool for ClickTool {
                         structured["evidence"] = serde_json::json!([
                             { "kind": "accessibility_readback" }
                         ]);
+                    }
+                    // The application answered the dispatch with a code that
+                    // establishes neither delivery nor a no-op, so the mode
+                    // the action was delivered in is not known either.
+                    if unverified.is_some() {
+                        structured["delivery_mode"] = serde_json::json!("unknown");
                     }
                     if suspected_noop {
                         structured["escalation"] = serde_json::json!({
@@ -1613,14 +1672,26 @@ impl Tool for ClickTool {
 
 // ── AX click implementation (blocking) ───────────────────────────────────────
 
-/// Returns `(summary_text, needs_webkit_delay, suspected_noop,
-/// selection_verified, selection_via_pixel)`.
-///
-/// `suspected_noop` is true when the element did not advertise the action we
-/// dispatched — AXUIElementPerformAction returns success regardless, so this is
-/// the driver's only signal that the press likely did nothing. The caller turns
-/// it into `effect: "suspected_noop"` + an escalation hint so the agent crosses
-/// to the vision/pixel path instead of trusting a hollow success.
+/// What the AX dispatch did, as far as the driver can tell.
+#[derive(Default)]
+struct AxClickOutcome {
+    summary: String,
+    needs_webkit_delay: bool,
+    /// True when the element did not advertise the action we dispatched —
+    /// AXUIElementPerformAction returns success regardless, so this is the
+    /// driver's only signal that the press likely did nothing. The caller
+    /// turns it into `effect: "suspected_noop"` + an escalation hint so the
+    /// agent crosses to the vision/pixel path instead of trusting a hollow
+    /// success.
+    suspected_noop: bool,
+    selection_verified: bool,
+    selection_via_pixel: bool,
+    /// The application's own reply, when it neither succeeded nor proved that
+    /// nothing was performed. The action stays dispatched and the reply is
+    /// reported as such: `AxActionReplyError::outcome_unverifiable`.
+    unverified: Option<AxActionReplyError>,
+}
+
 fn perform_ax_click(
     element_ptr: usize,
     idx: usize,
@@ -1632,7 +1703,7 @@ fn perform_ax_click(
     menu_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
-) -> anyhow::Result<(String, bool, bool, bool, bool)> {
+) -> anyhow::Result<AxClickOutcome> {
     let ax_action = map_action(action_str);
     let element = element_ptr as AXUIElementRef;
 
@@ -1658,16 +1729,14 @@ fn perform_ax_click(
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr)
             {
-                return Ok((
-                    format!(
+                return Ok(AxClickOutcome {
+                    summary: format!(
                         "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\"; \
                          confirmed AXSelected=true."
                     ),
-                    false,
-                    false,
-                    true,
-                    false,
-                ));
+                    selection_verified: true,
+                    ..AxClickOutcome::default()
+                });
             }
         }
 
@@ -1730,18 +1799,17 @@ fn perform_ax_click(
                                     stable_peers_preserved,
                                 )
                             {
-                                return Ok((
-                                    format!(
+                                return Ok(AxClickOutcome {
+                                    summary: format!(
                                         "✅ Selected nearest {selected_role} for [{idx}] {role} \
                                          \"{title}\"; AX selection write was unavailable, so a \
                                          coordinate click was delivered and confirmed by stable \
                                          AXSelected read-back."
                                     ),
-                                    false,
-                                    false,
-                                    true,
-                                    true,
-                                ));
+                                    selection_verified: true,
+                                    selection_via_pixel: true,
+                                    ..AxClickOutcome::default()
+                                });
                             }
                         }
                     }
@@ -1773,38 +1841,44 @@ fn perform_ax_click(
     let reply = dispatch_ax_action(ax_action, || unsafe {
         crate::ax::bindings::perform_action(element, ax_action)
     });
-    if let Err(reply) = reply {
-        let err = reply.code;
-        // Some collection rows claim a click-like action but Finder returns
-        // kAXErrorCannotComplete. Use the same verified selection fallback
-        // before surfacing the dispatch error.
-        if ax_action == "AXPress" && modifiers.is_empty() {
-            if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr)
-            {
-                return Ok((
-                    format!(
-                        "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\" \
-                         after AXPress returned {err}; confirmed AXSelected=true."
-                    ),
-                    false,
-                    false,
-                    true,
-                    false,
-                ));
+    let unverified = match reply {
+        Ok(()) => None,
+        Err(reply) => {
+            let err = reply.code;
+            // Some collection rows claim a click-like action but Finder returns
+            // kAXErrorCannotComplete. Use the same verified selection fallback
+            // before surfacing the dispatch error.
+            if ax_action == "AXPress" && modifiers.is_empty() {
+                if let Some(selected_role) =
+                    crate::input::ax_actions::select_nearest_container(element_ptr)
+                {
+                    return Ok(AxClickOutcome {
+                        summary: format!(
+                            "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\" \
+                             after AXPress returned {err}; confirmed AXSelected=true."
+                        ),
+                        selection_verified: true,
+                        ..AxClickOutcome::default()
+                    });
+                }
             }
+            if !reply.outcome_unverifiable() {
+                return Err(reply.into());
+            }
+            Some(reply)
         }
-        return Err(reply.into());
-    }
+    };
 
-    let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
+    let mut summary = ax_reply_summary(unverified.as_ref(), ax_action, idx, &role, &title);
 
     // AXShowMenu returns success on controls that never open a menu, which
     // left `click(button:"right")` with no way to reach a context menu at all.
     // A real pointer right-click at the element centre is the actuation a user
-    // performs, so cross that rung once the AX action proved empty.
+    // performs, so cross that rung once the AX action proved empty. A reply
+    // that cannot say what the app did is not that proof: naming the rung is
+    // then the whole escalation, because a second actuation could act twice.
     if ax_action == "AXShowMenu" && !crate::windows::menu_appeared_since(pid, &menus_before) {
-        match menu_pixel {
+        match menu_pixel.filter(|_| unverified.is_none()) {
             Some(target) => {
                 crate::input::mouse::right_click_at_xy_with_window_local(
                     pid,
@@ -1815,20 +1889,28 @@ fn perform_ax_click(
                     window_id,
                     &[],
                 )?;
-                summary = format!(
-                    "✅ Right-clicked [{idx}] {role} \"{title}\" at its centre \
-                     ({:.0}, {:.0}): AXShowMenu opened no menu, so a real pointer \
-                     right-click was delivered.",
-                    target.screen_x, target.screen_y
-                );
-                return Ok((summary, false, false, false, true));
+                return Ok(AxClickOutcome {
+                    summary: format!(
+                        "✅ Right-clicked [{idx}] {role} \"{title}\" at its centre \
+                         ({:.0}, {:.0}): AXShowMenu opened no menu, so a real pointer \
+                         right-click was delivered.",
+                        target.screen_x, target.screen_y
+                    ),
+                    selection_via_pixel: true,
+                    ..AxClickOutcome::default()
+                });
             }
-            None => summary.push_str(
-                "\n⚠️ AXShowMenu reported success but no menu appeared, and the pixel \
-                 right-click at the element centre was unavailable (no resolvable frame, \
-                 or the pointer rung is refused for this target). Re-observe, then \
-                 right-click by pixel with delivery_mode:\"foreground\".",
-            ),
+            None => summary.push_str(&format!(
+                "\n⚠️ No menu appeared and no pointer right-click was delivered ({}). \
+                 Re-observe, then right-click by pixel with delivery_mode:\"foreground\".",
+                if unverified.is_some() {
+                    "the AXShowMenu reply cannot establish what the app did, so a second \
+                     actuation was not improvised"
+                } else {
+                    "AXShowMenu reported success; the pixel right-click was unavailable — no \
+                     resolvable frame, or the pointer rung is refused for this target"
+                }
+            )),
         }
     }
 
@@ -1911,7 +1993,13 @@ fn perform_ax_click(
     let _ = pid;
     let _ = window_id; // used by caller context
 
-    Ok((summary, needs_webkit_delay, suspected_noop, false, false))
+    Ok(AxClickOutcome {
+        summary,
+        needs_webkit_delay,
+        suspected_noop,
+        unverified,
+        ..AxClickOutcome::default()
+    })
 }
 
 #[cfg(test)]
@@ -2064,14 +2152,46 @@ mod tests {
         assert!(msg.contains("Delivery unverified"), "{msg}");
     }
 
+    /// Contacts answers `AXPress` on its Edit/Done buttons with
+    /// `kAXErrorFailure` or `kAXErrorAttributeUnsupported` *after* saving the
+    /// card, and a text field answers `kAXErrorActionUnsupported` after taking
+    /// focus. Reporting those replies as a failed invocation aborted the
+    /// caller's cell before the observe that would have read the effect back.
     #[test]
-    fn failed_reply_after_receiver_effect_requires_reconciliation_without_redispatch() {
+    fn an_app_reply_that_cannot_disprove_the_action_reports_a_dispatch() {
+        for code in [
+            crate::ax::bindings::kAXErrorFailure,
+            crate::ax::bindings::kAXErrorAttributeUnsupported,
+            crate::ax::bindings::kAXErrorActionUnsupported,
+        ] {
+            let reply = dispatch_ax_action("AXPress", || code).unwrap_err();
+            assert!(reply.outcome_unverifiable(), "{code}");
+            let summary = ax_reply_summary(Some(&reply), "AXPress", 7, "AXButton", "Done");
+            assert!(
+                summary.contains("Dispatched AXPress to [7] AXButton \"Done\""),
+                "{summary}"
+            );
+            assert!(summary.contains(&code.to_string()), "{summary}");
+            assert!(summary.contains(reply.code_name()), "{summary}");
+            assert!(!summary.contains('✅'), "{summary}");
+        }
+        assert!(ax_reply_summary(None, "AXOpen", 3, "AXRow", "note.txt")
+            .starts_with("✅ Performed AXOpen"));
+    }
+
+    /// A reply the framework produced rather than an application answering an
+    /// action — a dead element, disabled API, a messaging timeout — keeps the
+    /// error contract and its reconcile-first advice: nothing there says the
+    /// request ever reached the receiver.
+    #[test]
+    fn framework_reply_errors_stay_failures_that_ask_for_reconciliation() {
         let mut receiver_commits = 0;
         let failure = dispatch_ax_action("AXPress", || {
             receiver_commits += 1;
-            crate::ax::bindings::kAXErrorAttributeUnsupported
+            crate::ax::bindings::kAXErrorInvalidUIElement
         })
         .unwrap_err();
+        assert!(!failure.outcome_unverifiable());
         let result = ax_action_error(anyhow::Error::new(failure).context("save panel closed"));
         assert_eq!(receiver_commits, 1);
         assert_eq!(result.is_error, Some(true));
@@ -2080,13 +2200,14 @@ mod tests {
         assert_eq!(data["dispatch"], "attempted");
         assert_eq!(data["effect"], "unverifiable");
         assert_eq!(data["retry"], "reconcile_first");
-        assert_eq!(data["ax_error"], -25205);
+        assert_eq!(data["ax_error"], -25202);
 
-        // The same reply with no receiver effect is equally indeterminate.
-        // An error code alone cannot distinguish these two application states.
         let failure = dispatch_ax_action("AXPress", || -25204).unwrap_err();
-        let result = ax_action_error(failure.into());
-        assert_eq!(result.structured_content.unwrap()["effect"], "unverifiable");
+        assert!(!failure.outcome_unverifiable());
+        assert_eq!(
+            ax_action_error(failure.into()).structured_content.unwrap()["effect"],
+            "unverifiable"
+        );
         assert!(dispatch_ax_action("AXPress", || kAXErrorSuccess).is_ok());
     }
 
