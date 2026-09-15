@@ -134,7 +134,7 @@ const SELECTION_READBACK_STABILITY: std::time::Duration = std::time::Duration::f
 
 /// A reply error cannot establish that the receiver did nothing. In particular,
 /// a system file panel can commit the save and disappear before replying.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("AXUIElementPerformAction({action}) returned {code}")]
 struct AxActionReplyError {
     action: &'static str,
@@ -178,6 +178,38 @@ fn dispatch_ax_action(
         Ok(())
     } else {
         Err(AxActionReplyError { action, code })
+    }
+}
+
+/// What a reply to `AXUIElementPerformAction` licenses the driver to do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AxReplyDisposition {
+    Performed,
+    /// The application answered the action without saying whether it acted, so
+    /// nothing further may touch the UI: a selection write could act a second
+    /// time, and its read-back would then report a confirmed effect the reply
+    /// does not support.
+    Dispatched(AxActionReplyError),
+    /// A refusal to a plain press. Finder answers `kAXErrorCannotComplete` for
+    /// a press on a collection row whose selectable object is an ancestor, so
+    /// the bounded `AXSelected` fallback is still worth trying.
+    TrySelection(AxActionReplyError),
+    Failed(AxActionReplyError),
+}
+
+fn ax_reply_disposition(
+    reply: Result<(), AxActionReplyError>,
+    modifiers: &[String],
+) -> AxReplyDisposition {
+    let Err(reply) = reply else {
+        return AxReplyDisposition::Performed;
+    };
+    if reply.outcome_unverifiable() {
+        AxReplyDisposition::Dispatched(reply)
+    } else if reply.action == "AXPress" && modifiers.is_empty() {
+        AxReplyDisposition::TrySelection(reply)
+    } else {
+        AxReplyDisposition::Failed(reply)
     }
 }
 
@@ -1031,27 +1063,18 @@ impl Tool for ClickTool {
             let changes = super::finish_window_observation(snapshot, &args).await;
 
             match result {
-                Ok(Ok((
-                    AxClickOutcome {
-                        summary: mut msg,
-                        needs_webkit_delay,
-                        suspected_noop,
-                        selection_verified,
-                        selection_via_pixel,
-                        unverified,
-                    },
-                    fronted,
-                ))) => {
+                Ok(Ok((mut outcome, fronted))) => {
                     // For text inputs, wait 800ms for WebKit DOM focus to settle
                     // before returning — matches the Swift reference behaviour.
-                    if needs_webkit_delay {
+                    if outcome.needs_webkit_delay {
                         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                     }
+                    let mut msg = std::mem::take(&mut outcome.summary);
                     msg.push_str(&changes.result_suffix());
                     // A window that appeared during the action (sheet, dialog,
                     // popover) is delivery evidence on its own — no second
                     // probe sample needed for it.
-                    let evidence = if selection_verified {
+                    let evidence = if outcome.selection_verified {
                         None
                     } else if changes.needs_restore() {
                         probe.map(|probe| {
@@ -1064,57 +1087,13 @@ impl Tool for ClickTool {
                     } else {
                         None
                     };
-                    // AX dispatch went through, but AXPerformAction returning
-                    // success does not confirm the on-screen effect (many elements
-                    // no-op silently). A click is never driver-verifiable (no
-                    // read-back) → verified:false stays for back-compat. The
-                    // `effect` string is the richer signal:
-                    //   * suspected_noop — the element didn't advertise the action,
-                    //     so the press likely did nothing → cross to vision/pixel.
-                    //   * unverifiable — dispatched fine, driver just can't confirm;
-                    //     the caller verifies via screenshot.
-                    //   * delivered / no_observed_change — the background delivery
-                    //     probe below saw the target react, or saw nothing react.
-                    let mut structured = serde_json::json!({
-                        "path": if selection_via_pixel {
-                            if fronted { "cgevent_fg" } else { "cgevent" }
-                        } else if fronted {
-                            "ax_fg"
-                        } else {
-                            "ax"
-                        },
-                        "verified": selection_verified,
-                        "effect": if selection_verified {
-                            "confirmed"
-                        } else if suspected_noop {
-                            "suspected_noop"
-                        } else {
-                            "unverifiable"
-                        },
-                    });
-                    if selection_verified {
-                        structured["evidence"] = serde_json::json!([
-                            { "kind": "accessibility_readback" }
-                        ]);
-                    }
-                    // The application answered the dispatch with a code that
-                    // establishes neither delivery nor a no-op, so the mode
-                    // the action was delivered in is not known either.
-                    if unverified.is_some() {
-                        structured["delivery_mode"] = serde_json::json!("unknown");
-                    }
-                    if suspected_noop {
-                        structured["escalation"] = serde_json::json!({
-                            "recommended": "px",
-                            "reason": "element does not advertise this action — the \
-                                       AX press likely no-op'd. Do an element px \
-                                       action: click by pixel (x,y) off the \
-                                       screenshot from get_window_state."
-                        });
-                    }
-                    if let Some(outcome) = evidence {
+                    let mut structured = ax_click_structured(&outcome, fronted);
+                    // The probe contributes the remaining verdicts: `delivered`
+                    // when the target reacted, `no_observed_change` when nothing
+                    // did.
+                    if let Some(delivery) = evidence {
                         let chromium_family =
-                            matches!(outcome.evidence, delivery_probe::Evidence::Unchanged)
+                            matches!(delivery.evidence, delivery_probe::Evidence::Unchanged)
                                 && cua_driver_core::operation::spawn_blocking(move || {
                                     crate::browser::is_chromium_family(pid)
                                 })
@@ -1123,11 +1102,11 @@ impl Tool for ClickTool {
                         apply_delivery_evidence(
                             &mut msg,
                             &mut structured,
-                            outcome,
+                            delivery,
                             // The selection fallback already delivered real
                             // pixels; everything else on this branch is an AX
                             // action, which foreground cannot upgrade.
-                            if selection_via_pixel {
+                            if outcome.selection_via_pixel {
                                 NextRung::Foreground
                             } else {
                                 NextRung::PixelForeground
@@ -1686,6 +1665,49 @@ struct AxClickOutcome {
     unverified: Option<AxActionReplyError>,
 }
 
+/// The machine-readable half of an AX click result. A generic click has no
+/// independent read-back, so `verified` stays false unless a selection write
+/// was confirmed, and the tri-state `effect` carries the richer verdict:
+/// `suspected_noop` for an action the element never advertised (cross to the
+/// vision/pixel path), `unverifiable` for a dispatch the driver cannot settle
+/// (the caller's own observation does). A reply that establishes neither
+/// delivery nor a no-op leaves the delivery mode unknown as well.
+fn ax_click_structured(outcome: &AxClickOutcome, fronted: bool) -> serde_json::Value {
+    let mut structured = serde_json::json!({
+        "path": if outcome.selection_via_pixel {
+            if fronted { "cgevent_fg" } else { "cgevent" }
+        } else if fronted {
+            "ax_fg"
+        } else {
+            "ax"
+        },
+        "verified": outcome.selection_verified,
+        "effect": if outcome.selection_verified {
+            "confirmed"
+        } else if outcome.suspected_noop {
+            "suspected_noop"
+        } else {
+            "unverifiable"
+        },
+    });
+    if outcome.selection_verified {
+        structured["evidence"] = serde_json::json!([{ "kind": "accessibility_readback" }]);
+    }
+    if outcome.unverified.is_some() {
+        structured["delivery_mode"] = serde_json::json!("unknown");
+    }
+    if outcome.suspected_noop {
+        structured["escalation"] = serde_json::json!({
+            "recommended": "px",
+            "reason": "element does not advertise this action — the \
+                       AX press likely no-op'd. Do an element px \
+                       action: click by pixel (x,y) off the \
+                       screenshot from get_window_state."
+        });
+    }
+    structured
+}
+
 /// Roles whose click gesture is "put the caret here" rather than "activate".
 /// None of them advertise `AXPress`.
 fn is_text_entry_role(role: &str) -> bool {
@@ -1950,32 +1972,26 @@ fn perform_ax_click(
     let reply = dispatch_ax_action(ax_action, || unsafe {
         crate::ax::bindings::perform_action(element, ax_action)
     });
-    let unverified = match reply {
-        Ok(()) => None,
-        Err(reply) => {
-            let err = reply.code;
-            // Some collection rows claim a click-like action but Finder returns
-            // kAXErrorCannotComplete. Use the same verified selection fallback
-            // before surfacing the dispatch error.
-            if ax_action == "AXPress" && modifiers.is_empty() {
-                if let Some(selected_role) =
-                    crate::input::ax_actions::select_nearest_container(element_ptr)
-                {
-                    return Ok(AxClickOutcome {
-                        summary: format!(
-                            "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\" \
-                             after AXPress returned {err}; confirmed AXSelected=true."
-                        ),
-                        selection_verified: true,
-                        ..AxClickOutcome::default()
-                    });
-                }
+    let unverified = match ax_reply_disposition(reply, modifiers) {
+        AxReplyDisposition::Performed => None,
+        AxReplyDisposition::Dispatched(reply) => Some(reply),
+        AxReplyDisposition::TrySelection(reply) => {
+            if let Some(selected_role) =
+                crate::input::ax_actions::select_nearest_container(element_ptr)
+            {
+                return Ok(AxClickOutcome {
+                    summary: format!(
+                        "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\" \
+                         after AXPress returned {}; confirmed AXSelected=true.",
+                        reply.code
+                    ),
+                    selection_verified: true,
+                    ..AxClickOutcome::default()
+                });
             }
-            if !reply.outcome_unverifiable() {
-                return Err(reply.into());
-            }
-            Some(reply)
+            return Err(reply.into());
         }
+        AxReplyDisposition::Failed(reply) => return Err(reply.into()),
     };
 
     let mut summary = ax_reply_summary(unverified.as_ref(), ax_action, idx, &role, &title);
@@ -2290,6 +2306,95 @@ mod tests {
         }
         assert!(ax_reply_summary(None, "AXOpen", 3, "AXRow", "note.txt")
             .starts_with("✅ Performed AXOpen"));
+    }
+
+    /// The reply decides what may happen next, before anything else touches
+    /// the UI. An application that answered the action may have performed it,
+    /// so the collection-row selection fallback — an `AXSelected` write whose
+    /// read-back would publish a confirmed effect — must not run for those
+    /// replies. `-25204` (kAXErrorCannotComplete) is the refusal that fallback
+    /// exists for and keeps it.
+    #[test]
+    fn an_unverifiable_reply_is_classified_before_the_selection_fallback() {
+        for code in [
+            crate::ax::bindings::kAXErrorFailure,
+            crate::ax::bindings::kAXErrorAttributeUnsupported,
+            crate::ax::bindings::kAXErrorActionUnsupported,
+        ] {
+            let reply = dispatch_ax_action("AXPress", || code);
+            assert_eq!(
+                ax_reply_disposition(reply, &[]),
+                AxReplyDisposition::Dispatched(AxActionReplyError {
+                    action: "AXPress",
+                    code
+                }),
+                "{code}"
+            );
+        }
+        let refusal = AxActionReplyError {
+            action: "AXPress",
+            code: -25204,
+        };
+        assert_eq!(
+            ax_reply_disposition(Err(refusal), &[]),
+            AxReplyDisposition::TrySelection(refusal)
+        );
+        assert_eq!(
+            ax_reply_disposition(Err(refusal), &["cmd".to_string()]),
+            AxReplyDisposition::Failed(refusal),
+            "a modified click never improvises a selection"
+        );
+        assert_eq!(
+            ax_reply_disposition(
+                Err(AxActionReplyError {
+                    action: "AXShowMenu",
+                    code: -25204
+                }),
+                &[]
+            ),
+            AxReplyDisposition::Failed(AxActionReplyError {
+                action: "AXShowMenu",
+                code: -25204
+            }),
+            "only a plain press has a selection equivalent"
+        );
+        assert_eq!(
+            ax_reply_disposition(Ok(()), &[]),
+            AxReplyDisposition::Performed
+        );
+    }
+
+    /// The published result of a dispatch the application answered: uncertain,
+    /// with the delivery mode unknown and no read-back evidence. Only a
+    /// confirmed selection write earns `confirmed`.
+    #[test]
+    fn an_answered_dispatch_is_not_published_as_a_confirmed_effect() {
+        let dispatched = ax_click_structured(
+            &AxClickOutcome {
+                unverified: Some(AxActionReplyError {
+                    action: "AXPress",
+                    code: crate::ax::bindings::kAXErrorFailure,
+                }),
+                ..AxClickOutcome::default()
+            },
+            false,
+        );
+        assert_eq!(dispatched["effect"], "unverifiable");
+        assert_eq!(dispatched["verified"], false);
+        assert_eq!(dispatched["delivery_mode"], "unknown");
+        assert!(dispatched.get("evidence").is_none(), "{dispatched}");
+
+        let selected = ax_click_structured(
+            &AxClickOutcome {
+                selection_verified: true,
+                ..AxClickOutcome::default()
+            },
+            false,
+        );
+        assert_eq!(selected["effect"], "confirmed");
+        assert_eq!(selected["verified"], true);
+        assert_eq!(selected["evidence"][0]["kind"], "accessibility_readback");
+        assert!(selected.get("delivery_mode").is_none(), "{selected}");
     }
 
     /// A reply the framework produced rather than an application answering an
