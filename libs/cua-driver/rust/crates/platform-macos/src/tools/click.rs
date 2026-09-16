@@ -300,20 +300,27 @@ impl NextRung {
     }
 }
 
-/// Fold the background delivery probe's verdict into a click's reply, staying
-/// inside the closed public `ActionResult` vocabulary
-/// (`confirmed | partial | unverifiable | suspected_noop | refused`).
-///
-/// The probe answers "did the target react", never "did the click do what the
-/// caller wanted". So:
-/// * `Changed` → keep `unverifiable` (delivery is not the intended
-///   postcondition) and publish the reaction as `window_change` evidence.
-/// * `Unchanged` → `suspected_noop`, said loudly, escalated to the rung that
-///   can still deliver. Never retried here and never silently re-routed: a
-///   dispatched action can take effect invisibly, and acting twice is worse
-///   than reporting an unproven one.
-/// * `Unusable` → leave the existing contract alone; the probe had nothing
-///   comparable to offer, and says so in the text.
+fn noop_reason(chromium_family: bool) -> &'static str {
+    if chromium_family {
+        "no observable change after background delivery; it cannot produce \
+         trusted pointer events, so controls driven by pointerdown \
+         (Chromium/Electron UIs) ignore it"
+    } else {
+        "no observable change after background delivery; the probe reads \
+         element state, app focus, window contents and new windows only, so \
+         an effect it cannot see is still possible"
+    }
+}
+
+fn pointerdown_note(chromium_family: bool) -> &'static str {
+    if chromium_family {
+        " A control driven by pointerdown, common in Chromium/Electron UIs, \
+         ignores background delivery."
+    } else {
+        ""
+    }
+}
+
 fn apply_delivery_evidence(
     msg: &mut String,
     structured: &mut serde_json::Value,
@@ -322,64 +329,21 @@ fn apply_delivery_evidence(
     chromium_family: bool,
     window_change: Option<&delivery_probe::WindowChangeEvidence>,
 ) {
-    let probe_ms = outcome.probe.as_millis();
-    let waited_ms = outcome.waited.as_millis();
-    structured["delivery_probe"] = serde_json::json!({
-        "signal": outcome.evidence.signal(),
-        "probe_ms": probe_ms,
-        "waited_ms": waited_ms,
-    });
-    match outcome.evidence {
-        delivery_probe::Evidence::Changed(signal) => {
-            let mut entry = serde_json::json!({ "kind": "window_change", "detail": signal });
-            if let Some(observed) = window_change {
-                entry["appeared_windows"] =
-                    serde_json::to_value(&observed.appeared_windows).unwrap_or_default();
-                entry["target_window_main"] = serde_json::json!(observed.target_window_main);
-            }
-            structured["evidence"] = serde_json::json!([entry]);
-            msg.push_str(&format!(
-                "\n🔎 Delivered: {signal} changed after the dispatch, so the app reacted. \
-                 That is delivery, not the intended result — check the postcondition you \
-                 wanted."
-            ));
-        }
-        delivery_probe::Evidence::Unchanged => {
-            structured["effect"] = serde_json::json!("suspected_noop");
-            structured["escalation"] = serde_json::json!({
+    let advice = format!("{} {}", pointerdown_note(chromium_family), rung.advice());
+    delivery_probe::apply_evidence(
+        msg,
+        structured,
+        outcome,
+        delivery_probe::NoopReport {
+            signals: "element state, app focus, window contents, new windows",
+            escalation: Some(serde_json::json!({
                 "recommended": rung.recommended(),
-                "reason": if chromium_family {
-                    "no observable change after background delivery; it cannot produce \
-                     trusted pointer events, so controls driven by pointerdown \
-                     (Chromium/Electron UIs) ignore it"
-                } else {
-                    "no observable change after background delivery; the probe reads \
-                     element state, app focus, window contents and new windows only, so \
-                     an effect it cannot see is still possible"
-                }
-            });
-            msg.push_str(&format!(
-                "\n⚠️ Unverified: the target was watched for {waited_ms} ms after the \
-                 dispatch and nothing changed (element state, app focus, window contents, \
-                 new windows) — re-observe before repeating. The dispatch may still have \
-                 landed, so a second call could act twice.{} {}",
-                if chromium_family {
-                    " A control driven by pointerdown, common in Chromium/Electron UIs, \
-                     ignores background delivery."
-                } else {
-                    ""
-                },
-                rung.advice()
-            ));
-        }
-        delivery_probe::Evidence::Unusable => {
-            msg.push_str(
-                "\n❔ Delivery unverified: the target exposed no stable state to compare \
-                 (element gone from the tree, or the window changes on its own). Confirm the \
-                 postcondition yourself.",
-            );
-        }
-    }
+                "reason": noop_reason(chromium_family),
+            })),
+            advice: &advice,
+        },
+        window_change,
+    );
 }
 
 fn pixel_activation_policy(

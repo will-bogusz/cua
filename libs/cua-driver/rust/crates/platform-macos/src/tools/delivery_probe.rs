@@ -368,6 +368,77 @@ fn tree_digest(pid: i32, window_id: u32) -> Option<u64> {
     Some(std::hash::Hasher::finish(&hash))
 }
 
+pub struct NoopReport<'a> {
+    pub signals: &'a str,
+    pub escalation: Option<serde_json::Value>,
+    pub advice: &'a str,
+}
+
+/// Fold the delivery probe's verdict into an action's reply, staying inside
+/// the closed public `ActionResult` vocabulary
+/// (`confirmed | partial | unverifiable | suspected_noop | refused`).
+///
+/// The probe answers "did the target react", never "did the action do what
+/// the caller wanted". So:
+/// * `Changed` → keep `unverifiable` (delivery is not the intended
+///   postcondition) and publish the reaction as `window_change` evidence.
+/// * `Unchanged` → `suspected_noop`, said loudly, escalated to the rung that
+///   can still deliver. Never retried here and never silently re-routed: a
+///   dispatched action can take effect invisibly, and acting twice is worse
+///   than reporting an unproven one.
+/// * `Unusable` → leave the existing contract alone; the probe had nothing
+///   comparable to offer, and says so in the text.
+pub fn apply_evidence(
+    msg: &mut String,
+    structured: &mut serde_json::Value,
+    outcome: ProbeOutcome,
+    noop: NoopReport<'_>,
+    window_change: Option<&WindowChangeEvidence>,
+) {
+    let probe_ms = outcome.probe.as_millis();
+    let waited_ms = outcome.waited.as_millis();
+    structured["delivery_probe"] = serde_json::json!({
+        "signal": outcome.evidence.signal(),
+        "probe_ms": probe_ms,
+        "waited_ms": waited_ms,
+    });
+    match outcome.evidence {
+        Evidence::Changed(signal) => {
+            let mut entry = serde_json::json!({ "kind": "window_change", "detail": signal });
+            if let Some(observed) = window_change {
+                entry["appeared_windows"] =
+                    serde_json::to_value(&observed.appeared_windows).unwrap_or_default();
+                entry["target_window_main"] = serde_json::json!(observed.target_window_main);
+            }
+            structured["evidence"] = serde_json::json!([entry]);
+            msg.push_str(&format!(
+                "\n🔎 Delivered: {signal} changed after the dispatch, so the app reacted. \
+                 That is delivery, not the intended result — check the postcondition you \
+                 wanted."
+            ));
+        }
+        Evidence::Unchanged => {
+            structured["effect"] = serde_json::json!("suspected_noop");
+            if let Some(escalation) = noop.escalation {
+                structured["escalation"] = escalation;
+            }
+            msg.push_str(&format!(
+                "\n⚠️ Unverified: the target was watched for {waited_ms} ms after the \
+                 dispatch and nothing changed ({}) — re-observe before repeating. The \
+                 dispatch may still have landed, so a second call could act twice.{}",
+                noop.signals, noop.advice
+            ));
+        }
+        Evidence::Unusable => {
+            msg.push_str(
+                "\n❔ Delivery unverified: the target exposed no stable state to compare \
+                 (element gone from the tree, or the window changes on its own). Confirm the \
+                 postcondition yourself.",
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

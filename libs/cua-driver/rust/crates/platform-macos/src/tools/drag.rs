@@ -17,6 +17,7 @@ use cua_driver_core::{
 use serde_json::Value;
 use std::sync::Arc;
 
+use super::delivery_probe;
 use super::ToolState;
 use crate::apps;
 use crate::focus_guard;
@@ -30,6 +31,17 @@ pub struct DragTool {
 impl DragTool {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
+    }
+}
+
+fn drag_noop_report() -> delivery_probe::NoopReport<'static> {
+    delivery_probe::NoopReport {
+        signals: "app focus, window contents, new windows",
+        escalation: None,
+        advice: " A drag whose window never moved usually missed the drag source or was \
+                 rejected by the drop target: re-read the window and, if the source is right, \
+                 retry with a longer duration_ms so the app registers the press before the \
+                 motion.",
     }
 }
 
@@ -315,74 +327,84 @@ impl Tool for DragTool {
             prior_front,
             "drag.CGEvent",
             || async move {
-                cua_driver_core::operation::spawn_blocking(move || -> anyhow::Result<()> {
-                    let do_it = move || -> anyhow::Result<()> {
-                        let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                        if fg {
-                            // HID delivery is global, so foreground mode must
-                            // establish a real active application before the
-                            // gesture begins. The SkyLight flash can be
-                            // unavailable for Electron child windows; the
-                            // documented Cocoa activation is the fallback.
-                            apps::activate_pid(pid);
-                            std::thread::sleep(std::time::Duration::from_millis(40));
-                            let observed_cursor = cursor_for_drag.clone();
-                            return crate::input::mouse::drag_at_xy_foreground_observed(
-                                from_sx,
-                                from_sy,
-                                to_sx,
-                                to_sy,
-                                duration_ms,
-                                steps,
-                                &m,
-                                button,
-                                move |x, y| {
-                                    crate::cursor::overlay::send_command(
-                                        observed_cursor.clone(),
-                                        cursor_overlay::track_pointer_command(x, y),
-                                    );
-                                },
-                            );
-                        }
-                        crate::input::mouse::drag_at_xy_observed(
-                            pid,
-                            from_sx,
-                            from_sy,
-                            to_sx,
-                            to_sy,
-                            Some((from_lx, from_ly)),
-                            Some((to_lx, to_ly)),
-                            window_id,
-                            duration_ms,
-                            steps,
-                            &m,
-                            button,
-                            fg,
-                            move |x, y| {
-                                crate::cursor::overlay::send_command(
-                                    cursor_for_drag.clone(),
-                                    cursor_overlay::track_pointer_command(x, y),
-                                );
-                            },
-                        )
-                    };
-                    // Foreground rung: activate for the complete HID gesture,
-                    // then restore the prior app after pointer capture settles.
-                    match (fg, window_id) {
-                        (true, Some(_wid)) => {
-                            let result = do_it();
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            if let Some(previous_pid) = prior_front {
-                                if previous_pid != pid {
-                                    apps::activate_pid(previous_pid);
+                cua_driver_core::operation::spawn_blocking(
+                    move || -> anyhow::Result<Option<delivery_probe::DeliveryProbe>> {
+                        let probe = || {
+                            window_id
+                                .map(|wid| delivery_probe::DeliveryProbe::capture(pid, wid, None))
+                        };
+                        let do_it =
+                            move || -> anyhow::Result<Option<delivery_probe::DeliveryProbe>> {
+                                let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
+                                if fg {
+                                    // HID delivery is global, so foreground mode must
+                                    // establish a real active application before the
+                                    // gesture begins. The SkyLight flash can be
+                                    // unavailable for Electron child windows; the
+                                    // documented Cocoa activation is the fallback.
+                                    apps::activate_pid(pid);
+                                    std::thread::sleep(std::time::Duration::from_millis(40));
+                                    let observed_cursor = cursor_for_drag.clone();
+                                    let probe = probe();
+                                    crate::input::mouse::drag_at_xy_foreground_observed(
+                                        from_sx,
+                                        from_sy,
+                                        to_sx,
+                                        to_sy,
+                                        duration_ms,
+                                        steps,
+                                        &m,
+                                        button,
+                                        move |x, y| {
+                                            crate::cursor::overlay::send_command(
+                                                observed_cursor.clone(),
+                                                cursor_overlay::track_pointer_command(x, y),
+                                            );
+                                        },
+                                    )?;
+                                    return Ok(probe);
                                 }
+                                let probe = probe();
+                                crate::input::mouse::drag_at_xy_observed(
+                                    pid,
+                                    from_sx,
+                                    from_sy,
+                                    to_sx,
+                                    to_sy,
+                                    Some((from_lx, from_ly)),
+                                    Some((to_lx, to_ly)),
+                                    window_id,
+                                    duration_ms,
+                                    steps,
+                                    &m,
+                                    button,
+                                    fg,
+                                    move |x, y| {
+                                        crate::cursor::overlay::send_command(
+                                            cursor_for_drag.clone(),
+                                            cursor_overlay::track_pointer_command(x, y),
+                                        );
+                                    },
+                                )?;
+                                Ok(probe)
+                            };
+                        // Foreground rung: activate for the complete HID gesture,
+                        // then restore the prior app after pointer capture settles.
+                        match (fg, window_id) {
+                            (true, Some(_wid)) => {
+                                let result = do_it();
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                if let Some(previous_pid) = prior_front {
+                                    if previous_pid != pid {
+                                        apps::activate_pid(previous_pid);
+                                    }
+                                }
+                                result
                             }
-                            result?;
-                            Ok(())
+                            _ => do_it(),
                         }
-                        _ => do_it(),
-                    }
-                })
+                    },
+                )
                 .await
             },
         )
@@ -392,7 +414,7 @@ impl Tool for DragTool {
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(false),
         );
-        if matches!(&result, Ok(Ok(()))) {
+        if matches!(&result, Ok(Ok(_))) {
             self.state
                 .cursor_registry
                 .update_position(&cursor_key, to_sx, to_sy);
@@ -424,23 +446,113 @@ impl Tool for DragTool {
             ""
         };
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
-                "✅ Posted drag{btn_suffix}{mod_suffix} to pid {pid} \
-                 from window-pixel ({}, {}) → ({}, {}), \
-                 screen ({}, {}) → ({}, {}) \
-                 in {duration_ms}ms / {steps} steps{mode_label} \
-                 (background CGEvent; not driver-verified — confirm via screenshot).{}",
-                from_x as i64, from_y as i64,
-                to_x   as i64, to_y   as i64,
-                from_sx as i64, from_sy as i64,
-                to_sx   as i64, to_sy   as i64,
-                changes.result_suffix(),
-            ))
-            .with_structured(serde_json::json!({
-                "path": if fg { "cgevent_fg" } else { "cgevent" }, "verified": false, "effect": "unverifiable"
-            })),
+            Ok(Ok(probe)) => {
+                let evidence = if changes.needs_restore() {
+                    probe.as_ref().map(|probe| {
+                        probe.settled(delivery_probe::Evidence::Changed("window_change"))
+                    })
+                } else if let Some(probe) = probe {
+                    cua_driver_core::operation::spawn_blocking(move || probe.compare())
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                let window_change = if evidence.is_some() && changes.needs_restore() {
+                    let appeared = changes.new_windows.clone();
+                    cua_driver_core::operation::spawn_blocking(move || {
+                        delivery_probe::WindowChangeEvidence::observe(pid, window_id, &appeared)
+                    })
+                    .await
+                    .ok()
+                } else {
+                    None
+                };
+                let mut msg = format!(
+                    "✅ Posted drag{btn_suffix}{mod_suffix} to pid {pid} \
+                     from window-pixel ({}, {}) → ({}, {}), \
+                     screen ({}, {}) → ({}, {}) \
+                     in {duration_ms}ms / {steps} steps{mode_label} \
+                     (background CGEvent; not driver-verified — confirm via screenshot).{}",
+                    from_x as i64,
+                    from_y as i64,
+                    to_x as i64,
+                    to_y as i64,
+                    from_sx as i64,
+                    from_sy as i64,
+                    to_sx as i64,
+                    to_sy as i64,
+                    changes.result_suffix(),
+                );
+                let mut structured = serde_json::json!({
+                    "path": if fg { "cgevent_fg" } else { "cgevent" }, "verified": false, "effect": "unverifiable"
+                });
+                if let Some(outcome) = evidence {
+                    delivery_probe::apply_evidence(
+                        &mut msg,
+                        &mut structured,
+                        outcome,
+                        drag_noop_report(),
+                        window_change.as_ref(),
+                    );
+                }
+                ToolResult::text(msg).with_structured(structured)
+            }
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
-            Err(e)     => ToolResult::error(format!("Task error: {e}")),
+            Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(evidence: delivery_probe::Evidence, waited_ms: u64) -> delivery_probe::ProbeOutcome {
+        delivery_probe::ProbeOutcome {
+            evidence,
+            probe: std::time::Duration::from_millis(waited_ms + 120),
+            waited: std::time::Duration::from_millis(waited_ms),
+        }
+    }
+
+    #[test]
+    fn a_drag_that_moved_nothing_is_a_suspected_noop_naming_the_window_it_watched() {
+        let mut msg = "✅ Posted drag to pid 1.".to_owned();
+        let mut structured = serde_json::json!({ "path": "cgevent_fg", "effect": "unverifiable" });
+        delivery_probe::apply_evidence(
+            &mut msg,
+            &mut structured,
+            outcome(delivery_probe::Evidence::Unchanged, 2000),
+            drag_noop_report(),
+            None,
+        );
+        assert_eq!(structured["effect"], "suspected_noop");
+        assert_eq!(structured["delivery_probe"]["waited_ms"], 2000);
+        assert_eq!(structured["delivery_probe"]["signal"], "none");
+        assert!(structured["escalation"].is_null(), "{structured}");
+        assert!(
+            msg.contains("watched for 2000 ms after the dispatch"),
+            "{msg}"
+        );
+        assert!(msg.contains("longer duration_ms"), "{msg}");
+    }
+
+    #[test]
+    fn a_drag_the_window_reacted_to_stays_unverifiable_and_publishes_the_reaction() {
+        let mut msg = "✅ Posted drag to pid 1.".to_owned();
+        let mut structured = serde_json::json!({ "path": "cgevent_fg", "effect": "unverifiable" });
+        delivery_probe::apply_evidence(
+            &mut msg,
+            &mut structured,
+            outcome(delivery_probe::Evidence::Changed("window_tree"), 60),
+            drag_noop_report(),
+            None,
+        );
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["evidence"][0]["kind"], "window_change");
+        assert_eq!(structured["evidence"][0]["detail"], "window_tree");
+        assert_eq!(structured["delivery_probe"]["waited_ms"], 60);
+        assert!(msg.contains("Delivered: window_tree changed"), "{msg}");
     }
 }
