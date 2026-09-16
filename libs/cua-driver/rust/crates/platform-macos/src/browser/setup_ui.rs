@@ -1755,6 +1755,7 @@ mod tests {
             window_scope: Some(crate::ax::WindowScope::Matched),
             document: None,
             document_edited: None,
+            collapsed_rows: 0,
         }
     }
 
@@ -1889,6 +1890,7 @@ mod tests {
             window_scope: Some(crate::ax::WindowScope::Matched),
             document: None,
             document_edited: None,
+            collapsed_rows: 0,
         };
         assert!(
             exact_pixel_setup_checkbox(0, &truncated, 0, chrome(), false)

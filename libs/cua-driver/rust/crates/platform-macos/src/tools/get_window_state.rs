@@ -667,6 +667,7 @@ impl Tool for GetWindowStateTool {
             "total_element_count": element_count,
             "returned_element_count": filtered_element_count,
             "elements_complete": elements_complete,
+            "collapsed_rows": tree_result.as_ref().map_or(0, |r| r.collapsed_rows),
             "element_double_click": "left_center_v1",
             "ax_walk_timed_out": tree_result.as_ref().is_some_and(|r| r.timed_out),
             "ax_walk_stop_reason": tree_result.as_ref().and_then(|r| r.stop_reason),

@@ -698,6 +698,49 @@ pub unsafe fn copy_children_checked(element: AXUIElementRef) -> (Vec<AXUIElement
     (children, dropped)
 }
 
+/// # Safety
+///
+/// `element` must be valid, and the caller must release every returned element.
+pub unsafe fn copy_element_array_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Option<Vec<AXUIElementRef>> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    if core_foundation::base::CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
+        CFRelease(value);
+        return None;
+    }
+    let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+    let ax_type_id = AXUIElementGetTypeID();
+    Some(
+        (0..arr.len())
+            .filter_map(|i| {
+                let item = *arr.get(i)?;
+                if core_foundation::base::CFGetTypeID(item) == ax_type_id {
+                    CFRetain(item);
+                    Some(item as AXUIElementRef)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
+/// # Safety
+///
+/// Each element must be owned by the caller exactly once.
+pub unsafe fn release_all(elements: Vec<AXUIElementRef>) {
+    for element in elements {
+        CFRelease(element as CFTypeRef);
+    }
+}
+
 /// Whether an `AXChildren` error code leaves the child list unknown, as
 /// opposed to establishing that the element has no children.
 fn children_read_hid_descendants(err: AXError) -> bool {

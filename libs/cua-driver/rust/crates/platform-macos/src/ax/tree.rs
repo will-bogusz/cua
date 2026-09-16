@@ -12,6 +12,7 @@
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
 
 use super::bindings::*;
+use super::row_collapse::collapse_offscreen_rows;
 use super::window_scope::{decide_window_scope, is_related_sheet, TopLevelCandidate, WindowScope};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 
@@ -169,6 +170,7 @@ pub struct TreeWalkResult {
     /// The app's own unsaved-changes flag for the requested window. `None` when
     /// the app reports it nowhere — absence is unknown, never "saved".
     pub document_edited: Option<bool>,
+    pub collapsed_rows: usize,
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -264,6 +266,7 @@ pub(crate) fn walk_tree_with_timeout(
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
                 document: None,
                 document_edited: None,
+                collapsed_rows: 0,
             };
         }
 
@@ -417,6 +420,15 @@ pub(crate) fn walk_tree_with_timeout(
         );
     }
 
+    if truncation.collapsed_rows > 0 {
+        tree_markdown.push_str(&format!(
+            "\n{} row(s) are scrolled out of view and were not read. \
+             Scroll, or use the window's own search, to bring a row into view \
+             before acting on it.",
+            truncation.collapsed_rows
+        ));
+    }
+
     TreeWalkResult {
         background_open_restricted: scope.background_open_restricted,
         related_windows: scope.related_windows,
@@ -428,6 +440,7 @@ pub(crate) fn walk_tree_with_timeout(
         window_scope,
         document,
         document_edited,
+        collapsed_rows: truncation.collapsed_rows,
     }
 }
 
@@ -461,11 +474,12 @@ struct WalkTruncation {
     limit: bool,
     /// An `AXChildren` read hid descendants — see [`copy_children_checked`].
     unreadable: bool,
+    collapsed_rows: usize,
 }
 
 impl WalkTruncation {
     fn any(&self) -> bool {
-        self.limit || self.unreadable
+        self.limit || self.unreadable || self.collapsed_rows > 0
     }
 }
 
@@ -557,25 +571,21 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let (children, hid_descendants) = copy_children_checked(element);
-        note_unreadable_children(hid_descendants, depth, lines, truncation);
-        for child in children {
-            walk_element(
-                child,
-                depth,
-                parent_index,
-                in_web_content,
-                nodes,
-                lines,
-                counter,
-                visited_count,
-                truncation,
-                scope,
-                max_elements,
-                max_depth,
-            );
-            CFRelease(child as CFTypeRef);
-        }
+        walk_children(
+            element,
+            &role,
+            depth,
+            parent_index,
+            in_web_content,
+            nodes,
+            lines,
+            counter,
+            visited_count,
+            truncation,
+            scope,
+            max_elements,
+            max_depth,
+        );
         return;
     }
 
@@ -633,25 +643,21 @@ unsafe fn walk_element(
     );
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let (children, hid_descendants) = copy_children_checked(element);
-        note_unreadable_children(hid_descendants, depth + 1, lines, truncation);
-        for child in children {
-            walk_element(
-                child,
-                depth + 1,
-                parent_index,
-                in_web_content,
-                nodes,
-                lines,
-                counter,
-                visited_count,
-                truncation,
-                scope,
-                max_elements,
-                max_depth,
-            );
-            CFRelease(child as CFTypeRef);
-        }
+        walk_children(
+            element,
+            &role,
+            depth + 1,
+            parent_index,
+            in_web_content,
+            nodes,
+            lines,
+            counter,
+            visited_count,
+            truncation,
+            scope,
+            max_elements,
+            max_depth,
+        );
         return;
     }
 
@@ -759,13 +765,51 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
 
+    walk_children(
+        element,
+        &role,
+        depth + 1,
+        next_parent,
+        in_web_content,
+        nodes,
+        lines,
+        counter,
+        visited_count,
+        truncation,
+        scope,
+        max_elements,
+        max_depth,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn walk_children(
+    element: AXUIElementRef,
+    role: &str,
+    child_depth: usize,
+    parent_index: Option<usize>,
+    in_web_content: bool,
+    nodes: &mut Vec<AXNode>,
+    lines: &mut Vec<(usize, String)>,
+    counter: &mut usize,
+    visited_count: &mut usize,
+    truncation: &mut WalkTruncation,
+    scope: &mut WalkScope,
+    max_elements: usize,
+    max_depth: usize,
+) {
     let (children, hid_descendants) = copy_children_checked(element);
-    note_unreadable_children(hid_descendants, depth + 1, lines, truncation);
+    note_unreadable_children(hid_descendants, child_depth, lines, truncation);
+    let collapsed = collapse_offscreen_rows(element, role);
     for child in children {
+        if collapsed.as_ref().is_some_and(|rows| rows.hides(child)) {
+            CFRelease(child as CFTypeRef);
+            continue;
+        }
         walk_element(
             child,
-            depth + 1,
-            next_parent,
+            child_depth,
+            parent_index,
             in_web_content,
             nodes,
             lines,
@@ -777,6 +821,17 @@ unsafe fn walk_element(
             max_depth,
         );
         CFRelease(child as CFTypeRef);
+    }
+    if let Some(rows) = collapsed {
+        truncation.collapsed_rows += rows.count();
+        lines.push((
+            child_depth,
+            format!(
+                "- {} of {} rows are scrolled out of view and were not read",
+                rows.count(),
+                rows.total()
+            ),
+        ));
     }
 }
 
