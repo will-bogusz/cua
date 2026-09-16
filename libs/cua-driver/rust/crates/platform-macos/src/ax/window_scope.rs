@@ -117,6 +117,8 @@ pub fn scope_from_owner(owner: &WindowOwner) -> Option<WindowScope> {
     }
 }
 
+pub const SHEET_RELATION: &str = "sheet";
+
 /// An independently mapped attached sheet has its own control scope. Its
 /// subtree must not mint tokens for the document window being observed.
 pub fn is_related_sheet(role: &str, requested: Option<u32>, mapped: Option<u32>) -> bool {

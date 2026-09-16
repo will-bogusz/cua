@@ -556,7 +556,7 @@ unsafe fn walk_element(
                         pid,
                         window_id,
                         title,
-                        relation: "sheet",
+                        relation: super::window_scope::SHEET_RELATION,
                     });
                 }
             }
