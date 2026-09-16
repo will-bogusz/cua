@@ -42,9 +42,11 @@
 use std::time::{Duration, Instant};
 
 use crate::ax::bindings::{
-    children_count, copy_bool_attr, copy_string_attr, element_screen_rect, focused_element_of_pid,
-    AXUIElementRef,
+    ax_get_window_id, children_count, copy_ax_windows, copy_bool_attr, copy_string_attr,
+    element_screen_rect, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
+use crate::window_change_detector::WindowEvent;
 use core_foundation::base::{CFRelease, CFTypeRef};
 
 /// Node cap for the probe's window digest. Large enough to reach the content
@@ -100,6 +102,75 @@ impl Evidence {
             Evidence::Unchanged => "none",
             Evidence::Unusable => "unavailable",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AppearedWindow {
+    pub window_id: u32,
+    pub pid: i32,
+    pub app_name: String,
+    pub title: String,
+    pub subrole: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WindowChangeEvidence {
+    pub appeared_windows: Vec<AppearedWindow>,
+    pub target_window_main: Option<bool>,
+}
+
+impl WindowChangeEvidence {
+    pub fn observe(
+        target_pid: i32,
+        target_window_id: Option<u32>,
+        appeared: &[WindowEvent],
+    ) -> Self {
+        Self {
+            appeared_windows: appeared
+                .iter()
+                .map(|event| AppearedWindow {
+                    window_id: event.window_id,
+                    pid: event.pid,
+                    app_name: event.app_name.clone(),
+                    title: event.title.clone(),
+                    subrole: window_attr(event.pid, event.window_id, |window| unsafe {
+                        copy_string_attr(window, "AXSubrole")
+                    }),
+                })
+                .collect(),
+            target_window_main: target_window_id.and_then(|window_id| {
+                window_attr(target_pid, window_id, |window| unsafe {
+                    copy_bool_attr(window, "AXMain")
+                })
+            }),
+        }
+    }
+}
+
+const WINDOW_LOOKUP_TIMEOUT_SECONDS: f32 = 0.25;
+
+fn window_attr<T>(
+    pid: i32,
+    window_id: u32,
+    read: impl Fn(AXUIElementRef) -> Option<T>,
+) -> Option<T> {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, WINDOW_LOOKUP_TIMEOUT_SECONDS);
+        let mut found = None;
+        for window in copy_ax_windows(app) {
+            AXUIElementSetMessagingTimeout(window, WINDOW_LOOKUP_TIMEOUT_SECONDS);
+            if found.is_none() && ax_get_window_id(window) == Some(window_id) {
+                found = read(window);
+            }
+            CFRelease(window as CFTypeRef);
+        }
+        CFRelease(app as CFTypeRef);
+        found
     }
 }
 

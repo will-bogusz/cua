@@ -320,6 +320,7 @@ fn apply_delivery_evidence(
     outcome: delivery_probe::ProbeOutcome,
     rung: NextRung,
     chromium_family: bool,
+    window_change: Option<&delivery_probe::WindowChangeEvidence>,
 ) {
     let probe_ms = outcome.probe.as_millis();
     let waited_ms = outcome.waited.as_millis();
@@ -330,9 +331,13 @@ fn apply_delivery_evidence(
     });
     match outcome.evidence {
         delivery_probe::Evidence::Changed(signal) => {
-            structured["evidence"] = serde_json::json!([
-                { "kind": "window_change", "detail": signal }
-            ]);
+            let mut entry = serde_json::json!({ "kind": "window_change", "detail": signal });
+            if let Some(observed) = window_change {
+                entry["appeared_windows"] =
+                    serde_json::to_value(&observed.appeared_windows).unwrap_or_default();
+                entry["target_window_main"] = serde_json::json!(observed.target_window_main);
+            }
+            structured["evidence"] = serde_json::json!([entry]);
             msg.push_str(&format!(
                 "\n🔎 Delivered: {signal} changed after the dispatch, so the app reacted. \
                  That is delivery, not the intended result — check the postcondition you \
@@ -1087,6 +1092,16 @@ impl Tool for ClickTool {
                     } else {
                         None
                     };
+                    let window_change = if evidence.is_some() && changes.needs_restore() {
+                        let appeared = changes.new_windows.clone();
+                        cua_driver_core::operation::spawn_blocking(move || {
+                            delivery_probe::WindowChangeEvidence::observe(pid, Some(wid), &appeared)
+                        })
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
                     let mut structured = ax_click_structured(&outcome, fronted);
                     // The probe contributes the remaining verdicts: `delivered`
                     // when the target reacted, `no_observed_change` when nothing
@@ -1112,6 +1127,7 @@ impl Tool for ClickTool {
                                 NextRung::PixelForeground
                             },
                             chromium_family,
+                            window_change.as_ref(),
                         );
                     }
                     ToolResult::text(msg).with_structured(structured)
@@ -1601,6 +1617,16 @@ impl Tool for ClickTool {
                     } else {
                         None
                     };
+                    let window_change = if evidence.is_some() && changes.needs_restore() {
+                        let appeared = changes.new_windows.clone();
+                        cua_driver_core::operation::spawn_blocking(move || {
+                            delivery_probe::WindowChangeEvidence::observe(pid, window_id, &appeared)
+                        })
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
                     let mut msg = format!(
                         "✅ Posted {button_label} to pid {pid} ({mode_label}; \
                          not driver-verified — confirm via screenshot).{}",
@@ -1628,6 +1654,7 @@ impl Tool for ClickTool {
                             outcome,
                             NextRung::Foreground,
                             chromium_family,
+                            window_change.as_ref(),
                         );
                     }
                     ToolResult::text(msg).with_structured(structured)
@@ -2188,6 +2215,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             false,
+            None,
         );
         assert_eq!(ax["effect"], "suspected_noop");
         // An AX press gains nothing from fronting the app: it never carries
@@ -2210,6 +2238,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::Foreground,
             false,
+            None,
         );
         assert_eq!(pixel["escalation"]["recommended"], "foreground");
     }
@@ -2226,6 +2255,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             false,
+            None,
         );
         assert!(!native_msg.contains("pointerdown"), "{native_msg}");
         assert!(
@@ -2244,6 +2274,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             true,
+            None,
         );
         assert!(chromium_msg.contains("pointerdown"), "{chromium_msg}");
     }
@@ -2258,11 +2289,42 @@ mod tests {
             outcome(delivery_probe::Evidence::Changed("element_state"), 120),
             NextRung::PixelForeground,
             false,
+            None,
         );
         assert_eq!(structured["effect"], "unverifiable");
         assert_eq!(structured["evidence"][0]["kind"], "window_change");
+        assert!(structured["evidence"][0]["appeared_windows"].is_null());
         assert!(structured["escalation"].is_null());
         assert!(msg.contains("Delivered: element_state changed"), "{msg}");
+    }
+
+    #[test]
+    fn a_window_that_appeared_is_named_in_the_evidence_with_the_target_window_state() {
+        let mut msg = String::new();
+        let mut structured = serde_json::json!({ "path": "ax", "effect": "unverifiable" });
+        let observed = delivery_probe::WindowChangeEvidence {
+            appeared_windows: vec![delivery_probe::AppearedWindow {
+                window_id: 10764,
+                pid: 588,
+                app_name: "Google Chrome".to_owned(),
+                title: "Print".to_owned(),
+                subrole: Some("AXDialog".to_owned()),
+            }],
+            target_window_main: Some(true),
+        };
+        apply_delivery_evidence(
+            &mut msg,
+            &mut structured,
+            outcome(delivery_probe::Evidence::Changed("window_change"), 0),
+            NextRung::PixelForeground,
+            false,
+            Some(&observed),
+        );
+        let appeared = &structured["evidence"][0]["appeared_windows"][0];
+        assert_eq!(appeared["window_id"], 10764);
+        assert_eq!(appeared["title"], "Print");
+        assert_eq!(appeared["subrole"], "AXDialog");
+        assert_eq!(structured["evidence"][0]["target_window_main"], true);
     }
 
     #[test]
@@ -2275,6 +2337,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unusable, 2000),
             NextRung::PixelForeground,
             false,
+            None,
         );
         assert_eq!(structured["effect"], "suspected_noop");
         assert!(structured["evidence"].is_null());
