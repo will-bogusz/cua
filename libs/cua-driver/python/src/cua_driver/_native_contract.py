@@ -754,6 +754,260 @@ _uniffi_check_contract_api_version(_UniffiLib)
 # Public interface members begin here.
 
 
+class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u64"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**64
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u64()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u64(value)
+
+class _UniffiFfiConverterString:
+    @staticmethod
+    def check_lower(value):
+        if not isinstance(value, str):
+            raise TypeError("argument must be str, not {}".format(type(value).__name__))
+        return value
+
+    @staticmethod
+    def read(buf):
+        size = buf.read_i32()
+        if size < 0:
+            raise InternalError("Unexpected negative string length")
+        utf8_bytes = buf.read(size)
+        return utf8_bytes.decode("utf-8")
+
+    @staticmethod
+    def write(value, buf):
+        utf8_bytes = value.encode("utf-8")
+        buf.write_i32(len(utf8_bytes))
+        buf.write(utf8_bytes)
+
+    @staticmethod
+    def lift(buf):
+        with buf.consume_with_stream() as stream:
+            return stream.read(stream.remaining()).decode("utf-8")
+
+    @staticmethod
+    def lower(value):
+        with _UniffiRustBuffer.alloc_with_builder() as builder:
+            builder.write(value.encode("utf-8"))
+            return builder.finalize()
+
+class _UniffiFfiConverterOptionalString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterString.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterString.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterString.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterBoolean:
+    @classmethod
+    def check_lower(cls, value):
+        return not not value
+
+    @classmethod
+    def lower(cls, value):
+        return 1 if value else 0
+
+    @staticmethod
+    def lift(value):
+        return value != 0
+
+    @classmethod
+    def read(cls, buf):
+        return cls.lift(buf.read_u8())
+
+    @classmethod
+    def write(cls, value, buf):
+        buf.write_u8(value)
+
+class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterBoolean.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterBoolean.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterBoolean.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class AccessibilityWindow:
+    def __init__(self, *, window_id:int, role:str, subrole:typing.Optional[str], minimized:typing.Optional[bool], main:typing.Optional[bool]):
+        self.window_id = window_id
+        self.role = role
+        self.subrole = subrole
+        self.minimized = minimized
+        self.main = main
+
+
+
+
+    def __str__(self):
+        return "AccessibilityWindow(window_id={}, role={}, subrole={}, minimized={}, main={})".format(self.window_id, self.role, self.subrole, self.minimized, self.main)
+    def __eq__(self, other):
+        if self.window_id != other.window_id:
+            return False
+        if self.role != other.role:
+            return False
+        if self.subrole != other.subrole:
+            return False
+        if self.minimized != other.minimized:
+            return False
+        if self.main != other.main:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeAccessibilityWindow(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return AccessibilityWindow(
+            window_id=_UniffiFfiConverterUInt64.read(buf),
+            role=_UniffiFfiConverterString.read(buf),
+            subrole=_UniffiFfiConverterOptionalString.read(buf),
+            minimized=_UniffiFfiConverterOptionalBoolean.read(buf),
+            main=_UniffiFfiConverterOptionalBoolean.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt64.check_lower(value.window_id)
+        _UniffiFfiConverterString.check_lower(value.role)
+        _UniffiFfiConverterOptionalString.check_lower(value.subrole)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.minimized)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.main)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt64.write(value.window_id, buf)
+        _UniffiFfiConverterString.write(value.role, buf)
+        _UniffiFfiConverterOptionalString.write(value.subrole, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.minimized, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.main, buf)
+
+class _UniffiFfiConverterUInt32(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u32"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**32
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u32()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u32(value)
+
+class _UniffiFfiConverterSequenceTypeAccessibilityWindow(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeAccessibilityWindow.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeAccessibilityWindow.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeAccessibilityWindow.read(buf) for i in range(count)
+        ]
+
+@dataclass
+class AccessibilityWindows:
+    def __init__(self, *, pid:int, complete:bool, windows:typing.List[AccessibilityWindow], error:typing.Optional[str]):
+        self.pid = pid
+        self.complete = complete
+        self.windows = windows
+        self.error = error
+
+
+
+
+    def __str__(self):
+        return "AccessibilityWindows(pid={}, complete={}, windows={}, error={})".format(self.pid, self.complete, self.windows, self.error)
+    def __eq__(self, other):
+        if self.pid != other.pid:
+            return False
+        if self.complete != other.complete:
+            return False
+        if self.windows != other.windows:
+            return False
+        if self.error != other.error:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeAccessibilityWindows(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return AccessibilityWindows(
+            pid=_UniffiFfiConverterUInt32.read(buf),
+            complete=_UniffiFfiConverterBoolean.read(buf),
+            windows=_UniffiFfiConverterSequenceTypeAccessibilityWindow.read(buf),
+            error=_UniffiFfiConverterOptionalString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt32.check_lower(value.pid)
+        _UniffiFfiConverterBoolean.check_lower(value.complete)
+        _UniffiFfiConverterSequenceTypeAccessibilityWindow.check_lower(value.windows)
+        _UniffiFfiConverterOptionalString.check_lower(value.error)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt32.write(value.pid, buf)
+        _UniffiFfiConverterBoolean.write(value.complete, buf)
+        _UniffiFfiConverterSequenceTypeAccessibilityWindow.write(value.windows, buf)
+        _UniffiFfiConverterOptionalString.write(value.error, buf)
+
 
 
 
@@ -809,19 +1063,6 @@ class _UniffiFfiConverterTypeActionDeliveryMode(_UniffiConverterRustBuffer):
             buf.write_i32(4)
 
 
-
-class _UniffiFfiConverterUInt32(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u32"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**32
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u32()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u32(value)
 
 class _UniffiFfiConverterOptionalUInt32(_UniffiConverterRustBuffer):
     @classmethod
@@ -1493,84 +1734,6 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalTypeActionEscalation.write(value.escalation, buf)
         _UniffiFfiConverterOptionalTypeActionCommit.write(value.committed, buf)
 
-class _UniffiFfiConverterString:
-    @staticmethod
-    def check_lower(value):
-        if not isinstance(value, str):
-            raise TypeError("argument must be str, not {}".format(type(value).__name__))
-        return value
-
-    @staticmethod
-    def read(buf):
-        size = buf.read_i32()
-        if size < 0:
-            raise InternalError("Unexpected negative string length")
-        utf8_bytes = buf.read(size)
-        return utf8_bytes.decode("utf-8")
-
-    @staticmethod
-    def write(value, buf):
-        utf8_bytes = value.encode("utf-8")
-        buf.write_i32(len(utf8_bytes))
-        buf.write(utf8_bytes)
-
-    @staticmethod
-    def lift(buf):
-        with buf.consume_with_stream() as stream:
-            return stream.read(stream.remaining()).decode("utf-8")
-
-    @staticmethod
-    def lower(value):
-        with _UniffiRustBuffer.alloc_with_builder() as builder:
-            builder.write(value.encode("utf-8"))
-            return builder.finalize()
-
-class _UniffiFfiConverterBoolean:
-    @classmethod
-    def check_lower(cls, value):
-        return not not value
-
-    @classmethod
-    def lower(cls, value):
-        return 1 if value else 0
-
-    @staticmethod
-    def lift(value):
-        return value != 0
-
-    @classmethod
-    def read(cls, buf):
-        return cls.lift(buf.read_u8())
-
-    @classmethod
-    def write(cls, value, buf):
-        buf.write_u8(value)
-
-class _UniffiFfiConverterOptionalString(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterString.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterString.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterString.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
 @dataclass
 class AppInfo:
     def __init__(self, *, pid:int, name:str, running:bool, active:bool, bundle_id:typing.Optional[str], launch_path:typing.Optional[str], kind:typing.Optional[str], last_used:typing.Optional[str]):
@@ -1730,19 +1893,6 @@ class _UniffiFfiConverterTypeBoundsExpectation(_UniffiConverterRustBuffer):
         _UniffiFfiConverterFloat64.write(value.width, buf)
         _UniffiFfiConverterFloat64.write(value.height, buf)
         _UniffiFfiConverterOptionalFloat64.write(value.tolerance_px, buf)
-
-class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u64"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**64
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u64()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u64(value)
 
 
 
@@ -3125,31 +3275,6 @@ class _UniffiFfiConverterTypeElementSelector(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.role, buf)
         _UniffiFfiConverterOptionalString.write(value.label_contains, buf)
 
-class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterBoolean.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterBoolean.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterBoolean.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
 @dataclass
 class ElementPredicate:
     def __init__(self, *, selector:ElementSelector, exists:typing.Optional[bool], value_equals:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool]):
@@ -4252,19 +4377,22 @@ class _UniffiFfiConverterTypeListSessionsOutput(_UniffiConverterRustBuffer):
 
 @dataclass
 class ListWindowsInput:
-    def __init__(self, *, pid:typing.Optional[int], on_screen_only:typing.Optional[bool]):
+    def __init__(self, *, pid:typing.Optional[int], on_screen_only:typing.Optional[bool], include_accessibility_metadata:typing.Optional[bool]):
         self.pid = pid
         self.on_screen_only = on_screen_only
+        self.include_accessibility_metadata = include_accessibility_metadata
 
 
 
 
     def __str__(self):
-        return "ListWindowsInput(pid={}, on_screen_only={})".format(self.pid, self.on_screen_only)
+        return "ListWindowsInput(pid={}, on_screen_only={}, include_accessibility_metadata={})".format(self.pid, self.on_screen_only, self.include_accessibility_metadata)
     def __eq__(self, other):
         if self.pid != other.pid:
             return False
         if self.on_screen_only != other.on_screen_only:
+            return False
+        if self.include_accessibility_metadata != other.include_accessibility_metadata:
             return False
         return True
 
@@ -4274,17 +4402,20 @@ class _UniffiFfiConverterTypeListWindowsInput(_UniffiConverterRustBuffer):
         return ListWindowsInput(
             pid=_UniffiFfiConverterOptionalUInt32.read(buf),
             on_screen_only=_UniffiFfiConverterOptionalBoolean.read(buf),
+            include_accessibility_metadata=_UniffiFfiConverterOptionalBoolean.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterOptionalUInt32.check_lower(value.pid)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.on_screen_only)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.include_accessibility_metadata)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterOptionalUInt32.write(value.pid, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.on_screen_only, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.include_accessibility_metadata, buf)
 
 @dataclass
 class WindowBounds:
@@ -4460,7 +4591,7 @@ class _UniffiFfiConverterOptionalSequenceUInt64(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowInfo:
-    def __init__(self, *, window_id:int, pid:typing.Optional[int], app_name:str, title:str, bounds:WindowBounds, is_on_screen:bool, z_index:typing.Optional[int], layer:typing.Optional[int], minimized:typing.Optional[bool], current_space_id:typing.Optional[int], on_current_space:typing.Optional[bool], space_ids:typing.Optional[typing.List[int]], kind:typing.Optional[str]):
+    def __init__(self, *, window_id:int, pid:typing.Optional[int], app_name:str, title:str, bounds:WindowBounds, is_on_screen:bool, z_index:typing.Optional[int], layer:typing.Optional[int], minimized:typing.Optional[bool], current_space_id:typing.Optional[int], on_current_space:typing.Optional[bool], space_ids:typing.Optional[typing.List[int]], kind:typing.Optional[str], ax_backed:typing.Optional[bool]):
         self.window_id = window_id
         self.pid = pid
         self.app_name = app_name
@@ -4474,12 +4605,13 @@ class WindowInfo:
         self.on_current_space = on_current_space
         self.space_ids = space_ids
         self.kind = kind
+        self.ax_backed = ax_backed
 
 
 
 
     def __str__(self):
-        return "WindowInfo(window_id={}, pid={}, app_name={}, title={}, bounds={}, is_on_screen={}, z_index={}, layer={}, minimized={}, current_space_id={}, on_current_space={}, space_ids={}, kind={})".format(self.window_id, self.pid, self.app_name, self.title, self.bounds, self.is_on_screen, self.z_index, self.layer, self.minimized, self.current_space_id, self.on_current_space, self.space_ids, self.kind)
+        return "WindowInfo(window_id={}, pid={}, app_name={}, title={}, bounds={}, is_on_screen={}, z_index={}, layer={}, minimized={}, current_space_id={}, on_current_space={}, space_ids={}, kind={}, ax_backed={})".format(self.window_id, self.pid, self.app_name, self.title, self.bounds, self.is_on_screen, self.z_index, self.layer, self.minimized, self.current_space_id, self.on_current_space, self.space_ids, self.kind, self.ax_backed)
     def __eq__(self, other):
         if self.window_id != other.window_id:
             return False
@@ -4507,6 +4639,8 @@ class WindowInfo:
             return False
         if self.kind != other.kind:
             return False
+        if self.ax_backed != other.ax_backed:
+            return False
         return True
 
 class _UniffiFfiConverterTypeWindowInfo(_UniffiConverterRustBuffer):
@@ -4526,6 +4660,7 @@ class _UniffiFfiConverterTypeWindowInfo(_UniffiConverterRustBuffer):
             on_current_space=_UniffiFfiConverterOptionalBoolean.read(buf),
             space_ids=_UniffiFfiConverterOptionalSequenceUInt64.read(buf),
             kind=_UniffiFfiConverterOptionalString.read(buf),
+            ax_backed=_UniffiFfiConverterOptionalBoolean.read(buf),
         )
 
     @staticmethod
@@ -4543,6 +4678,7 @@ class _UniffiFfiConverterTypeWindowInfo(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalBoolean.check_lower(value.on_current_space)
         _UniffiFfiConverterOptionalSequenceUInt64.check_lower(value.space_ids)
         _UniffiFfiConverterOptionalString.check_lower(value.kind)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.ax_backed)
 
     @staticmethod
     def write(value, buf):
@@ -4559,6 +4695,7 @@ class _UniffiFfiConverterTypeWindowInfo(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalBoolean.write(value.on_current_space, buf)
         _UniffiFfiConverterOptionalSequenceUInt64.write(value.space_ids, buf)
         _UniffiFfiConverterOptionalString.write(value.kind, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.ax_backed, buf)
 
 class _UniffiFfiConverterSequenceTypeWindowInfo(_UniffiConverterRustBuffer):
     @classmethod
@@ -4583,21 +4720,49 @@ class _UniffiFfiConverterSequenceTypeWindowInfo(_UniffiConverterRustBuffer):
             _UniffiFfiConverterTypeWindowInfo.read(buf) for i in range(count)
         ]
 
+class _UniffiFfiConverterOptionalTypeAccessibilityWindows(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeAccessibilityWindows.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeAccessibilityWindows.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeAccessibilityWindows.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class ListWindowsOutput:
-    def __init__(self, *, windows:typing.List[WindowInfo], current_space_id:typing.Optional[int]):
+    def __init__(self, *, windows:typing.List[WindowInfo], current_space_id:typing.Optional[int], accessibility_windows:typing.Optional[AccessibilityWindows]):
         self.windows = windows
         self.current_space_id = current_space_id
+        self.accessibility_windows = accessibility_windows
 
 
 
 
     def __str__(self):
-        return "ListWindowsOutput(windows={}, current_space_id={})".format(self.windows, self.current_space_id)
+        return "ListWindowsOutput(windows={}, current_space_id={}, accessibility_windows={})".format(self.windows, self.current_space_id, self.accessibility_windows)
     def __eq__(self, other):
         if self.windows != other.windows:
             return False
         if self.current_space_id != other.current_space_id:
+            return False
+        if self.accessibility_windows != other.accessibility_windows:
             return False
         return True
 
@@ -4607,17 +4772,20 @@ class _UniffiFfiConverterTypeListWindowsOutput(_UniffiConverterRustBuffer):
         return ListWindowsOutput(
             windows=_UniffiFfiConverterSequenceTypeWindowInfo.read(buf),
             current_space_id=_UniffiFfiConverterOptionalUInt64.read(buf),
+            accessibility_windows=_UniffiFfiConverterOptionalTypeAccessibilityWindows.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterSequenceTypeWindowInfo.check_lower(value.windows)
         _UniffiFfiConverterOptionalUInt64.check_lower(value.current_space_id)
+        _UniffiFfiConverterOptionalTypeAccessibilityWindows.check_lower(value.accessibility_windows)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterSequenceTypeWindowInfo.write(value.windows, buf)
         _UniffiFfiConverterOptionalUInt64.write(value.current_space_id, buf)
+        _UniffiFfiConverterOptionalTypeAccessibilityWindows.write(value.accessibility_windows, buf)
 
 @dataclass
 class MoveCursorInput:
@@ -6676,6 +6844,8 @@ __all__ = [
     "CaptureScope",
     "EffectiveScope",
     "Platform",
+    "AccessibilityWindow",
+    "AccessibilityWindows",
     "ActionDelivery",
     "ActionEscalation",
     "ActionEvidence",

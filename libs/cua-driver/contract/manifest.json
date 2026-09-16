@@ -2656,6 +2656,9 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "include_accessibility_metadata": {
+            "type": "boolean"
+          },
           "on_screen_only": {
             "type": "boolean"
           },
@@ -2671,6 +2674,71 @@
       "success_output_schema": {
         "additionalProperties": true,
         "properties": {
+          "accessibility_windows": {
+            "properties": {
+              "complete": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "pid": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "windows": {
+                "items": {
+                  "properties": {
+                    "main": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "minimized": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "role": {
+                      "type": "string"
+                    },
+                    "subrole": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "window_id": {
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "window_id",
+                    "role"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "pid",
+              "complete",
+              "windows"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "current_space_id": {
             "format": "uint64",
             "minimum": 0,
@@ -2684,6 +2752,12 @@
               "properties": {
                 "app_name": {
                   "type": "string"
+                },
+                "ax_backed": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
                 },
                 "bounds": {
                   "properties": {

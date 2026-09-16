@@ -93,13 +93,18 @@ impl Tool for ListWindowsTool {
             windows.retain(|w| w.pid == pid);
         }
 
+        let roster = include_accessibility.then(|| accessibility_roster(pid_filter.unwrap()));
+
         let windows_json: Vec<Value> = windows
             .iter()
             .map(|w| {
                 let kind = system_overlays
                     .contains(&w.window_id)
                     .then_some(crate::window_kind::SYSTEM_OVERLAY_KIND);
-                window_record_json(w, kind)
+                let ax_backed = roster
+                    .as_ref()
+                    .and_then(|roster| roster.ax_backed(w.window_id));
+                window_record_json(w, kind, ax_backed)
             })
             .collect();
 
@@ -107,39 +112,80 @@ impl Tool for ListWindowsTool {
             "windows": windows_json,
             "current_space_id": current_space_id
         });
-        if include_accessibility {
-            data["accessibility_windows"] = accessibility_windows(pid_filter.unwrap());
+        if let Some(roster) = roster {
+            data["accessibility_windows"] = roster.json;
         }
         ToolResult::text(format!("Found {} window(s).", windows_json.len())).with_structured(data)
     }
 }
 
-fn accessibility_windows(pid: i32) -> Value {
+const AX_ROSTER_MAX_WINDOWS: usize = 128;
+const AX_ROSTER_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+const AX_WINDOW_MESSAGING_TIMEOUT: f32 = 0.25;
+
+struct AccessibilityRoster {
+    complete: bool,
+    window_ids: std::collections::HashSet<u32>,
+    json: Value,
+}
+
+impl AccessibilityRoster {
+    fn unavailable(pid: i32, error: String) -> Self {
+        Self {
+            complete: false,
+            window_ids: std::collections::HashSet::new(),
+            json: serde_json::json!({
+                "pid": pid,
+                "complete": false,
+                "windows": [],
+                "error": error,
+            }),
+        }
+    }
+
+    fn ax_backed(&self, window_id: u32) -> Option<bool> {
+        if self.window_ids.contains(&window_id) {
+            Some(true)
+        } else {
+            self.complete.then_some(false)
+        }
+    }
+}
+
+fn accessibility_roster(pid: i32) -> AccessibilityRoster {
     use crate::ax::bindings::*;
     use core_foundation::base::{CFRelease, CFTypeRef};
 
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
-            return serde_json::json!({"pid": pid, "complete": false, "windows": [], "error": "No application accessibility element"});
+            return AccessibilityRoster::unavailable(
+                pid,
+                "No application accessibility element".to_owned(),
+            );
         }
-        AXUIElementSetMessagingTimeout(app, 0.25);
+        AXUIElementSetMessagingTimeout(app, AX_WINDOW_MESSAGING_TIMEOUT);
         let copied = copy_ax_windows_checked(app);
         CFRelease(app as CFTypeRef);
         let windows = match copied {
             Ok(windows) => windows,
             Err(error) => {
-                return serde_json::json!({"pid": pid, "complete": false, "windows": [], "error": format!("AXWindows unavailable ({error})")})
+                return AccessibilityRoster::unavailable(
+                    pid,
+                    format!("AXWindows unavailable ({error})"),
+                )
             }
         };
-        let mut complete = windows.len() <= 128;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut complete = windows.len() <= AX_ROSTER_MAX_WINDOWS;
+        let deadline = std::time::Instant::now() + AX_ROSTER_BUDGET;
+        let mut window_ids = std::collections::HashSet::new();
         let mut records = Vec::new();
         for (index, window) in windows.into_iter().enumerate() {
-            if index < 128 && std::time::Instant::now() < deadline {
-                AXUIElementSetMessagingTimeout(window, 0.25);
+            if index < AX_ROSTER_MAX_WINDOWS && std::time::Instant::now() < deadline {
+                AXUIElementSetMessagingTimeout(window, AX_WINDOW_MESSAGING_TIMEOUT);
                 match (ax_get_window_id(window), copy_string_attr(window, "AXRole")) {
                     (Some(window_id), Some(role)) if role == "AXWindow" => {
+                        window_ids.insert(window_id);
                         records.push(serde_json::json!({
                             "window_id": window_id,
                             "role": role,
@@ -155,11 +201,19 @@ fn accessibility_windows(pid: i32) -> Value {
             }
             CFRelease(window as CFTypeRef);
         }
-        serde_json::json!({"pid": pid, "complete": complete, "windows": records})
+        AccessibilityRoster {
+            complete,
+            window_ids,
+            json: serde_json::json!({"pid": pid, "complete": complete, "windows": records}),
+        }
     }
 }
 
-pub(super) fn window_record_json(w: &crate::windows::WindowInfo, kind: Option<&str>) -> Value {
+pub(super) fn window_record_json(
+    w: &crate::windows::WindowInfo,
+    kind: Option<&str>,
+    ax_backed: Option<bool>,
+) -> Value {
     let mut record = serde_json::json!({
         "window_id": w.window_id,
         "pid": w.pid,
@@ -180,6 +234,9 @@ pub(super) fn window_record_json(w: &crate::windows::WindowInfo, kind: Option<&s
     });
     if let Some(kind) = kind {
         record["kind"] = Value::String(kind.to_owned());
+    }
+    if let Some(ax_backed) = ax_backed {
+        record["ax_backed"] = Value::Bool(ax_backed);
     }
     record
 }
@@ -226,15 +283,15 @@ mod tests {
         let window = sample_window();
 
         assert_eq!(
-            window_record_json(&window, None)["z_index"],
+            window_record_json(&window, None, None)["z_index"],
             serde_json::json!(7)
         );
         assert_eq!(
-            window_record_json(&window, None)["current_space_id"],
+            window_record_json(&window, None, None)["current_space_id"],
             serde_json::json!(1)
         );
         assert_eq!(
-            window_record_json(&window, None)["on_current_space"],
+            window_record_json(&window, None, None)["on_current_space"],
             serde_json::json!(true)
         );
     }
@@ -243,10 +300,54 @@ mod tests {
     fn only_a_classified_window_carries_a_kind_key() {
         let window = sample_window();
 
-        let classified = window_record_json(&window, Some(crate::window_kind::SYSTEM_OVERLAY_KIND));
+        let classified =
+            window_record_json(&window, Some(crate::window_kind::SYSTEM_OVERLAY_KIND), None);
         assert_eq!(classified["kind"], serde_json::json!("system_overlay"));
 
-        let unclassified = window_record_json(&window, None);
+        let unclassified = window_record_json(&window, None, None);
         assert_eq!(unclassified.get("kind"), None);
+    }
+
+    fn roster(complete: bool, window_ids: &[u32]) -> AccessibilityRoster {
+        AccessibilityRoster {
+            complete,
+            window_ids: window_ids.iter().copied().collect(),
+            json: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn a_row_an_accessibility_window_claims_is_ax_backed() {
+        let complete = roster(true, &[42, 43]);
+        assert_eq!(complete.ax_backed(42), Some(true));
+        assert_eq!(complete.ax_backed(58), Some(false));
+
+        let window = sample_window();
+        assert_eq!(
+            window_record_json(&window, None, complete.ax_backed(window.window_id))["ax_backed"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn an_incomplete_roster_never_claims_a_row_is_cg_only() {
+        let partial = roster(false, &[43]);
+        assert_eq!(partial.ax_backed(43), Some(true));
+        assert_eq!(partial.ax_backed(42), None);
+
+        let window = sample_window();
+        assert_eq!(
+            window_record_json(&window, None, partial.ax_backed(window.window_id)).get("ax_backed"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_roster_without_accessibility_metadata_leaves_every_row_unclaimed() {
+        let window = sample_window();
+        assert_eq!(
+            window_record_json(&window, None, None).get("ax_backed"),
+            None
+        );
     }
 }

@@ -228,7 +228,8 @@ async fn typed_discovery_requests_use_the_existing_daemon_transport() {
     assert!(driver
         .list_windows(ListWindowsInput {
             pid: Some(42),
-            on_screen_only: Some(true)
+            on_screen_only: Some(true),
+            include_accessibility_metadata: None
         })
         .await
         .unwrap()

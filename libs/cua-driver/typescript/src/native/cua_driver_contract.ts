@@ -19,6 +19,133 @@ const uniffiIsDebug =
 
 // Public interface members begin here.
 
+const stringConverter = (() => {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    return {
+        stringToBytes: (s: string) => encoder.encode(s),
+        bytesToString: (ab: UniffiByteArray) => decoder.decode(ab),
+        stringByteLength: (s: string) => encoder.encode(s).byteLength,
+        writeStringIntoBuffer: (s: string, buf: any, offset: number): number => {
+            const view = new Uint8Array(
+                buf.arrayBuffer,
+                offset,
+                buf.arrayBuffer.byteLength - offset,
+            );
+            return encoder.encodeInto(s, view).written;
+        },
+        readStringFromBuffer: (buf: any, offset: number, length: number): string =>
+            decoder.decode(new Uint8Array(buf.arrayBuffer, offset, length)),
+    };
+})();
+const FfiConverterString = uniffiCreateFfiConverterString(stringConverter);
+
+export type AccessibilityWindow = {
+    windowId: bigint,
+    role: string,
+    subrole?: string,
+    minimized?: boolean,
+    main?: boolean
+}
+
+/**
+ * Generated factory for {@link AccessibilityWindow} record objects.
+ */
+export const AccessibilityWindow = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<AccessibilityWindow, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<AccessibilityWindow>,
+    });
+})();
+
+const FfiConverterTypeAccessibilityWindow = (() => {
+    type TypeName = AccessibilityWindow;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                windowId: FfiConverterUInt64.read(from),
+                role: FfiConverterString.read(from),
+                subrole: FfiConverterOptionalString.read(from),
+                minimized: FfiConverterOptionalBoolean.read(from),
+                main: FfiConverterOptionalBoolean.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterUInt64.write(value.windowId, into);
+            FfiConverterString.write(value.role, into);
+            FfiConverterOptionalString.write(value.subrole, into);
+            FfiConverterOptionalBoolean.write(value.minimized, into);
+            FfiConverterOptionalBoolean.write(value.main, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt64.allocationSize(value.windowId) +
+             FfiConverterString.allocationSize(value.role) +
+             FfiConverterOptionalString.allocationSize(value.subrole) +
+             FfiConverterOptionalBoolean.allocationSize(value.minimized) +
+             FfiConverterOptionalBoolean.allocationSize(value.main);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export type AccessibilityWindows = {
+    pid: number,
+    complete: boolean,
+    windows: Array<AccessibilityWindow>,
+    error?: string
+}
+
+/**
+ * Generated factory for {@link AccessibilityWindows} record objects.
+ */
+export const AccessibilityWindows = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<AccessibilityWindows, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<AccessibilityWindows>,
+    });
+})();
+
+const FfiConverterTypeAccessibilityWindows = (() => {
+    type TypeName = AccessibilityWindows;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                pid: FfiConverterUInt32.read(from),
+                complete: FfiConverterBool.read(from),
+                windows: FfiConverterSequenceTypeAccessibilityWindow.read(from),
+                error: FfiConverterOptionalString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterUInt32.write(value.pid, into);
+            FfiConverterBool.write(value.complete, into);
+            FfiConverterSequenceTypeAccessibilityWindow.write(value.windows, into);
+            FfiConverterOptionalString.write(value.error, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt32.allocationSize(value.pid) +
+             FfiConverterBool.allocationSize(value.complete) +
+             FfiConverterSequenceTypeAccessibilityWindow.allocationSize(value.windows) +
+             FfiConverterOptionalString.allocationSize(value.error);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export enum ActionDeliveryMode {
     Background,
     Foreground,
@@ -471,27 +598,6 @@ const FfiConverterTypeActionResult = (() => {
     };
     return new FFIConverter();
 })();
-
-const stringConverter = (() => {
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
-    return {
-        stringToBytes: (s: string) => encoder.encode(s),
-        bytesToString: (ab: UniffiByteArray) => decoder.decode(ab),
-        stringByteLength: (s: string) => encoder.encode(s).byteLength,
-        writeStringIntoBuffer: (s: string, buf: any, offset: number): number => {
-            const view = new Uint8Array(
-                buf.arrayBuffer,
-                offset,
-                buf.arrayBuffer.byteLength - offset,
-            );
-            return encoder.encodeInto(s, view).written;
-        },
-        readStringFromBuffer: (buf: any, offset: number, length: number): string =>
-            decoder.decode(new Uint8Array(buf.arrayBuffer, offset, length)),
-    };
-})();
-const FfiConverterString = uniffiCreateFfiConverterString(stringConverter);
 
 export type AppInfo = {
     pid: number,
@@ -2920,7 +3026,8 @@ const FfiConverterTypeListSessionsOutput = (() => {
 
 export type ListWindowsInput = {
     pid?: number,
-    onScreenOnly?: boolean
+    onScreenOnly?: boolean,
+    includeAccessibilityMetadata?: boolean
 }
 
 /**
@@ -2945,16 +3052,19 @@ const FfiConverterTypeListWindowsInput = (() => {
         read(from: RustBuffer): TypeName {
             return {
                 pid: FfiConverterOptionalUInt32.read(from),
-                onScreenOnly: FfiConverterOptionalBoolean.read(from)
+                onScreenOnly: FfiConverterOptionalBoolean.read(from),
+                includeAccessibilityMetadata: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterOptionalUInt32.write(value.pid, into);
             FfiConverterOptionalBoolean.write(value.onScreenOnly, into);
+            FfiConverterOptionalBoolean.write(value.includeAccessibilityMetadata, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterOptionalUInt32.allocationSize(value.pid) +
-             FfiConverterOptionalBoolean.allocationSize(value.onScreenOnly);
+             FfiConverterOptionalBoolean.allocationSize(value.onScreenOnly) +
+             FfiConverterOptionalBoolean.allocationSize(value.includeAccessibilityMetadata);
 
         }
     };
@@ -3028,7 +3138,8 @@ export type WindowInfo = {
     currentSpaceId?: bigint,
     onCurrentSpace?: boolean,
     spaceIds?: Array<bigint>,
-    kind?: string
+    kind?: string,
+    axBacked?: boolean
 }
 
 /**
@@ -3064,7 +3175,8 @@ const FfiConverterTypeWindowInfo = (() => {
                 currentSpaceId: FfiConverterOptionalUInt64.read(from),
                 onCurrentSpace: FfiConverterOptionalBoolean.read(from),
                 spaceIds: FfiConverterOptionalSequenceUInt64.read(from),
-                kind: FfiConverterOptionalString.read(from)
+                kind: FfiConverterOptionalString.read(from),
+                axBacked: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -3081,6 +3193,7 @@ const FfiConverterTypeWindowInfo = (() => {
             FfiConverterOptionalBoolean.write(value.onCurrentSpace, into);
             FfiConverterOptionalSequenceUInt64.write(value.spaceIds, into);
             FfiConverterOptionalString.write(value.kind, into);
+            FfiConverterOptionalBoolean.write(value.axBacked, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterUInt64.allocationSize(value.windowId) +
@@ -3095,7 +3208,8 @@ const FfiConverterTypeWindowInfo = (() => {
              FfiConverterOptionalUInt64.allocationSize(value.currentSpaceId) +
              FfiConverterOptionalBoolean.allocationSize(value.onCurrentSpace) +
              FfiConverterOptionalSequenceUInt64.allocationSize(value.spaceIds) +
-             FfiConverterOptionalString.allocationSize(value.kind);
+             FfiConverterOptionalString.allocationSize(value.kind) +
+             FfiConverterOptionalBoolean.allocationSize(value.axBacked);
 
         }
     };
@@ -3104,7 +3218,8 @@ const FfiConverterTypeWindowInfo = (() => {
 
 export type ListWindowsOutput = {
     windows: Array<WindowInfo>,
-    currentSpaceId?: bigint
+    currentSpaceId?: bigint,
+    accessibilityWindows?: AccessibilityWindows
 }
 
 /**
@@ -3129,16 +3244,19 @@ const FfiConverterTypeListWindowsOutput = (() => {
         read(from: RustBuffer): TypeName {
             return {
                 windows: FfiConverterSequenceTypeWindowInfo.read(from),
-                currentSpaceId: FfiConverterOptionalUInt64.read(from)
+                currentSpaceId: FfiConverterOptionalUInt64.read(from),
+                accessibilityWindows: FfiConverterOptionalTypeAccessibilityWindows.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterSequenceTypeWindowInfo.write(value.windows, into);
             FfiConverterOptionalUInt64.write(value.currentSpaceId, into);
+            FfiConverterOptionalTypeAccessibilityWindows.write(value.accessibilityWindows, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterSequenceTypeWindowInfo.allocationSize(value.windows) +
-             FfiConverterOptionalUInt64.allocationSize(value.currentSpaceId);
+             FfiConverterOptionalUInt64.allocationSize(value.currentSpaceId) +
+             FfiConverterOptionalTypeAccessibilityWindows.allocationSize(value.accessibilityWindows);
 
         }
     };
@@ -4762,6 +4880,15 @@ const FfiConverterTypePlatform = (() => {
     return new FFIConverter();
 })();
 
+// FfiConverter for string | undefined
+const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
+
+// FfiConverter for boolean | undefined
+const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
+
+// FfiConverter for Array<AccessibilityWindow>
+const FfiConverterSequenceTypeAccessibilityWindow = new FfiConverterArray(FfiConverterTypeAccessibilityWindow);
+
 // FfiConverter for number | undefined
 const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
 
@@ -4779,9 +4906,6 @@ const FfiConverterOptionalTypeActionEscalation = new FfiConverterOptional(FfiCon
 
 // FfiConverter for ActionCommit | undefined
 const FfiConverterOptionalTypeActionCommit = new FfiConverterOptional(FfiConverterTypeActionCommit);
-
-// FfiConverter for string | undefined
-const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 
 // FfiConverter for number | undefined
 const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
@@ -4803,9 +4927,6 @@ const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
 
 // FfiConverter for Array<string> | undefined
 const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
-
-// FfiConverter for boolean | undefined
-const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 
 // FfiConverter for CursorPointOutput | undefined
 const FfiConverterOptionalTypeCursorPointOutput = new FfiConverterOptional(FfiConverterTypeCursorPointOutput);
@@ -4830,6 +4951,9 @@ const FfiConverterOptionalSequenceUInt64 = new FfiConverterOptional(FfiConverter
 
 // FfiConverter for Array<WindowInfo>
 const FfiConverterSequenceTypeWindowInfo = new FfiConverterArray(FfiConverterTypeWindowInfo);
+
+// FfiConverter for AccessibilityWindows | undefined
+const FfiConverterOptionalTypeAccessibilityWindows = new FfiConverterOptional(FfiConverterTypeAccessibilityWindows);
 
 // FfiConverter for UnknownReason | undefined
 const FfiConverterOptionalTypeUnknownReason = new FfiConverterOptional(FfiConverterTypeUnknownReason);
@@ -4901,6 +5025,8 @@ function uniffiEnsureInitialized() {
 export default Object.freeze({
   initialize: uniffiEnsureInitialized,
   converters: {
+    FfiConverterTypeAccessibilityWindow,
+    FfiConverterTypeAccessibilityWindows,
     FfiConverterTypeActionCommit,
     FfiConverterTypeActionDelivery,
     FfiConverterTypeActionDeliveryMode,

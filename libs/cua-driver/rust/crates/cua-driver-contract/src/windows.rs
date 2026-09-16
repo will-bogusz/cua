@@ -45,6 +45,9 @@ pub struct ListWindowsInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
     pub on_screen_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "bool_schema")]
+    pub include_accessibility_metadata: Option<bool>,
 }
 
 impl ToolInput for ListWindowsInput {
@@ -53,6 +56,9 @@ impl ToolInput for ListWindowsInput {
     fn validate(&self) -> Result<(), String> {
         if self.pid == Some(0) {
             return Err("window discovery requires a positive process ID".into());
+        }
+        if self.include_accessibility_metadata == Some(true) && self.pid.is_none() {
+            return Err("accessibility window metadata requires an explicit process ID".into());
         }
         Ok(())
     }
@@ -173,6 +179,29 @@ pub struct WindowInfo {
     pub space_ids: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ax_backed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+pub struct AccessibilityWindow {
+    pub window_id: u64,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subrole: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+pub struct AccessibilityWindows {
+    pub pid: u32,
+    pub complete: bool,
+    pub windows: Vec<AccessibilityWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
@@ -180,6 +209,8 @@ pub struct ListWindowsOutput {
     pub windows: Vec<WindowInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_space_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessibility_windows: Option<AccessibilityWindows>,
 }
 
 impl ToolOutput for ListWindowsOutput {

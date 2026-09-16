@@ -968,6 +968,7 @@ fn run_typed_sdk_native_window(fixture: &mut Fixture) -> Observation {
             .list_windows(ListWindowsInput {
                 pid: None,
                 on_screen_only: None,
+                include_accessibility_metadata: None,
             })
             .await
             .expect("typed window discovery");

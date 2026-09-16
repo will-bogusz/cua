@@ -314,7 +314,7 @@ impl Tool for LaunchAppTool {
 
                 let windows_json: Vec<Value> = windows
                     .iter()
-                    .map(|w| super::list_windows::window_record_json(w, None))
+                    .map(|w| super::list_windows::window_record_json(w, None, None))
                     .collect();
 
                 let structured = serde_json::json!({
