@@ -469,6 +469,21 @@ impl WalkTruncation {
     }
 }
 
+const UNREADABLE_SUBTREE_LINE: &str = "- Unreadable subtree: child list could not be read";
+
+fn note_unreadable_children(
+    hid_descendants: bool,
+    child_depth: usize,
+    lines: &mut Vec<(usize, String)>,
+    truncation: &mut WalkTruncation,
+) {
+    if !hid_descendants {
+        return;
+    }
+    truncation.unreadable = true;
+    lines.push((child_depth, UNREADABLE_SUBTREE_LINE.to_owned()));
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn walk_element(
     element: AXUIElementRef,
@@ -543,7 +558,7 @@ unsafe fn walk_element(
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
         let (children, hid_descendants) = copy_children_checked(element);
-        truncation.unreadable |= hid_descendants;
+        note_unreadable_children(hid_descendants, depth, lines, truncation);
         for child in children {
             walk_element(
                 child,
@@ -619,7 +634,7 @@ unsafe fn walk_element(
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         let (children, hid_descendants) = copy_children_checked(element);
-        truncation.unreadable |= hid_descendants;
+        note_unreadable_children(hid_descendants, depth + 1, lines, truncation);
         for child in children {
             walk_element(
                 child,
@@ -745,7 +760,7 @@ unsafe fn walk_element(
     nodes.push(node);
 
     let (children, hid_descendants) = copy_children_checked(element);
-    truncation.unreadable |= hid_descendants;
+    note_unreadable_children(hid_descendants, depth + 1, lines, truncation);
     for child in children {
         walk_element(
             child,
@@ -1022,5 +1037,21 @@ mod tests {
         });
         assert_eq!(reads.get(), 1, "actionable nodes must read state once");
         assert_eq!(actionable.enabled, Some(true));
+    }
+
+    #[test]
+    fn a_hidden_child_list_renders_a_row_at_the_child_depth() {
+        let mut lines = vec![(0, "- [0] AXWindow \"Contacts\"".to_owned())];
+        let mut truncation = WalkTruncation::default();
+
+        note_unreadable_children(false, 1, &mut lines, &mut truncation);
+        assert_eq!(lines.len(), 1, "a readable child list adds no row");
+        assert!(!truncation.any());
+
+        note_unreadable_children(true, 1, &mut lines, &mut truncation);
+        assert!(truncation.unreadable);
+        let rendered = render_lines(&lines);
+        let expected = format!("  {UNREADABLE_SUBTREE_LINE}");
+        assert_eq!(rendered.lines().nth(1), Some(expected.as_str()));
     }
 }

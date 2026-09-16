@@ -13,6 +13,7 @@ use super::bindings::{kAXErrorSuccess, AXError, AXUIElementRef, AXUIElementSetMe
 thread_local! {
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
     static FAILURE: Cell<Option<StopReason>> = const { Cell::new(None) };
+    static NATIVE_FAILURES: Cell<u32> = const { Cell::new(0) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -27,11 +28,13 @@ pub enum StopReason {
 pub const WALK_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const CANNOT_COMPLETE: AXError = -25204;
+const TOLERATED_CONSECUTIVE_NATIVE_FAILURES: u32 = 12;
 
 /// Remains on the blocking thread and restores any outer deadline on every exit.
 pub struct WalkBudget {
     previous: Option<Instant>,
     previous_failure: Option<StopReason>,
+    previous_native_failures: u32,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -46,6 +49,7 @@ impl WalkBudget {
         Self {
             previous,
             previous_failure: FAILURE.with(Cell::get),
+            previous_native_failures: NATIVE_FAILURES.with(Cell::get),
             _thread: PhantomData,
         }
     }
@@ -55,6 +59,7 @@ impl Drop for WalkBudget {
     fn drop(&mut self) {
         DEADLINE.with(|slot| slot.set(self.previous));
         FAILURE.with(|slot| slot.set(self.previous_failure));
+        NATIVE_FAILURES.with(|slot| slot.set(self.previous_native_failures));
     }
 }
 
@@ -90,6 +95,21 @@ fn stop(reason: StopReason) {
     }
 }
 
+fn note_native_failure(code: AXError) {
+    let consecutive = NATIVE_FAILURES.with(|slot| {
+        let consecutive = slot.get().saturating_add(1);
+        slot.set(consecutive);
+        consecutive
+    });
+    if consecutive > TOLERATED_CONSECUTIVE_NATIVE_FAILURES {
+        stop(StopReason::NativeRequestFailed { code });
+    }
+}
+
+fn clear_native_failures() {
+    NATIVE_FAILURES.with(|slot| slot.set(0));
+}
+
 /// The timeout is attached to each AX proxy, including helper-created proxies.
 /// Never use zero: AX interprets it as restoring the default timeout.
 pub unsafe fn request(element: AXUIElementRef, call: impl FnOnce() -> AXError) -> AXError {
@@ -121,22 +141,68 @@ fn request_with(
         }
     }
     let result = call();
-    if deadline.is_some() && result == CANNOT_COMPLETE {
-        stop(StopReason::NativeRequestFailed { code: result });
+    if let Some(deadline) = deadline {
+        if result != CANNOT_COMPLETE {
+            clear_native_failures();
+        } else if Instant::now() < deadline {
+            note_native_failure(result);
+        }
     }
     result
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::bindings::kAXErrorAttributeUnsupported;
     use super::*;
 
     #[test]
-    fn unresponsive_native_request_stops_the_walk_without_claiming_a_deadline_expired() {
+    fn a_native_failure_once_the_deadline_has_passed_is_reported_as_the_deadline() {
+        let _budget = WalkBudget::new(Duration::from_millis(15));
+        assert_eq!(
+            request_with(
+                DEADLINE.with(Cell::get),
+                |_| kAXErrorSuccess,
+                || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    CANNOT_COMPLETE
+                }
+            ),
+            CANNOT_COMPLETE
+        );
+        assert_eq!(stop_reason(), Some(StopReason::Deadline));
+    }
+
+    #[test]
+    fn an_isolated_unresponsive_native_request_leaves_the_walk_running() {
+        let _budget = WalkBudget::new(Duration::from_secs(10));
+        let deadline = DEADLINE.with(Cell::get);
+        assert_eq!(
+            request_with(deadline, |_| kAXErrorSuccess, || CANNOT_COMPLETE),
+            CANNOT_COMPLETE
+        );
+        assert_eq!(stop_reason(), None);
+        assert!(!exhausted());
+        assert_eq!(
+            request_with(deadline, |_| kAXErrorSuccess, || kAXErrorSuccess),
+            kAXErrorSuccess
+        );
+    }
+
+    #[test]
+    fn a_wedged_app_stops_the_walk_once_the_tolerated_native_failures_are_exceeded() {
         {
             let _budget = WalkBudget::new(Duration::from_secs(10));
+            let deadline = DEADLINE.with(Cell::get);
+            for _ in 0..TOLERATED_CONSECUTIVE_NATIVE_FAILURES {
+                assert_eq!(
+                    request_with(deadline, |_| kAXErrorSuccess, || CANNOT_COMPLETE),
+                    CANNOT_COMPLETE
+                );
+                assert!(!exhausted());
+            }
             assert_eq!(
-                request_with(DEADLINE.with(Cell::get), |_| 0, || CANNOT_COMPLETE),
+                request_with(deadline, |_| kAXErrorSuccess, || CANNOT_COMPLETE),
                 CANNOT_COMPLETE
             );
             assert_eq!(
@@ -145,16 +211,29 @@ mod tests {
                     code: CANNOT_COMPLETE
                 })
             );
-            assert_eq!(
-                request_with(
-                    DEADLINE.with(Cell::get),
-                    |_| panic!("walk stopped"),
-                    || panic!("must not request another attribute")
-                ),
-                CANNOT_COMPLETE
-            );
         }
         assert_eq!(stop_reason(), None);
+    }
+
+    #[test]
+    fn a_completed_request_between_failures_resets_the_tolerated_native_failures() {
+        let _budget = WalkBudget::new(Duration::from_secs(10));
+        let deadline = DEADLINE.with(Cell::get);
+        for _ in 0..TOLERATED_CONSECUTIVE_NATIVE_FAILURES * 3 {
+            assert_eq!(
+                request_with(deadline, |_| kAXErrorSuccess, || CANNOT_COMPLETE),
+                CANNOT_COMPLETE
+            );
+            assert_eq!(
+                request_with(
+                    deadline,
+                    |_| kAXErrorSuccess,
+                    || kAXErrorAttributeUnsupported
+                ),
+                kAXErrorAttributeUnsupported
+            );
+        }
+        assert!(!exhausted());
     }
 
     #[tokio::test]
