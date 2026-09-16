@@ -134,10 +134,10 @@ const SELECTION_READBACK_STABILITY: std::time::Duration = std::time::Duration::f
 
 /// A reply error cannot establish that the receiver did nothing. In particular,
 /// a system file panel can commit the save and disappear before replying.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("AXUIElementPerformAction({action}) returned {code}")]
 struct AxActionReplyError {
-    action: &'static str,
+    action: String,
     code: crate::ax::bindings::AXError,
 }
 
@@ -170,19 +170,22 @@ impl AxActionReplyError {
 }
 
 fn dispatch_ax_action(
-    action: &'static str,
+    action: &str,
     dispatch: impl FnOnce() -> crate::ax::bindings::AXError,
 ) -> Result<(), AxActionReplyError> {
     let code = dispatch();
     if code == kAXErrorSuccess {
         Ok(())
     } else {
-        Err(AxActionReplyError { action, code })
+        Err(AxActionReplyError {
+            action: action.to_owned(),
+            code,
+        })
     }
 }
 
 /// What a reply to `AXUIElementPerformAction` licenses the driver to do next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum AxReplyDisposition {
     Performed,
     /// The application answered the action without saying whether it acted, so
@@ -237,7 +240,42 @@ fn ax_reply_summary(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnknownAxAction {
+    requested: String,
+    advertised: Vec<String>,
+}
+
+impl std::fmt::Display for UnknownAxAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let advertised = if self.advertised.is_empty() {
+            "none".to_owned()
+        } else {
+            self.advertised.join(", ")
+        };
+        write!(
+            f,
+            "action \"{}\" is neither a documented alias (press, show_menu, pick, confirm, \
+             cancel, open) nor an action this element advertises (advertised: {advertised}); \
+             nothing was dispatched",
+            self.requested
+        )
+    }
+}
+
+impl std::error::Error for UnknownAxAction {}
+
 fn ax_action_error(error: anyhow::Error) -> ToolResult {
+    if let Some(unknown) = error.downcast_ref::<UnknownAxAction>() {
+        return ToolResult::error(format!("click refused: {error}")).with_structured(
+            serde_json::json!({
+                "code": "action_unsupported",
+                "effect": "not_dispatched",
+                "action": unknown.requested,
+                "advertised_actions": unknown.advertised,
+            }),
+        );
+    }
     if let Some(reply) = error.downcast_ref::<AxActionReplyError>() {
         ToolResult::error(format!(
             "AX action outcome is unknown: {error}. The action was attempted and may \
@@ -429,7 +467,7 @@ fn def() -> &'static ToolDef {
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "x":             { "type": "number",  "description": "X in screenshot pixels. A window target uses the get_window_state PNG; a desktop target uses the native get_desktop_state PNG. The driver reverses Retina backing scale and any window-image downscale." },
                 "y":             { "type": "number",  "description": "Y in screenshot pixels from the image selected by target." },
-                "action":        { "type": "string",  "description": "AX action: press, show_menu, pick, confirm, cancel, open." },
+                "action":        { "type": "string",  "description": "AX action: press, show_menu, pick, confirm, cancel, open. Any other value must be an action name the element itself advertises — an AX name from the element's `actions` or the `raw` string of one of its `custom_actions`; anything else is refused instead of dispatched as a press." },
                 "button":        {
                     "type": "string",
                     "enum": ["left", "right", "middle"],
@@ -771,7 +809,7 @@ impl Tool for ClickTool {
                 action.clone()
             };
 
-            if !delivery_mode.is_foreground() && map_action(&effective_action) == "AXOpen" {
+            if !delivery_mode.is_foreground() && map_action(&effective_action) == Some("AXOpen") {
                 let panel = cua_driver_core::operation::spawn_blocking(move || {
                     crate::ax::exact_target::is_file_panel_element(element_ptr)
                 })
@@ -1809,18 +1847,23 @@ fn perform_ax_click(
     modifiers: &[String],
     foreground: bool,
 ) -> anyhow::Result<AxClickOutcome> {
-    let ax_action = map_action(action_str);
     let element = element_ptr as AXUIElementRef;
+
+    // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
+    // (AX returns success even when the element doesn't advertise the action).
+    let advertised = crate::ax::actions::split(unsafe { copy_action_names(element) });
+    let ax_action = resolve_ax_action(action_str, &advertised).ok_or_else(|| {
+        anyhow::Error::new(UnknownAxAction {
+            requested: action_str.to_owned(),
+            advertised: advertised.names(),
+        })
+    })?;
 
     // Check the live value immediately before dispatch. Foreground assist can
     // enable menu items that were disabled in the cached snapshot, while a
     // background transition can disable them after that snapshot. macOS may
     // otherwise return success for a disabled action that did nothing.
-    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, ax_action)?;
-
-    // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
-    // (AX returns success even when the element doesn't advertise the action).
-    let advertised = unsafe { copy_action_names(element) };
+    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, &ax_action)?;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
@@ -1829,7 +1872,7 @@ fn perform_ax_click(
     // label child or row that does not advertise AXPress. Prefer a bounded,
     // read-back-verified AXSelected write over dispatching a known hollow press
     // or forcing the caller onto a less stable pixel coordinate.
-    if ax_action == "AXPress" && !advertised.iter().any(|action| action == ax_action) {
+    if ax_action == "AXPress" && !advertised.advertises(&ax_action) {
         if modifiers.is_empty() {
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr)
@@ -1960,8 +2003,8 @@ fn perform_ax_click(
         .then(|| crate::windows::accessory_window_ids(pid))
         .unwrap_or_default();
 
-    let reply = dispatch_ax_action(ax_action, || unsafe {
-        crate::ax::bindings::perform_action(element, ax_action)
+    let reply = dispatch_ax_action(&ax_action, || unsafe {
+        crate::ax::bindings::perform_action(element, &ax_action)
     });
     let unverified = match ax_reply_disposition(reply, modifiers) {
         AxReplyDisposition::Performed => None,
@@ -1985,7 +2028,7 @@ fn perform_ax_click(
         AxReplyDisposition::Failed(reply) => return Err(reply.into()),
     };
 
-    let mut summary = ax_reply_summary(unverified.as_ref(), ax_action, idx, &role, &title);
+    let mut summary = ax_reply_summary(unverified.as_ref(), &ax_action, idx, &role, &title);
 
     // AXShowMenu returns success on controls that never open a menu, which
     // left `click(button:"right")` with no way to reach a context menu at all.
@@ -2071,12 +2114,12 @@ fn perform_ax_click(
 
     // Advertised-action warning: non-fatal but surfaces likely no-ops. Also the
     // machine-readable `suspected_noop` signal returned to the caller.
-    let suspected_noop = !advertised.contains(&ax_action.to_string());
+    let suspected_noop = !advertised.advertises(&ax_action);
     if suspected_noop {
         let adv_list = if advertised.is_empty() {
-            "none".into()
+            "none".to_owned()
         } else {
-            advertised.join(", ")
+            advertised.names().join(", ")
         };
         summary.push_str(&format!(
             "\n⚠️ Element does not advertise {ax_action} (actions: {adv_list}). \
@@ -2138,16 +2181,25 @@ mod selection_fallback_tests {
     }
 }
 
-fn map_action(action: &str) -> &'static str {
+fn map_action(action: &str) -> Option<&'static str> {
     match action.to_lowercase().as_str() {
-        "press" | "click" => "AXPress",
-        "show_menu" | "right_click" => "AXShowMenu",
-        "pick" => "AXPick",
-        "confirm" => "AXConfirm",
-        "cancel" => "AXCancel",
-        "open" => "AXOpen",
-        _ => "AXPress",
+        "press" | "click" => Some("AXPress"),
+        "show_menu" | "right_click" => Some("AXShowMenu"),
+        "pick" => Some("AXPick"),
+        "confirm" => Some("AXConfirm"),
+        "cancel" => Some("AXCancel"),
+        "open" => Some("AXOpen"),
+        _ => None,
     }
+}
+
+fn resolve_ax_action(
+    action: &str,
+    advertised: &crate::ax::actions::ElementActions,
+) -> Option<String> {
+    map_action(action)
+        .map(str::to_owned)
+        .or_else(|| advertised.advertises(action).then(|| action.to_owned()))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -2162,6 +2214,52 @@ mod tests {
             probe: std::time::Duration::from_millis(waited_ms + 250),
             waited: std::time::Duration::from_millis(waited_ms),
         }
+    }
+
+    fn advertised(names: &[&str]) -> crate::ax::actions::ElementActions {
+        crate::ax::actions::split(names.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    #[test]
+    fn an_action_name_the_element_advertises_is_dispatched_verbatim() {
+        let actions = advertised(&[
+            "AXScrollToVisible",
+            "Name:Pin List\nTarget:0x0\nSelector:(null)",
+        ]);
+        assert_eq!(
+            resolve_ax_action("AXScrollToVisible", &actions).as_deref(),
+            Some("AXScrollToVisible")
+        );
+        assert_eq!(
+            resolve_ax_action("Name:Pin List\nTarget:0x0\nSelector:(null)", &actions).as_deref(),
+            Some("Name:Pin List\nTarget:0x0\nSelector:(null)")
+        );
+        assert_eq!(
+            resolve_ax_action("show_menu", &actions).as_deref(),
+            Some("AXShowMenu"),
+            "a documented alias resolves without the element advertising it"
+        );
+    }
+
+    #[test]
+    fn an_unknown_action_name_is_refused_instead_of_pressed() {
+        let actions = advertised(&["AXPress", "Name:Flag\nTarget:0x0\nSelector:(null)"]);
+        assert_eq!(resolve_ax_action("AXScrollToVisible", &actions), None);
+        assert_eq!(resolve_ax_action("Flag", &actions), None);
+        assert_eq!(resolve_ax_action("wiggle", &actions), None);
+
+        let refusal = ax_action_error(anyhow::Error::new(UnknownAxAction {
+            requested: "AXScrollToVisible".to_owned(),
+            advertised: actions.names(),
+        }));
+        let details = refusal.structured_content.expect("structured refusal");
+        assert_eq!(details["code"], "action_unsupported");
+        assert_eq!(details["effect"], "not_dispatched");
+        assert_eq!(details["action"], "AXScrollToVisible");
+        assert_eq!(
+            details["advertised_actions"],
+            serde_json::json!(["AXPress", "Flag"])
+        );
     }
 
     /// The probe reads four signals; an effect outside them is invisible to
@@ -2352,35 +2450,35 @@ mod tests {
             assert_eq!(
                 ax_reply_disposition(reply, &[]),
                 AxReplyDisposition::Dispatched(AxActionReplyError {
-                    action: "AXPress",
+                    action: "AXPress".to_owned(),
                     code
                 }),
                 "{code}"
             );
         }
         let refusal = AxActionReplyError {
-            action: "AXPress",
+            action: "AXPress".to_owned(),
             code: -25204,
         };
         assert_eq!(
-            ax_reply_disposition(Err(refusal), &[]),
-            AxReplyDisposition::TrySelection(refusal)
+            ax_reply_disposition(Err(refusal.clone()), &[]),
+            AxReplyDisposition::TrySelection(refusal.clone())
         );
         assert_eq!(
-            ax_reply_disposition(Err(refusal), &["cmd".to_string()]),
+            ax_reply_disposition(Err(refusal.clone()), &["cmd".to_string()]),
             AxReplyDisposition::Failed(refusal),
             "a modified click never improvises a selection"
         );
         assert_eq!(
             ax_reply_disposition(
                 Err(AxActionReplyError {
-                    action: "AXShowMenu",
+                    action: "AXShowMenu".to_owned(),
                     code: -25204
                 }),
                 &[]
             ),
             AxReplyDisposition::Failed(AxActionReplyError {
-                action: "AXShowMenu",
+                action: "AXShowMenu".to_owned(),
                 code: -25204
             }),
             "only a plain press has a selection equivalent"
@@ -2399,7 +2497,7 @@ mod tests {
         let dispatched = ax_click_structured(
             &AxClickOutcome {
                 unverified: Some(AxActionReplyError {
-                    action: "AXPress",
+                    action: "AXPress".to_owned(),
                     code: crate::ax::bindings::kAXErrorFailure,
                 }),
                 ..AxClickOutcome::default()
