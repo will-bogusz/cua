@@ -29,6 +29,7 @@ use crate::ax::bindings::{
     element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
 };
 use crate::focus_guard;
+use crate::input::ax_actions::{requests_ax_action, resolve_ax_action, UnknownAxAction};
 use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::{CFRelease, TCFType};
 
@@ -239,31 +240,6 @@ fn ax_reply_summary(
         ),
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UnknownAxAction {
-    requested: String,
-    advertised: Vec<String>,
-}
-
-impl std::fmt::Display for UnknownAxAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let advertised = if self.advertised.is_empty() {
-            "none".to_owned()
-        } else {
-            self.advertised.join(", ")
-        };
-        write!(
-            f,
-            "action \"{}\" is neither a documented alias (press, show_menu, pick, confirm, \
-             cancel, open) nor an action this element advertises (advertised: {advertised}); \
-             nothing was dispatched",
-            self.requested
-        )
-    }
-}
-
-impl std::error::Error for UnknownAxAction {}
 
 fn ax_action_error(error: anyhow::Error) -> ToolResult {
     if let Some(unknown) = error.downcast_ref::<UnknownAxAction>() {
@@ -810,7 +786,7 @@ impl Tool for ClickTool {
                 action.clone()
             };
 
-            if !delivery_mode.is_foreground() && map_action(&effective_action) == Some("AXOpen") {
+            if !delivery_mode.is_foreground() && requests_ax_action(&effective_action, "AXOpen") {
                 let panel = cua_driver_core::operation::spawn_blocking(move || {
                     crate::ax::exact_target::is_file_panel_element(element_ptr)
                 })
@@ -2180,27 +2156,6 @@ mod selection_fallback_tests {
         assert!(!selection_readback_confirms(true, true, true, true));
         assert!(!selection_readback_confirms(false, true, true, false));
     }
-}
-
-fn map_action(action: &str) -> Option<&'static str> {
-    match action.to_lowercase().as_str() {
-        "press" | "click" => Some("AXPress"),
-        "show_menu" | "right_click" => Some("AXShowMenu"),
-        "pick" => Some("AXPick"),
-        "confirm" => Some("AXConfirm"),
-        "cancel" => Some("AXCancel"),
-        "open" => Some("AXOpen"),
-        _ => None,
-    }
-}
-
-fn resolve_ax_action(
-    action: &str,
-    advertised: &crate::ax::actions::ElementActions,
-) -> Option<String> {
-    map_action(action)
-        .map(str::to_owned)
-        .or_else(|| advertised.advertises(action).then(|| action.to_owned()))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

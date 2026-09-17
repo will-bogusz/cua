@@ -219,27 +219,72 @@ pub fn ensure_ax_action_enabled(element_ptr: usize, action: &str) -> anyhow::Res
 
 /// Perform an AX action on a cached element.
 pub fn perform_ax_action(element_ptr: usize, action: &str) -> anyhow::Result<()> {
-    let ax_action = map_action(action);
-    ensure_ax_action_enabled(element_ptr, ax_action)?;
-    let err = unsafe { perform_action(element_ptr as AXUIElementRef, ax_action) };
+    let advertised =
+        crate::ax::actions::split(unsafe { copy_action_names(element_ptr as AXUIElementRef) });
+    let ax_action = resolve_ax_action(action, &advertised).ok_or_else(|| {
+        anyhow::Error::new(UnknownAxAction {
+            requested: action.to_owned(),
+            advertised: advertised.names(),
+        })
+    })?;
+    ensure_ax_action_enabled(element_ptr, &ax_action)?;
+    let err = unsafe { perform_action(element_ptr as AXUIElementRef, &ax_action) };
 
     if err == kAXErrorSuccess {
         Ok(())
     } else {
-        anyhow::bail!("AXUIElementPerformAction({action}) failed with error {err}")
+        anyhow::bail!("AXUIElementPerformAction({ax_action}) failed with error {err}")
     }
 }
 
-fn map_action(action: &str) -> &'static str {
-    match action.to_lowercase().as_str() {
-        "press" | "click" => "AXPress",
-        "show_menu" | "right_click" | "rightclick" => "AXShowMenu",
-        "pick" => "AXPick",
-        "confirm" => "AXConfirm",
-        "cancel" => "AXCancel",
-        "open" => "AXOpen",
-        _ => "AXPress",
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownAxAction {
+    pub requested: String,
+    pub advertised: Vec<String>,
+}
+
+impl std::fmt::Display for UnknownAxAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let advertised = if self.advertised.is_empty() {
+            "none".to_owned()
+        } else {
+            self.advertised.join(", ")
+        };
+        write!(
+            f,
+            "action \"{}\" is neither a documented alias (press, show_menu, pick, confirm, \
+             cancel, open) nor an action this element advertises (advertised: {advertised}); \
+             nothing was dispatched",
+            self.requested
+        )
     }
+}
+
+impl std::error::Error for UnknownAxAction {}
+
+fn map_action(action: &str) -> Option<&'static str> {
+    match action.to_lowercase().as_str() {
+        "press" | "click" => Some("AXPress"),
+        "show_menu" | "right_click" | "rightclick" => Some("AXShowMenu"),
+        "pick" => Some("AXPick"),
+        "confirm" => Some("AXConfirm"),
+        "cancel" => Some("AXCancel"),
+        "open" => Some("AXOpen"),
+        _ => None,
+    }
+}
+
+pub fn resolve_ax_action(
+    action: &str,
+    advertised: &crate::ax::actions::ElementActions,
+) -> Option<String> {
+    map_action(action)
+        .map(str::to_owned)
+        .or_else(|| advertised.advertises(action).then(|| action.to_owned()))
+}
+
+pub fn requests_ax_action(action: &str, ax_action: &str) -> bool {
+    map_action(action) == Some(ax_action) || action == ax_action
 }
 
 #[cfg(test)]
@@ -269,6 +314,33 @@ mod tests {
         for role in ["AXButton", "AXTextField", "AXWindow", "AXOutline"] {
             assert!(!is_selectable_container_role(role), "{role}");
         }
+    }
+
+    #[test]
+    fn every_documented_alias_survives_one_shared_table() {
+        for (alias, expected) in [
+            ("press", "AXPress"),
+            ("click", "AXPress"),
+            ("show_menu", "AXShowMenu"),
+            ("right_click", "AXShowMenu"),
+            ("rightclick", "AXShowMenu"),
+            ("pick", "AXPick"),
+            ("confirm", "AXConfirm"),
+            ("cancel", "AXCancel"),
+            ("open", "AXOpen"),
+        ] {
+            assert_eq!(map_action(alias), Some(expected), "{alias}");
+        }
+        assert_eq!(map_action("AXPress"), None);
+        assert_eq!(map_action("wiggle"), None);
+    }
+
+    #[test]
+    fn a_raw_ax_name_requests_the_same_action_as_its_alias() {
+        assert!(requests_ax_action("open", "AXOpen"));
+        assert!(requests_ax_action("AXOpen", "AXOpen"));
+        assert!(!requests_ax_action("press", "AXOpen"));
+        assert!(!requests_ax_action("Open Recent", "AXOpen"));
     }
 }
 
