@@ -4663,6 +4663,11 @@ const FfiConverterTypeVerifyStateOutput = (() => {
 export type WindowElement = {
     elementIndex: bigint,
     role: string,
+    /**
+     * `AXSubrole` — the control class the role alone does not name
+     * (`AXButton` + `AXSearchField`).
+     */
+    subrole?: string,
     depth: number,
     elementToken?: string,
     label?: string,
@@ -4713,6 +4718,7 @@ const FfiConverterTypeWindowElement = (() => {
             return {
                 elementIndex: FfiConverterUInt64.read(from),
                 role: FfiConverterString.read(from),
+                subrole: FfiConverterOptionalString.read(from),
                 depth: FfiConverterUInt32.read(from),
                 elementToken: FfiConverterOptionalString.read(from),
                 label: FfiConverterOptionalString.read(from),
@@ -4734,6 +4740,7 @@ const FfiConverterTypeWindowElement = (() => {
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterUInt64.write(value.elementIndex, into);
             FfiConverterString.write(value.role, into);
+            FfiConverterOptionalString.write(value.subrole, into);
             FfiConverterUInt32.write(value.depth, into);
             FfiConverterOptionalString.write(value.elementToken, into);
             FfiConverterOptionalString.write(value.label, into);
@@ -4754,6 +4761,7 @@ const FfiConverterTypeWindowElement = (() => {
         allocationSize(value: TypeName): number {
             return FfiConverterUInt64.allocationSize(value.elementIndex) +
              FfiConverterString.allocationSize(value.role) +
+             FfiConverterOptionalString.allocationSize(value.subrole) +
              FfiConverterUInt32.allocationSize(value.depth) +
              FfiConverterOptionalString.allocationSize(value.elementToken) +
              FfiConverterOptionalString.allocationSize(value.label) +
