@@ -67,6 +67,7 @@ const TREE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Matches the `type_text` delivery drain, which answers the same question
 /// about the same kind of latency.
 const SETTLE_BUDGET: Duration = Duration::from_secs(2);
+const BLIND_SETTLE_BUDGET: Duration = Duration::from_millis(500);
 /// Gap between post-dispatch samples. Each sample already costs one or more
 /// native AX reads, so this only keeps a cheap sample set from spinning.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
@@ -229,7 +230,8 @@ impl DeliveryProbe {
     /// application pays only its own latency; only a target that never
     /// reacts pays the whole budget.
     pub fn compare(self) -> ProbeOutcome {
-        self.compare_within(SETTLE_BUDGET)
+        let budget = settle_budget(&self.before);
+        self.compare_within(budget)
     }
 
     fn compare_within(self, budget: Duration) -> ProbeOutcome {
@@ -278,6 +280,14 @@ impl DeliveryProbe {
             probe: self.elapsed,
             waited: Duration::ZERO,
         }
+    }
+}
+
+fn settle_budget(before: &Signals) -> Duration {
+    if before.element.is_some() {
+        SETTLE_BUDGET
+    } else {
+        BLIND_SETTLE_BUDGET
     }
 }
 
@@ -449,6 +459,50 @@ mod tests {
             focus: focus.map(str::to_owned),
             tree,
         }
+    }
+
+    fn probe_over_a_pid_that_answers_nothing() -> DeliveryProbe {
+        DeliveryProbe {
+            pid: 0,
+            window_id: 0,
+            element_ptr: None,
+            before: Signals::default(),
+            quiescent: false,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_readable_element_state_is_what_buys_the_full_settle_budget() {
+        assert_eq!(
+            settle_budget(&signals(Some("AXButton|New Item||"), None, None)),
+            SETTLE_BUDGET
+        );
+        assert_eq!(
+            settle_budget(&signals(Some("AXButton|New Item||"), Some("f"), Some(3))),
+            SETTLE_BUDGET
+        );
+        assert_eq!(
+            settle_budget(&signals(None, Some("f"), Some(3))),
+            BLIND_SETTLE_BUDGET
+        );
+        assert_eq!(settle_budget(&Signals::default()), BLIND_SETTLE_BUDGET);
+    }
+
+    #[test]
+    fn a_capture_without_element_state_stops_at_the_blind_budget() {
+        let outcome = probe_over_a_pid_that_answers_nothing().compare();
+        assert_eq!(outcome.evidence, Evidence::Unusable);
+        assert!(
+            outcome.waited >= BLIND_SETTLE_BUDGET,
+            "the cap is a full sampling window, not an early exit: {:?}",
+            outcome.waited
+        );
+        assert!(
+            outcome.waited < SETTLE_BUDGET,
+            "a probe with no element to compare must not wait the full budget: {:?}",
+            outcome.waited
+        );
     }
 
     #[test]
