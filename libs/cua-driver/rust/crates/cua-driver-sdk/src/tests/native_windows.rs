@@ -259,6 +259,7 @@ async fn typed_click_returns_action_facts_and_flat_native_arguments() {
             session: Some("run-1".into()),
             button: None,
             count: None,
+            detect_window_change: None,
         })
         .await
         .unwrap();
@@ -330,6 +331,7 @@ async fn invalid_typed_click_is_rejected_before_transport() {
                 session: None,
                 button: None,
                 count: None,
+                detect_window_change: None,
             })
             .await
             .unwrap_err();
