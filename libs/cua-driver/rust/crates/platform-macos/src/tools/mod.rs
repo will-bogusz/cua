@@ -292,7 +292,7 @@ pub(crate) async fn finish_window_observation(
 ) -> crate::window_change_detector::Changes {
     if window_change_detection_declined(args) {
         drop(snapshot);
-        crate::window_change_detector::Changes::no_change()
+        crate::window_change_detector::Changes::not_polled()
     } else {
         snapshot.detect_async().await
     }

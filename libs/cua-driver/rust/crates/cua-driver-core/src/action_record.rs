@@ -489,10 +489,10 @@ impl ActionExecutionRecord {
         // react (element state, app focus, window contents, a new window).
         // Publish that as window-change evidence — it stays weaker than a
         // read-back, so the effect it accompanies is still `unverifiable`.
-        for kind in legacy_observed_change_evidence(structured) {
+        for signal in legacy_observed_change_evidence(structured) {
             record.evidence.push(ActionEvidence {
-                kind,
-                detail: "observed change after dispatch".to_owned(),
+                kind: EvidenceKind::WindowChange,
+                detail: signal.to_owned(),
             });
         }
         if let Some(escalation) = structured.get("escalation") {
@@ -679,21 +679,24 @@ fn legacy_has_publishable_readback(tool_name: &str, structured: &serde_json::Val
         && structured.get("effect").and_then(serde_json::Value::as_str) == Some("confirmed")
 }
 
-/// Evidence rows a platform may declare for an observed post-dispatch change.
-/// Only `window_change` is accepted here: a read-back claim has to go through
-/// [`legacy_has_publishable_readback`], which also demands `verified` and
-/// `confirmed`, so this weaker signal can never launder itself into one.
-fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<EvidenceKind> {
+/// Evidence rows a platform may declare for an observed post-dispatch change,
+/// named after the signal that moved. All of them are the same coarse
+/// `WindowChange` bucket here, with the signal kept as the row's detail. A
+/// read-back claim has to go through [`legacy_has_publishable_readback`],
+/// which also demands `verified` and `confirmed`, so these weaker signals can
+/// never launder themselves into one.
+const OBSERVED_CHANGE_SIGNALS: [&str; 4] =
+    ["window_change", "element_state", "app_focus", "window_tree"];
+
+fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<&str> {
     structured
         .get("evidence")
         .and_then(serde_json::Value::as_array)
         .map(|evidence| {
             evidence
                 .iter()
-                .filter(|item| {
-                    item.get("kind").and_then(serde_json::Value::as_str) == Some("window_change")
-                })
-                .map(|_| EvidenceKind::WindowChange)
+                .filter_map(|item| item.get("kind").and_then(serde_json::Value::as_str))
+                .filter(|kind| OBSERVED_CHANGE_SIGNALS.contains(kind))
                 .collect()
         })
         .unwrap_or_default()
@@ -1909,6 +1912,51 @@ mod tests {
             public.evidence.as_deref().map(<[_]>::len),
             Some(1),
             "an observed change is publishable delivery evidence"
+        );
+    }
+
+    #[test]
+    fn an_observed_change_named_after_its_signal_is_still_publishable_evidence() {
+        for signal in ["element_state", "app_focus", "window_tree", "window_change"] {
+            let record = ActionExecutionRecord::from_legacy(
+                "click",
+                &serde_json::json!({"delivery_mode": "background"}),
+                &serde_json::json!({
+                    "path": "ax",
+                    "verified": false,
+                    "effect": "unverifiable",
+                    "evidence": [{ "kind": signal }],
+                }),
+            )
+            .expect("background click with observed change should normalize");
+            assert_eq!(record.evidence.len(), 1, "{signal} is an observed change");
+            assert_eq!(record.evidence[0].kind, EvidenceKind::WindowChange);
+            assert_eq!(
+                record.evidence[0].detail, signal,
+                "the signal stays readable on the record"
+            );
+            let public = record.public_result().expect("public ActionResult");
+            assert_eq!(
+                public.evidence.as_deref().map(<[_]>::len),
+                Some(1),
+                "{signal} is publishable delivery evidence"
+            );
+        }
+
+        let unknown = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"delivery_mode": "background"}),
+            &serde_json::json!({
+                "path": "ax",
+                "verified": false,
+                "effect": "unverifiable",
+                "evidence": [{ "kind": "vibes" }],
+            }),
+        )
+        .expect("background click should normalize");
+        assert!(
+            unknown.evidence.is_empty(),
+            "an undeclared kind is not evidence"
         );
     }
 

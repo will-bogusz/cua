@@ -86,6 +86,10 @@ pub struct Snapshot {
 pub struct Changes {
     pub new_windows: Vec<WindowEvent>,
     pub foreground_changed: bool,
+    /// Whether the post-action window poll ran at all. A caller that declined
+    /// it (`detect_window_change: false`) gets `false`, and no reply may then
+    /// claim new windows were among the signals it watched.
+    pub polled: bool,
 }
 
 impl Changes {
@@ -93,6 +97,14 @@ impl Changes {
         Self {
             new_windows: Vec::new(),
             foreground_changed: false,
+            polled: true,
+        }
+    }
+
+    pub fn not_polled() -> Self {
+        Self {
+            polled: false,
+            ..Self::no_change()
         }
     }
 
@@ -265,7 +277,7 @@ impl Snapshot {
         // thread; the lease's Drop runs there when detect_with returns.
         tokio::task::spawn_blocking(move || self.detect())
             .await
-            .unwrap_or_else(|_| Changes::no_change())
+            .unwrap_or_else(|_| Changes::not_polled())
     }
 
     /// Same as `detect()` but with configurable timing — exposed for
@@ -310,6 +322,7 @@ impl Snapshot {
                 return Changes {
                     new_windows,
                     foreground_changed,
+                    polled: true,
                 };
             }
             if Instant::now() >= deadline {
@@ -432,6 +445,7 @@ mod tests {
     #[test]
     fn changes_result_suffix_single_new_window_with_title() {
         let c = Changes {
+            polled: true,
             new_windows: vec![WindowEvent {
                 window_id: 99,
                 pid: 100,
@@ -450,6 +464,7 @@ mod tests {
     #[test]
     fn changes_result_suffix_groups_windows_by_app() {
         let c = Changes {
+            polled: true,
             new_windows: vec![
                 WindowEvent {
                     window_id: 1,
@@ -483,6 +498,7 @@ mod tests {
     #[test]
     fn changes_result_suffix_foreground_change_only() {
         let c = Changes {
+            polled: true,
             new_windows: vec![],
             foreground_changed: true,
         };
@@ -496,6 +512,7 @@ mod tests {
     #[test]
     fn changes_result_suffix_empty_title_is_dropped() {
         let c = Changes {
+            polled: true,
             new_windows: vec![WindowEvent {
                 window_id: 1,
                 pid: 100,

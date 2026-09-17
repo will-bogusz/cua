@@ -314,15 +314,25 @@ impl NextRung {
     }
 }
 
-fn noop_reason(chromium_family: bool) -> &'static str {
+fn watched_signals(polled: bool) -> &'static str {
+    if polled {
+        "element state, app focus, window contents, new windows"
+    } else {
+        "element state, app focus, window contents"
+    }
+}
+
+fn noop_reason(chromium_family: bool, signals: &str) -> String {
     if chromium_family {
         "no observable change after background delivery; it cannot produce \
          trusted pointer events, so controls driven by pointerdown \
          (Chromium/Electron UIs) ignore it"
+            .to_owned()
     } else {
-        "no observable change after background delivery; the probe reads \
-         element state, app focus, window contents and new windows only, so \
-         an effect it cannot see is still possible"
+        format!(
+            "no observable change after background delivery; the probe reads \
+             {signals} only, so an effect it cannot see is still possible"
+        )
     }
 }
 
@@ -341,18 +351,20 @@ fn apply_delivery_evidence(
     outcome: delivery_probe::ProbeOutcome,
     rung: NextRung,
     chromium_family: bool,
+    polled: bool,
     window_change: Option<&delivery_probe::WindowChangeEvidence>,
 ) {
     let advice = format!("{} {}", pointerdown_note(chromium_family), rung.advice());
+    let signals = watched_signals(polled);
     delivery_probe::apply_evidence(
         msg,
         structured,
         outcome,
         delivery_probe::NoopReport {
-            signals: "element state, app focus, window contents, new windows",
+            signals,
             escalation: Some(serde_json::json!({
                 "recommended": rung.recommended(),
-                "reason": noop_reason(chromium_family),
+                "reason": noop_reason(chromium_family, signals),
             })),
             advice: &advice,
         },
@@ -1062,7 +1074,9 @@ impl Tool for ClickTool {
                         None
                     } else if changes.needs_restore() {
                         probe.map(|probe| {
-                            probe.settled(delivery_probe::Evidence::Changed("window_change"))
+                            probe.settled(delivery_probe::Evidence::Changed(
+                                delivery_probe::WINDOW_SIGNAL,
+                            ))
                         })
                     } else if let Some(probe) = probe {
                         cua_driver_core::operation::spawn_blocking(move || probe.compare())
@@ -1106,6 +1120,7 @@ impl Tool for ClickTool {
                                 NextRung::PixelForeground
                             },
                             chromium_family,
+                            changes.polled,
                             window_change.as_ref(),
                         );
                     }
@@ -1587,7 +1602,9 @@ impl Tool for ClickTool {
                     };
                     let evidence = if changes.needs_restore() {
                         probe.map(|probe| {
-                            probe.settled(delivery_probe::Evidence::Changed("window_change"))
+                            probe.settled(delivery_probe::Evidence::Changed(
+                                delivery_probe::WINDOW_SIGNAL,
+                            ))
                         })
                     } else if let Some(probe) = probe {
                         cua_driver_core::operation::spawn_blocking(move || probe.compare())
@@ -1633,6 +1650,7 @@ impl Tool for ClickTool {
                             outcome,
                             NextRung::Foreground,
                             chromium_family,
+                            changes.polled,
                             window_change.as_ref(),
                         );
                     }
@@ -2233,6 +2251,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             false,
+            true,
             None,
         );
         assert_eq!(ax["effect"], "suspected_noop");
@@ -2256,6 +2275,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::Foreground,
             false,
+            true,
             None,
         );
         assert_eq!(pixel["escalation"]["recommended"], "foreground");
@@ -2273,6 +2293,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             false,
+            true,
             None,
         );
         assert!(!native_msg.contains("pointerdown"), "{native_msg}");
@@ -2292,6 +2313,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             NextRung::PixelForeground,
             true,
+            true,
             None,
         );
         assert!(chromium_msg.contains("pointerdown"), "{chromium_msg}");
@@ -2307,13 +2329,92 @@ mod tests {
             outcome(delivery_probe::Evidence::Changed("element_state"), 120),
             NextRung::PixelForeground,
             false,
+            true,
             None,
         );
         assert_eq!(structured["effect"], "unverifiable");
-        assert_eq!(structured["evidence"][0]["kind"], "window_change");
+        assert_eq!(structured["evidence"][0]["kind"], "element_state");
         assert!(structured["evidence"][0]["appeared_windows"].is_null());
         assert!(structured["escalation"].is_null());
         assert!(msg.contains("Delivered: element_state changed"), "{msg}");
+    }
+
+    #[test]
+    fn a_declined_window_poll_is_not_reported_as_a_watched_signal() {
+        let mut declined_msg = String::new();
+        let mut declined = serde_json::json!({ "path": "ax", "effect": "unverifiable" });
+        apply_delivery_evidence(
+            &mut declined_msg,
+            &mut declined,
+            outcome(delivery_probe::Evidence::Unchanged, 2000),
+            NextRung::PixelForeground,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            declined_msg.contains("nothing changed (element state, app focus, window contents)"),
+            "{declined_msg}"
+        );
+        assert!(!declined_msg.contains("new windows"), "{declined_msg}");
+        let reason = declined["escalation"]["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("element state, app focus, window contents only"),
+            "{reason}"
+        );
+        assert!(!reason.contains("new windows"), "{reason}");
+
+        let mut polled_msg = String::new();
+        let mut polled = serde_json::json!({ "path": "ax", "effect": "unverifiable" });
+        apply_delivery_evidence(
+            &mut polled_msg,
+            &mut polled,
+            outcome(delivery_probe::Evidence::Unchanged, 2000),
+            NextRung::PixelForeground,
+            false,
+            true,
+            None,
+        );
+        assert!(
+            polled_msg.contains(
+                "nothing changed (element state, app focus, window contents, new windows)"
+            ),
+            "{polled_msg}"
+        );
+        assert!(polled["escalation"]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("new windows"));
+    }
+
+    #[test]
+    fn evidence_names_the_signal_that_moved_and_only_a_window_signal_carries_windows() {
+        let observed = delivery_probe::WindowChangeEvidence {
+            appeared_windows: vec![],
+            target_window_main: Some(false),
+        };
+        for signal in ["element_state", "app_focus", "window_tree"] {
+            let mut msg = String::new();
+            let mut structured = serde_json::json!({ "path": "ax" });
+            apply_delivery_evidence(
+                &mut msg,
+                &mut structured,
+                outcome(delivery_probe::Evidence::Changed(signal), 120),
+                NextRung::PixelForeground,
+                false,
+                true,
+                Some(&observed),
+            );
+            assert_eq!(structured["evidence"][0]["kind"], signal);
+            assert!(
+                structured["evidence"][0]["target_window_main"].is_null(),
+                "{structured}"
+            );
+            assert!(
+                structured["evidence"][0]["appeared_windows"].is_null(),
+                "{structured}"
+            );
+        }
     }
 
     #[test]
@@ -2333,9 +2434,13 @@ mod tests {
         apply_delivery_evidence(
             &mut msg,
             &mut structured,
-            outcome(delivery_probe::Evidence::Changed("window_change"), 0),
+            outcome(
+                delivery_probe::Evidence::Changed(delivery_probe::WINDOW_SIGNAL),
+                0,
+            ),
             NextRung::PixelForeground,
             false,
+            true,
             Some(&observed),
         );
         let appeared = &structured["evidence"][0]["appeared_windows"][0];
@@ -2355,6 +2460,7 @@ mod tests {
             outcome(delivery_probe::Evidence::Unusable, 2000),
             NextRung::PixelForeground,
             false,
+            true,
             None,
         );
         assert_eq!(structured["effect"], "suspected_noop");

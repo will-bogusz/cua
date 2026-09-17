@@ -84,7 +84,9 @@ pub struct Signals {
     pub tree: Option<u64>,
 }
 
-/// What the probe observed after the dispatch.
+/// What the probe observed after the dispatch. `Changed` carries the name of
+/// the signal that moved, which is also the `kind` its evidence entry
+/// publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Evidence {
     /// A usable signal differed after the dispatch; the app reacted.
@@ -95,6 +97,10 @@ pub enum Evidence {
     /// self-updating or unreadable subtree).
     Unusable,
 }
+
+/// The window poll's own signal: a window opened, or the frontmost
+/// application changed. Only this signal carries observed windows.
+pub const WINDOW_SIGNAL: &str = "window_change";
 
 impl Evidence {
     pub fn signal(self) -> &'static str {
@@ -391,7 +397,8 @@ pub struct NoopReport<'a> {
 /// The probe answers "did the target react", never "did the action do what
 /// the caller wanted". So:
 /// * `Changed` → keep `unverifiable` (delivery is not the intended
-///   postcondition) and publish the reaction as `window_change` evidence.
+///   postcondition) and publish the reaction as evidence named after the
+///   signal that moved.
 /// * `Unchanged` → `suspected_noop`, said loudly, escalated to the rung that
 ///   can still deliver. Never retried here and never silently re-routed: a
 ///   dispatched action can take effect invisibly, and acting twice is worse
@@ -414,8 +421,8 @@ pub fn apply_evidence(
     });
     match outcome.evidence {
         Evidence::Changed(signal) => {
-            let mut entry = serde_json::json!({ "kind": "window_change", "detail": signal });
-            if let Some(observed) = window_change {
+            let mut entry = serde_json::json!({ "kind": signal });
+            if let Some(observed) = window_change.filter(|_| signal == WINDOW_SIGNAL) {
                 entry["appeared_windows"] =
                     serde_json::to_value(&observed.appeared_windows).unwrap_or_default();
                 entry["target_window_main"] = serde_json::json!(observed.target_window_main);

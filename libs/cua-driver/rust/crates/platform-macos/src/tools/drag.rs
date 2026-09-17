@@ -38,9 +38,13 @@ fn activation_needed(prior_front: Option<i32>, target_pid: i32) -> bool {
     prior_front != Some(target_pid)
 }
 
-fn drag_noop_report() -> delivery_probe::NoopReport<'static> {
+fn drag_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
     delivery_probe::NoopReport {
-        signals: "app focus, window contents, new windows",
+        signals: if polled {
+            "app focus, window contents, new windows"
+        } else {
+            "app focus, window contents"
+        },
         escalation: None,
         advice: " A drag whose window never moved usually missed the drag source or was \
                  rejected by the drop target: re-read the window and, if the source is right, \
@@ -456,7 +460,9 @@ impl Tool for DragTool {
             Ok(Ok(probe)) => {
                 let evidence = if changes.needs_restore() {
                     probe.as_ref().map(|probe| {
-                        probe.settled(delivery_probe::Evidence::Changed("window_change"))
+                        probe.settled(delivery_probe::Evidence::Changed(
+                            delivery_probe::WINDOW_SIGNAL,
+                        ))
                     })
                 } else if let Some(probe) = probe {
                     cua_driver_core::operation::spawn_blocking(move || probe.compare())
@@ -499,7 +505,7 @@ impl Tool for DragTool {
                         &mut msg,
                         &mut structured,
                         outcome,
-                        drag_noop_report(),
+                        drag_noop_report(changes.polled),
                         window_change.as_ref(),
                     );
                 }
@@ -538,7 +544,7 @@ mod tests {
             &mut msg,
             &mut structured,
             outcome(delivery_probe::Evidence::Unchanged, 2000),
-            drag_noop_report(),
+            drag_noop_report(true),
             None,
         );
         assert_eq!(structured["effect"], "suspected_noop");
@@ -550,6 +556,25 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("longer duration_ms"), "{msg}");
+        assert!(
+            msg.contains("(app focus, window contents, new windows)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_drag_whose_caller_declined_the_window_poll_does_not_claim_new_windows() {
+        let mut msg = String::new();
+        let mut structured = serde_json::json!({ "path": "cgevent_fg", "effect": "unverifiable" });
+        delivery_probe::apply_evidence(
+            &mut msg,
+            &mut structured,
+            outcome(delivery_probe::Evidence::Unchanged, 2000),
+            drag_noop_report(false),
+            None,
+        );
+        assert!(msg.contains("(app focus, window contents)"), "{msg}");
+        assert!(!msg.contains("new windows"), "{msg}");
     }
 
     #[test]
@@ -560,12 +585,11 @@ mod tests {
             &mut msg,
             &mut structured,
             outcome(delivery_probe::Evidence::Changed("window_tree"), 60),
-            drag_noop_report(),
+            drag_noop_report(true),
             None,
         );
         assert_eq!(structured["effect"], "unverifiable");
-        assert_eq!(structured["evidence"][0]["kind"], "window_change");
-        assert_eq!(structured["evidence"][0]["detail"], "window_tree");
+        assert_eq!(structured["evidence"][0]["kind"], "window_tree");
         assert_eq!(structured["delivery_probe"]["waited_ms"], 60);
         assert!(msg.contains("Delivered: window_tree changed"), "{msg}");
     }
