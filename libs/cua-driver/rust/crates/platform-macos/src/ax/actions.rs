@@ -23,9 +23,21 @@ impl ElementActions {
             .collect()
     }
 
+    /// The string macOS expects for `name`. A custom action is advertised to
+    /// every consumer by its readable name and dispatched by the envelope it
+    /// ships in, so both forms resolve to that envelope.
+    pub fn wire_name(&self, name: &str) -> Option<&str> {
+        if let Some(standard) = self.standard.iter().find(|action| action.as_str() == name) {
+            return Some(standard.as_str());
+        }
+        self.custom
+            .iter()
+            .find(|action| action.name == name || action.raw == name)
+            .map(|action| action.raw.as_str())
+    }
+
     pub fn advertises(&self, name: &str) -> bool {
-        self.standard.iter().any(|action| action == name)
-            || self.custom.iter().any(|action| action.raw == name)
+        self.wire_name(name).is_some()
     }
 }
 
@@ -76,9 +88,16 @@ mod tests {
                 raw: "Name:Move Down\nTarget:0x0\nSelector:(null)".to_owned(),
             }]
         );
-        assert!(actions.advertises("Name:Move Down\nTarget:0x0\nSelector:(null)"));
-        assert!(actions.advertises("AXShowMenu"));
-        assert!(!actions.advertises("Move Down"));
+        let envelope = "Name:Move Down\nTarget:0x0\nSelector:(null)";
+        assert_eq!(actions.wire_name(envelope), Some(envelope));
+        assert_eq!(
+            actions.wire_name("Move Down"),
+            Some(envelope),
+            "the readable name every consumer sees dispatches the envelope"
+        );
+        assert_eq!(actions.wire_name("AXShowMenu"), Some("AXShowMenu"));
+        assert_eq!(actions.wire_name("AXPress"), None);
+        assert_eq!(actions.wire_name("Move Up"), None);
     }
 
     #[test]

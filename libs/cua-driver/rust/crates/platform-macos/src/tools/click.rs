@@ -455,7 +455,7 @@ fn def() -> &'static ToolDef {
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "x":             { "type": "number",  "description": "X in screenshot pixels. A window target uses the get_window_state PNG; a desktop target uses the native get_desktop_state PNG. The driver reverses Retina backing scale and any window-image downscale." },
                 "y":             { "type": "number",  "description": "Y in screenshot pixels from the image selected by target." },
-                "action":        { "type": "string",  "description": "AX action: press, show_menu, pick, confirm, cancel, open. Any other value must be an action name the element itself advertises — an AX name from the element's `actions` or the `raw` string of one of its `custom_actions`; anything else is refused instead of dispatched as a press." },
+                "action":        { "type": "string",  "description": "AX action: press, show_menu, pick, confirm, cancel, open. Any other value must be an action name the element itself advertises — an AX name from the element's `actions`, or the `name` or `raw` string of one of its `custom_actions`; anything else is refused instead of dispatched as a press." },
                 "button":        {
                     "type": "string",
                     "enum": ["left", "right", "middle"],
@@ -2196,17 +2196,20 @@ mod tests {
 
     #[test]
     fn an_action_name_the_element_advertises_is_dispatched_verbatim() {
-        let actions = advertised(&[
-            "AXScrollToVisible",
-            "Name:Pin List\nTarget:0x0\nSelector:(null)",
-        ]);
+        let envelope = "Name:Pin List\nTarget:0x0\nSelector:(null)";
+        let actions = advertised(&["AXScrollToVisible", envelope]);
         assert_eq!(
             resolve_ax_action("AXScrollToVisible", &actions).as_deref(),
             Some("AXScrollToVisible")
         );
         assert_eq!(
-            resolve_ax_action("Name:Pin List\nTarget:0x0\nSelector:(null)", &actions).as_deref(),
-            Some("Name:Pin List\nTarget:0x0\nSelector:(null)")
+            resolve_ax_action(envelope, &actions).as_deref(),
+            Some(envelope)
+        );
+        assert_eq!(
+            resolve_ax_action("Pin List", &actions).as_deref(),
+            Some(envelope),
+            "the name the row advertises dispatches the envelope macOS expects"
         );
         assert_eq!(
             resolve_ax_action("show_menu", &actions).as_deref(),
@@ -2219,7 +2222,7 @@ mod tests {
     fn an_unknown_action_name_is_refused_instead_of_pressed() {
         let actions = advertised(&["AXPress", "Name:Flag\nTarget:0x0\nSelector:(null)"]);
         assert_eq!(resolve_ax_action("AXScrollToVisible", &actions), None);
-        assert_eq!(resolve_ax_action("Flag", &actions), None);
+        assert_eq!(resolve_ax_action("Unflag", &actions), None);
         assert_eq!(resolve_ax_action("wiggle", &actions), None);
 
         let refusal = ax_action_error(anyhow::Error::new(UnknownAxAction {

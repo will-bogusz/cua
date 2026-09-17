@@ -280,7 +280,7 @@ pub fn resolve_ax_action(
 ) -> Option<String> {
     map_action(action)
         .map(str::to_owned)
-        .or_else(|| advertised.advertises(action).then(|| action.to_owned()))
+        .or_else(|| advertised.wire_name(action).map(str::to_owned))
 }
 
 pub fn requests_ax_action(action: &str, ax_action: &str) -> bool {
