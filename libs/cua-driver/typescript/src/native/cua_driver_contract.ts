@@ -1080,7 +1080,8 @@ export type ClickInput = {
     deliveryMode: InputDeliveryMode,
     session?: string,
     button?: ClickButton,
-    count?: number
+    count?: number,
+    detectWindowChange?: boolean
 }
 
 /**
@@ -1109,7 +1110,8 @@ const FfiConverterTypeClickInput = (() => {
                 deliveryMode: FfiConverterTypeInputDeliveryMode.read(from),
                 session: FfiConverterOptionalString.read(from),
                 button: FfiConverterOptionalTypeClickButton.read(from),
-                count: FfiConverterOptionalUInt32.read(from)
+                count: FfiConverterOptionalUInt32.read(from),
+                detectWindowChange: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -1119,6 +1121,7 @@ const FfiConverterTypeClickInput = (() => {
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterOptionalTypeClickButton.write(value.button, into);
             FfiConverterOptionalUInt32.write(value.count, into);
+            FfiConverterOptionalBoolean.write(value.detectWindowChange, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionTarget.allocationSize(value.target) +
@@ -1126,7 +1129,8 @@ const FfiConverterTypeClickInput = (() => {
              FfiConverterTypeInputDeliveryMode.allocationSize(value.deliveryMode) +
              FfiConverterOptionalString.allocationSize(value.session) +
              FfiConverterOptionalTypeClickButton.allocationSize(value.button) +
-             FfiConverterOptionalUInt32.allocationSize(value.count);
+             FfiConverterOptionalUInt32.allocationSize(value.count) +
+             FfiConverterOptionalBoolean.allocationSize(value.detectWindowChange);
 
         }
     };
@@ -1764,7 +1768,8 @@ export type DragInput = {
     durationMs?: bigint,
     steps?: bigint,
     button?: ClickButton,
-    modifier?: Array<string>
+    modifier?: Array<string>,
+    detectWindowChange?: boolean
 }
 
 /**
@@ -1798,7 +1803,8 @@ const FfiConverterTypeDragInput = (() => {
                 durationMs: FfiConverterOptionalUInt64.read(from),
                 steps: FfiConverterOptionalUInt64.read(from),
                 button: FfiConverterOptionalTypeClickButton.read(from),
-                modifier: FfiConverterOptionalSequenceString.read(from)
+                modifier: FfiConverterOptionalSequenceString.read(from),
+                detectWindowChange: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -1813,6 +1819,7 @@ const FfiConverterTypeDragInput = (() => {
             FfiConverterOptionalUInt64.write(value.steps, into);
             FfiConverterOptionalTypeClickButton.write(value.button, into);
             FfiConverterOptionalSequenceString.write(value.modifier, into);
+            FfiConverterOptionalBoolean.write(value.detectWindowChange, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterFloat64.allocationSize(value.fromX) +
@@ -1825,7 +1832,8 @@ const FfiConverterTypeDragInput = (() => {
              FfiConverterOptionalUInt64.allocationSize(value.durationMs) +
              FfiConverterOptionalUInt64.allocationSize(value.steps) +
              FfiConverterOptionalTypeClickButton.allocationSize(value.button) +
-             FfiConverterOptionalSequenceString.allocationSize(value.modifier);
+             FfiConverterOptionalSequenceString.allocationSize(value.modifier) +
+             FfiConverterOptionalBoolean.allocationSize(value.detectWindowChange);
 
         }
     };
@@ -2614,7 +2622,8 @@ export type HotkeyInput = {
      * For multi-call work, prefer a short public session label and repeat it on every call that
      * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
      */
-    session?: string
+    session?: string,
+    detectWindowChange?: boolean
 }
 
 /**
@@ -2641,7 +2650,8 @@ const FfiConverterTypeHotkeyInput = (() => {
                 keys: FfiConverterSequenceString.read(from),
                 target: FfiConverterOptionalTypeActionTarget.read(from),
                 scope: FfiConverterOptionalTypeDesktopScope.read(from),
-                session: FfiConverterOptionalString.read(from)
+                session: FfiConverterOptionalString.read(from),
+                detectWindowChange: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -2649,12 +2659,14 @@ const FfiConverterTypeHotkeyInput = (() => {
             FfiConverterOptionalTypeActionTarget.write(value.target, into);
             FfiConverterOptionalTypeDesktopScope.write(value.scope, into);
             FfiConverterOptionalString.write(value.session, into);
+            FfiConverterOptionalBoolean.write(value.detectWindowChange, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterSequenceString.allocationSize(value.keys) +
              FfiConverterOptionalTypeActionTarget.allocationSize(value.target) +
              FfiConverterOptionalTypeDesktopScope.allocationSize(value.scope) +
-             FfiConverterOptionalString.allocationSize(value.session);
+             FfiConverterOptionalString.allocationSize(value.session) +
+             FfiConverterOptionalBoolean.allocationSize(value.detectWindowChange);
 
         }
     };
@@ -3513,7 +3525,8 @@ export type PressKeyInput = {
      * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
      */
     session?: string,
-    modifiers?: Array<string>
+    modifiers?: Array<string>,
+    detectWindowChange?: boolean
 }
 
 /**
@@ -3541,7 +3554,8 @@ const FfiConverterTypePressKeyInput = (() => {
                 target: FfiConverterOptionalTypeActionTarget.read(from),
                 scope: FfiConverterOptionalTypeDesktopScope.read(from),
                 session: FfiConverterOptionalString.read(from),
-                modifiers: FfiConverterOptionalSequenceString.read(from)
+                modifiers: FfiConverterOptionalSequenceString.read(from),
+                detectWindowChange: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -3550,13 +3564,15 @@ const FfiConverterTypePressKeyInput = (() => {
             FfiConverterOptionalTypeDesktopScope.write(value.scope, into);
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterOptionalSequenceString.write(value.modifiers, into);
+            FfiConverterOptionalBoolean.write(value.detectWindowChange, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.key) +
              FfiConverterOptionalTypeActionTarget.allocationSize(value.target) +
              FfiConverterOptionalTypeDesktopScope.allocationSize(value.scope) +
              FfiConverterOptionalString.allocationSize(value.session) +
-             FfiConverterOptionalSequenceString.allocationSize(value.modifiers);
+             FfiConverterOptionalSequenceString.allocationSize(value.modifiers) +
+             FfiConverterOptionalBoolean.allocationSize(value.detectWindowChange);
 
         }
     };
@@ -3642,7 +3658,8 @@ export type ScrollInput = {
      */
     session?: string,
     by?: ScrollBy,
-    amount?: bigint
+    amount?: bigint,
+    detectWindowChange?: boolean
 }
 
 /**
@@ -3673,7 +3690,8 @@ const FfiConverterTypeScrollInput = (() => {
                 scope: FfiConverterOptionalTypeDesktopScope.read(from),
                 session: FfiConverterOptionalString.read(from),
                 by: FfiConverterOptionalTypeScrollBy.read(from),
-                amount: FfiConverterOptionalUInt64.read(from)
+                amount: FfiConverterOptionalUInt64.read(from),
+                detectWindowChange: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -3685,6 +3703,7 @@ const FfiConverterTypeScrollInput = (() => {
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterOptionalTypeScrollBy.write(value.by, into);
             FfiConverterOptionalUInt64.write(value.amount, into);
+            FfiConverterOptionalBoolean.write(value.detectWindowChange, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterFloat64.allocationSize(value.x) +
@@ -3694,7 +3713,8 @@ const FfiConverterTypeScrollInput = (() => {
              FfiConverterOptionalTypeDesktopScope.allocationSize(value.scope) +
              FfiConverterOptionalString.allocationSize(value.session) +
              FfiConverterOptionalTypeScrollBy.allocationSize(value.by) +
-             FfiConverterOptionalUInt64.allocationSize(value.amount);
+             FfiConverterOptionalUInt64.allocationSize(value.amount) +
+             FfiConverterOptionalBoolean.allocationSize(value.detectWindowChange);
 
         }
     };
@@ -4447,7 +4467,8 @@ export type TypeTextInput = {
      * For multi-call work, prefer a short public session label and repeat it on every call that
      * accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
      */
-    session?: string
+    session?: string,
+    detectWindowChange?: boolean
 }
 
 /**
@@ -4474,7 +4495,8 @@ const FfiConverterTypeTypeTextInput = (() => {
                 text: FfiConverterString.read(from),
                 target: FfiConverterOptionalTypeActionTarget.read(from),
                 scope: FfiConverterOptionalTypeDesktopScope.read(from),
-                session: FfiConverterOptionalString.read(from)
+                session: FfiConverterOptionalString.read(from),
+                detectWindowChange: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -4482,12 +4504,14 @@ const FfiConverterTypeTypeTextInput = (() => {
             FfiConverterOptionalTypeActionTarget.write(value.target, into);
             FfiConverterOptionalTypeDesktopScope.write(value.scope, into);
             FfiConverterOptionalString.write(value.session, into);
+            FfiConverterOptionalBoolean.write(value.detectWindowChange, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.text) +
              FfiConverterOptionalTypeActionTarget.allocationSize(value.target) +
              FfiConverterOptionalTypeDesktopScope.allocationSize(value.scope) +
-             FfiConverterOptionalString.allocationSize(value.session);
+             FfiConverterOptionalString.allocationSize(value.session) +
+             FfiConverterOptionalBoolean.allocationSize(value.detectWindowChange);
 
         }
     };
