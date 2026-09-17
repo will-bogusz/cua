@@ -84,9 +84,8 @@ pub struct Signals {
     pub tree: Option<u64>,
 }
 
-/// What the probe observed after the dispatch. `Changed` carries the name of
-/// the signal that moved, which is also the `kind` its evidence entry
-/// publishes.
+/// What the probe observed after the dispatch; `Changed` names the signal that
+/// moved, which is the `kind` its evidence row publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Evidence {
     /// A usable signal differed after the dispatch; the app reacted.

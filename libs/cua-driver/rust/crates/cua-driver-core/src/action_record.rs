@@ -679,12 +679,8 @@ fn legacy_has_publishable_readback(tool_name: &str, structured: &serde_json::Val
         && structured.get("effect").and_then(serde_json::Value::as_str) == Some("confirmed")
 }
 
-/// Evidence rows a platform may declare for an observed post-dispatch change,
-/// named after the signal that moved. All of them are the same coarse
-/// `WindowChange` bucket here, with the signal kept as the row's detail. A
-/// read-back claim has to go through [`legacy_has_publishable_readback`],
-/// which also demands `verified` and `confirmed`, so these weaker signals can
-/// never launder themselves into one.
+/// Signal names a platform may declare as an observed post-dispatch change; all
+/// normalize to the coarse `WindowChange` kind with the signal kept as detail.
 const OBSERVED_CHANGE_SIGNALS: [&str; 4] =
     ["window_change", "element_state", "app_focus", "window_tree"];
 
