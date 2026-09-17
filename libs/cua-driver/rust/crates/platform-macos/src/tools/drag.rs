@@ -34,6 +34,10 @@ impl DragTool {
     }
 }
 
+fn activation_needed(prior_front: Option<i32>, target_pid: i32) -> bool {
+    prior_front != Some(target_pid)
+}
+
 fn drag_noop_report() -> delivery_probe::NoopReport<'static> {
     delivery_probe::NoopReport {
         signals: "app focus, window contents, new windows",
@@ -105,7 +109,8 @@ fn def() -> &'static ToolDef {
                     "description": "When true, coordinates are in the last zoom image for this pid; driver maps back to window coordinates."
                 },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Use desktop with no pid/window_id for native get_desktop_state screenshot coordinates." },
-                "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
+                "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema(),
+                "detect_window_change": { "type": "boolean", "description": "Default true: after the action the driver polls WindowServer for up to one second so the reply can name a window the action opened. Pass false when you enumerate windows yourself — the poll is then skipped (roughly a second off this call) and the reply carries no opened-window evidence." },
             },
             "additionalProperties": false
         }),
@@ -342,8 +347,10 @@ impl Tool for DragTool {
                                     // gesture begins. The SkyLight flash can be
                                     // unavailable for Electron child windows; the
                                     // documented Cocoa activation is the fallback.
-                                    apps::activate_pid(pid);
-                                    std::thread::sleep(std::time::Duration::from_millis(40));
+                                    if activation_needed(prior_front, pid) {
+                                        apps::activate_pid(pid);
+                                        std::thread::sleep(std::time::Duration::from_millis(40));
+                                    }
                                     let observed_cursor = cursor_for_drag.clone();
                                     let probe = probe();
                                     crate::input::mouse::drag_at_xy_foreground_observed(
@@ -507,6 +514,13 @@ impl Tool for DragTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_that_is_already_frontmost_is_not_activated_again() {
+        assert!(!activation_needed(Some(758), 758));
+        assert!(activation_needed(Some(12), 758));
+        assert!(activation_needed(None, 758));
+    }
 
     fn outcome(evidence: delivery_probe::Evidence, waited_ms: u64) -> delivery_probe::ProbeOutcome {
         delivery_probe::ProbeOutcome {
