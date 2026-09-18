@@ -262,6 +262,48 @@ fn ax_reply_summary(
     }
 }
 
+/// The application's own focus state when a refusal was composed.
+///
+/// A window is key only while its process holds the frontmost application
+/// slot and the process publishes that window as its focused one. AppKit
+/// disables controls whose enabled state tracks key-window focus — a toolbar
+/// search field reads `AXEnabled=false` in a window that is not key — so this
+/// is the fact that separates "the application disabled this control" from
+/// "this control is disabled until the window is key".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyWindowState {
+    app_frontmost: bool,
+    focused_window_id: Option<u32>,
+}
+
+impl KeyWindowState {
+    fn observe(pid: i32) -> Self {
+        Self {
+            app_frontmost: crate::apps::frontmost_pid() == Some(pid),
+            focused_window_id: crate::ax::bindings::focused_window_id_of_pid(pid),
+        }
+    }
+
+    fn holds(self, window_id: u32) -> bool {
+        self.app_frontmost && self.focused_window_id == Some(window_id)
+    }
+
+    /// Which observation denies the window its key status, or `None` when the
+    /// window is key.
+    fn denial(self, pid: i32, window_id: u32) -> Option<String> {
+        if self.holds(window_id) {
+            return None;
+        }
+        if !self.app_frontmost {
+            return Some(format!("pid {pid} is not the frontmost application"));
+        }
+        Some(match self.focused_window_id {
+            Some(focused) => format!("window {focused} holds pid {pid}'s keyboard focus"),
+            None => format!("pid {pid} reports no focused window"),
+        })
+    }
+}
+
 /// The application itself reports the addressed control disabled, with the
 /// focus and window-order state that decides which routes are real.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,9 +316,37 @@ struct ElementDisabled {
     foreground: bool,
     front_in_process: bool,
     obscuring_window: Option<super::ObscuringWindow>,
+    key_window: KeyWindowState,
+}
+
+/// The one state that explains the disabled control. Prose and the structured
+/// payload branch on the same answer, so a reply cannot name a route its
+/// escalation withholds.
+enum DisabledCause<'a> {
+    MenuItem,
+    OwnedPanelInFront(&'a super::ObscuringWindow),
+    WindowNotKey(String),
+    ApplicationState,
 }
 
 impl ElementDisabled {
+    fn cause(&self) -> DisabledCause<'_> {
+        if self.role == "AXMenuItem" {
+            return DisabledCause::MenuItem;
+        }
+        if let Some(obscuring) = &self.obscuring_window {
+            return DisabledCause::OwnedPanelInFront(obscuring);
+        }
+        match self
+            .key_window
+            .denial(self.pid, self.window_id)
+            .filter(|_| !self.foreground)
+        {
+            Some(denial) => DisabledCause::WindowNotKey(denial),
+            None => DisabledCause::ApplicationState,
+        }
+    }
+
     fn reason(&self) -> String {
         let Self {
             action,
@@ -286,41 +356,60 @@ impl ElementDisabled {
             pid,
             ..
         } = self;
-        if role == "AXMenuItem" {
-            return format!(
+        match self.cause() {
+            DisabledCause::MenuItem => format!(
                 "{action} was not dispatched: the {role} \"{label}\" of an open menu reports \
                  AXEnabled=false. A menu item's enabled state tracks the application's own \
                  applicability, not focus or delivery mode: it is disabled in pid {pid}'s \
                  current state."
-            );
+            ),
+            DisabledCause::OwnedPanelInFront(obscuring) => {
+                let blocker = obscuring.window_id;
+                let route = if obscuring.is_focusable() {
+                    format!("Dismiss that window, or address window {blocker} and act on it there.")
+                } else {
+                    "It publishes no AXWindow, so it cannot become the focused window: dismiss it, \
+                     or act on it by pixel."
+                        .to_owned()
+                };
+                format!(
+                    "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
+                     AXEnabled=false, and window {blocker} — pid {pid}'s own front window, {} — is \
+                     drawn in front of it. {route}",
+                    obscuring.describe()
+                )
+            }
+            DisabledCause::WindowNotKey(denial) => {
+                let order = if self.front_in_process {
+                    format!(
+                        "Window {window_id} is already pid {pid}'s front window and no window of \
+                         pid {pid} is drawn in front of it"
+                    )
+                } else {
+                    format!("No window of pid {pid} is drawn in front of window {window_id}")
+                };
+                format!(
+                    "{action} was not dispatched: {role} \"{label}\" of window {window_id} \
+                     reports AXEnabled=false. {order}, but window {window_id} is not pid {pid}'s \
+                     key window — {denial} — and a control whose enabled state tracks key-window \
+                     focus reads disabled until its window is key. A foreground dispatch makes it \
+                     key first."
+                )
+            }
+            DisabledCause::ApplicationState => {
+                let order = if self.front_in_process {
+                    format!("Window {window_id} is already pid {pid}'s front window")
+                } else {
+                    format!("No window of pid {pid} is drawn in front of window {window_id}")
+                };
+                format!(
+                    "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
+                     AXEnabled=false. {order} — the application disabled this control, and neither \
+                     delivery mode nor activation changes that. Satisfy its precondition or choose \
+                     another control."
+                )
+            }
         }
-        if let Some(obscuring) = &self.obscuring_window {
-            let blocker = obscuring.window_id;
-            let route = if obscuring.is_focusable() {
-                format!("Dismiss that window, or address window {blocker} and act on it there.")
-            } else {
-                "It publishes no AXWindow, so it cannot become the focused window: dismiss it, \
-                 or act on it by pixel."
-                    .to_owned()
-            };
-            return format!(
-                "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
-                 AXEnabled=false, and window {blocker} — pid {pid}'s own front window, {} — is \
-                 drawn in front of it. {route}",
-                obscuring.describe()
-            );
-        }
-        let order = if self.front_in_process {
-            format!("Window {window_id} is already pid {pid}'s front window")
-        } else {
-            format!("No window of pid {pid} is drawn in front of window {window_id}")
-        };
-        format!(
-            "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
-             AXEnabled=false. {order} — the application disabled this control, and neither \
-             delivery mode nor activation changes that. Satisfy its precondition or choose \
-             another control."
-        )
     }
 
     fn payload(&self) -> Value {
@@ -335,9 +424,20 @@ impl ElementDisabled {
             "pid": self.pid,
             "foreground": self.foreground,
             "front_in_process": self.front_in_process,
+            "key_window": {
+                "is_key": self.key_window.holds(self.window_id),
+                "app_frontmost": self.key_window.app_frontmost,
+                "focused_window_id": self.key_window.focused_window_id,
+            },
         });
         if let Some(obscuring) = &self.obscuring_window {
             payload["obscured_by"] = obscuring.payload();
+        }
+        if matches!(self.cause(), DisabledCause::WindowNotKey(_)) {
+            payload["escalation"] = serde_json::json!({
+                "target": "foreground",
+                "reason": "route_unavailable",
+            });
         }
         payload
     }
@@ -2016,6 +2116,7 @@ fn perform_ax_click(
             foreground,
             front_in_process: order.target_is_front,
             obscuring_window: order.in_front,
+            key_window: KeyWindowState::observe(pid),
         }));
     }
 
@@ -2830,6 +2931,8 @@ mod tests {
         assert_eq!(data["escalation"]["reason"], "route_unavailable");
     }
 
+    /// A disabled control in a window that *is* the application's key window:
+    /// the state in which no focus-related route is left to name.
     fn disabled(role: &str, front_in_process: bool) -> ElementDisabled {
         ElementDisabled {
             action: "AXPress".to_owned(),
@@ -2840,6 +2943,10 @@ mod tests {
             foreground: false,
             front_in_process,
             obscuring_window: None,
+            key_window: KeyWindowState {
+                app_frontmost: true,
+                focused_window_id: Some(17002),
+            },
         }
     }
 
@@ -2955,6 +3062,131 @@ mod tests {
                 .contains("own front window, titled \"Print\", AXWindow/AXUnknown —"),
             "{}",
             state.reason()
+        );
+    }
+
+    /// The measured Notes state: a background press on the toolbar search
+    /// field of a window that is front in its own process, with nothing in
+    /// front of it, while the application is not frontmost.
+    fn not_key(front_in_process: bool) -> ElementDisabled {
+        ElementDisabled {
+            action: "AXPress".to_owned(),
+            role: "AXTextField".to_owned(),
+            label: String::new(),
+            window_id: 19080,
+            pid: 84264,
+            foreground: false,
+            front_in_process,
+            obscuring_window: None,
+            key_window: KeyWindowState {
+                app_frontmost: false,
+                focused_window_id: Some(19080),
+            },
+        }
+    }
+
+    #[test]
+    fn a_disabled_control_on_a_window_that_is_not_key_names_the_foreground_rung() {
+        let state = not_key(true);
+        let reason = state.reason();
+        assert_eq!(
+            reason,
+            "AXPress was not dispatched: AXTextField \"\" of window 19080 reports \
+             AXEnabled=false. Window 19080 is already pid 84264's front window and no window of \
+             pid 84264 is drawn in front of it, but window 19080 is not pid 84264's key window — \
+             pid 84264 is not the frontmost application — and a control whose enabled state \
+             tracks key-window focus reads disabled until its window is key. A foreground \
+             dispatch makes it key first."
+        );
+
+        let payload = state.payload();
+        assert_eq!(payload["code"], "element_disabled");
+        assert_eq!(payload["effect"], "not_dispatched");
+        assert_eq!(payload["escalation"]["target"], "foreground");
+        assert_eq!(payload["escalation"]["reason"], "route_unavailable");
+        assert_eq!(payload["key_window"]["is_key"], false);
+        assert_eq!(payload["key_window"]["app_frontmost"], false);
+        assert_eq!(payload["key_window"]["focused_window_id"], 19080);
+        assert!(payload.get("obscured_by").is_none(), "{payload}");
+    }
+
+    /// Which observation denies the key status is named, not paraphrased.
+    #[test]
+    fn the_window_holding_the_app_s_focus_is_named_when_the_app_is_frontmost() {
+        let mut state = not_key(false);
+        state.key_window = KeyWindowState {
+            app_frontmost: true,
+            focused_window_id: Some(19077),
+        };
+        let reason = state.reason();
+        assert!(
+            reason.contains("No window of pid 84264 is drawn in front of window 19080, but"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("window 19077 holds pid 84264's keyboard focus"),
+            "{reason}"
+        );
+
+        state.key_window = KeyWindowState {
+            app_frontmost: true,
+            focused_window_id: None,
+        };
+        assert!(
+            state
+                .reason()
+                .contains("pid 84264 reports no focused window"),
+            "{}",
+            state.reason()
+        );
+    }
+
+    /// The rung is only real while it is unspent: a refusal composed inside
+    /// the foreground assist has no activation left to offer.
+    #[test]
+    fn the_foreground_rung_is_not_named_once_it_is_in_force() {
+        let mut state = not_key(true);
+        state.foreground = true;
+        let reason = state.reason();
+        assert!(
+            reason.contains(
+                "the application disabled this control, and neither delivery mode \
+                             nor activation changes that"
+            ),
+            "{reason}"
+        );
+        assert!(!reason.contains("foreground"), "{reason}");
+        assert!(
+            state.payload().get("escalation").is_none(),
+            "{}",
+            state.payload()
+        );
+    }
+
+    /// A key window's disabled control and a menu row keep their own arms, and
+    /// a real owned panel in front outranks the key-window fact: dismissing or
+    /// addressing that window is what the state leaves open.
+    #[test]
+    fn the_other_arms_withhold_the_foreground_escalation() {
+        for state in [disabled("AXButton", true), disabled("AXMenuItem", false)] {
+            assert!(
+                state.payload().get("escalation").is_none(),
+                "{}",
+                state.payload()
+            );
+        }
+        let mut behind_panel = not_key(false);
+        behind_panel.obscuring_window = Some(blocker(19091, "Print", true));
+        let reason = behind_panel.reason();
+        assert!(
+            reason.contains("Dismiss that window, or address window 19091 and act on it there."),
+            "{reason}"
+        );
+        assert!(!reason.contains("key window"), "{reason}");
+        assert!(
+            behind_panel.payload().get("escalation").is_none(),
+            "{}",
+            behind_panel.payload()
         );
     }
 
