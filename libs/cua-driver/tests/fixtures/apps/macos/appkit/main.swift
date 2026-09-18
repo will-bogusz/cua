@@ -656,11 +656,15 @@ func installMenuBar(target: HarnessWindowController) {
     let windowMenu = NSMenu(title: "Window")
     let arrangeItem = NSMenuItem(title: "Arrange", action: nil, keyEquivalent: "")
     let arrangeMenu = NSMenu(title: "Arrange")
+    // A real key equivalent, so a chord can be validated against the window
+    // the way NSMenu does it: AppKit only enables this item while the harness
+    // window is the application's key window.
     let leftItem = NSMenuItem(
         title: "Left",
         action: #selector(HarnessWindowController.onArrangeLeft(_:)),
-        keyEquivalent: ""
+        keyEquivalent: "l"
     )
+    leftItem.keyEquivalentModifierMask = [.command, .option]
     leftItem.target = target
     leftItem.setAccessibilityIdentifier("menu-window-arrange-left")
     arrangeMenu.addItem(leftItem)

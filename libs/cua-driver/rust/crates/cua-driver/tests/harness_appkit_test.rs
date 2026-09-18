@@ -853,9 +853,7 @@ fn harness_appkit_set_value_commits_the_edit() {
             // value. `committed=commit-cua` is the commit label; a bare
             // `commit-cua` static text can only be the mirror.
             assert!(
-                after
-                    .tree_text()
-                    .contains("AXStaticText = \"commit-cua\""),
+                after.tree_text().contains("AXStaticText = \"commit-cua\""),
                 "controlTextDidChange never fired, so the value was echoed rather than typed:\n{}",
                 after.tree_text()
             );
@@ -1339,7 +1337,11 @@ fn harness_appkit_window_scoped_type_reaches_the_focused_field() {
                     "element_token": element_token_by_id(&first, "txt-input")
                 }),
             );
-            assert!(!focus.is_error(), "focusing the field failed: {}", focus.text());
+            assert!(
+                !focus.is_error(),
+                "focusing the field failed: {}",
+                focus.text()
+            );
 
             // No element_index: the window-scoped form, which is what the
             // remembered responder competes with.
@@ -1365,6 +1367,97 @@ fn harness_appkit_window_scoped_type_reaches_the_focused_field() {
             assert!(
                 post.contains("responder-cua"),
                 "the keystrokes went to the remembered responder:\n{post}"
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
+/// A menu key equivalent has to actually reach NSMenu. Measured on Notes,
+/// window-scoped `cmd+option+f` (Edit ▸ Find ▸ "Note List Search…"): 0 of 12
+/// dispatches landed while the target window was not the app's key window,
+/// and every reply still said "Pressed cmd+option+f on pid 91895". The
+/// fixture's Window ▸ Arrange ▸ Left owns `cmd+option+l` and publishes
+/// `menu_action=window_arrange_left`.
+#[test]
+#[ignore]
+fn harness_appkit_menu_key_equivalent_through_hotkey() {
+    run_case(
+        native_foreground_case(
+            "appkit",
+            "hotkey_menu_key_equivalent",
+            Targeting::Ax,
+            DriverRoute::MacosCgEventPid,
+        ),
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("menu_action=none"),
+                "fixture did not start with an unfired menu action:\n{}",
+                before.tree_text()
+            );
+
+            // Background rung: the window is key from launch, so the
+            // auth-envelope post reaches NSMenu without any activation.
+            let background = driver.call(
+                "hotkey",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "keys": ["cmd", "option", "l"]
+                }),
+            );
+            assert!(
+                !background.is_error(),
+                "background chord failed: {}",
+                background.text()
+            );
+            assert_eq!(
+                background.structured()["key_window"]["is_key"],
+                serde_json::json!(true),
+                "the reply must publish the key-window fact it observed: {}",
+                background.raw
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            let after_background = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                after_background.contains("menu_action=window_arrange_left"),
+                "the background chord never reached NSMenu:\n{after_background}"
+            );
+
+            // Foreground rung: the branch that used to front with
+            // kCPSNoWindows and post at a window that was never made key.
+            let foreground = driver.call(
+                "hotkey",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "keys": ["cmd", "option", "l"],
+                    "delivery_mode": "foreground"
+                }),
+            );
+            assert!(
+                !foreground.is_error(),
+                "foreground chord failed: {}",
+                foreground.text()
+            );
+            assert_eq!(
+                foreground.structured()["key_window"]["is_key"],
+                serde_json::json!(true),
+                "the foreground rung posted at a window it had not made key: {}",
+                foreground.raw
+            );
+            assert_eq!(
+                foreground.structured()["path"],
+                serde_json::json!("key_events_fg"),
+                "the menu key-equivalent branch is a PID-routed post, not the HID tap: {}",
+                foreground.raw
+            );
+            assert_ne!(
+                foreground.action_effect(),
+                Some("suspected_noop"),
+                "a chord that reached NSMenu was reported as a no-op: {}",
+                foreground.raw
             );
             Observation::delivered_with_fixture_state(Vec::new())
         },
