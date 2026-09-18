@@ -283,6 +283,21 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     Some(s.to_string())
 }
 
+/// The element's display label under the tree's rule: `AXTitle`, else `AXDescription`, else `AXValue`.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn copy_label_attr(element: AXUIElementRef) -> Option<String> {
+    ["AXTitle", "AXDescription", "AXValue"]
+        .into_iter()
+        .find_map(|attr_name| {
+            copy_string_attr(element, attr_name)
+                .map(|label| label.trim().to_owned())
+                .filter(|label| !label.is_empty())
+        })
+}
+
 /// Copy a numeric attribute from an AX element as an `f64`. Returns `None` on
 /// any error or if the attribute is not a `CFNumber`. SwiftUI sliders expose a
 /// readable numeric `AXValue` even when that value is not settable — this lets

@@ -1002,6 +1002,11 @@ fn harness_appkit_click_on_a_selectable_row_selects_without_pressing() {
                 clicked.text()
             );
             assert!(
+                clicked.text().contains("AXRow \"pressable row\""),
+                "the reply did not name the row it acted on: {}",
+                clicked.text()
+            );
+            assert!(
                 clicked.text().contains("perform(\"press\")"),
                 "the reply did not name the row's own press action: {}",
                 clicked.text()

@@ -25,8 +25,9 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_children, copy_string_attr, element_at_screen_position,
-    element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
+    copy_action_names, copy_children, copy_label_attr, copy_string_attr,
+    element_at_screen_position, element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction,
+    AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::input::ax_actions::{requests_ax_action, resolve_ax_action, UnknownAxAction};
@@ -1883,7 +1884,7 @@ fn perform_ax_click(
     crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, &ax_action)?;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-    let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+    let title = unsafe { copy_label_attr(element) }.unwrap_or_default();
 
     // On a collection row the pointer gesture is select, so a plain click takes
     // the bounded, read-back-verified AXSelected write whether or not the
