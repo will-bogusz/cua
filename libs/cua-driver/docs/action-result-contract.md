@@ -23,6 +23,18 @@ Every successful action returns a closed `structuredContent` object:
 }
 ```
 
+An action that only proved the target reacted publishes the coarse kind plus
+the signal the platform watched:
+
+```json
+{
+  "effect": "unverifiable",
+  "route": "synthetic_events",
+  "delivery": {"mode": "background"},
+  "evidence": [{"kind": "observed_change", "signal": "app_focus"}]
+}
+```
+
 `effect` and `route` are required.
 
 | Field | Values |
@@ -30,7 +42,8 @@ Every successful action returns a closed `structuredContent` object:
 | `effect` | `confirmed`, `partial`, `unverifiable`, `suspected_noop`, `refused` |
 | `route` | `accessibility`, `synthetic_events`, `global_input`, `dom`, `trusted_input` |
 | `delivery.mode` | `background`, `foreground`, `not_applicable`, `unknown` |
-| `evidence[].kind` | `value_readback`, `window_change` |
+| `evidence[].kind` | `value_readback`, `observed_change` |
+| `evidence[].signal` | `element_state`, `app_focus`, `window_tree`, `window_change` — optional; absent when the producer named no signal, or named one this version does not publish |
 | `escalation.target` | `pixel`, `foreground`, `page`, `session` |
 | `escalation.reason` | `route_unavailable`, `delivery_failed`, `effect_unconfirmed`, `suspected_noop`, `permission_required` |
 
@@ -51,7 +64,7 @@ scope, targets, platform transport names, diagnostic pointers, or the old
 
 The invariants are:
 
-- `confirmed` has publishable readback or window-change evidence;
+- `confirmed` has publishable readback or observed-change evidence;
 - `partial` has `delivery.delivered_count`;
 - `refused` has neither delivery nor evidence.
 

@@ -2028,7 +2028,7 @@ fn valid_payload_for_event(event_type: &str, payload: &HistoryPayload) -> bool {
                         "accessibility_readback"
                             | "browser_readback"
                             | "value_readback"
-                            | "window_change"
+                            | "observed_change"
                     )
                 })
                 && escalation_kind.as_deref().is_none_or(|value| {
@@ -2182,7 +2182,7 @@ fn evidence_name(value: ProjectedEvidenceKind) -> &'static str {
         ProjectedEvidenceKind::AccessibilityReadback => "accessibility_readback",
         ProjectedEvidenceKind::BrowserReadback => "browser_readback",
         ProjectedEvidenceKind::ValueReadback => "value_readback",
-        ProjectedEvidenceKind::WindowChange => "window_change",
+        ProjectedEvidenceKind::ObservedChange => "observed_change",
     }
 }
 

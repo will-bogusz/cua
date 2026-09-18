@@ -526,13 +526,54 @@ pub struct ActionDelivery {
 #[serde(rename_all = "snake_case")]
 pub enum ActionEvidenceKind {
     ValueReadback,
+    ObservedChange,
+}
+
+/// Which post-dispatch observation a platform probe named. The coarse
+/// [`ActionEvidenceKind::ObservedChange`] says the target reacted; this says
+/// what was watched when it did.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionEvidenceSignal {
+    ElementState,
+    AppFocus,
+    WindowTree,
     WindowChange,
+}
+
+impl ActionEvidenceSignal {
+    /// The single wire spelling, so a platform producer and the record that
+    /// reads it back cannot drift apart.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::ElementState => "element_state",
+            Self::AppFocus => "app_focus",
+            Self::WindowTree => "window_tree",
+            Self::WindowChange => "window_change",
+        }
+    }
+
+    /// Only the four published signals are accepted; an unknown spelling
+    /// yields `None` rather than a claim about what the target did.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "element_state" => Some(Self::ElementState),
+            "app_focus" => Some(Self::AppFocus),
+            "window_tree" => Some(Self::WindowTree),
+            "window_change" => Some(Self::WindowChange),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionEvidence {
     pub kind: ActionEvidenceKind,
+    /// Which signal the platform watched. Absent when the producer declared
+    /// none, or named one this contract version does not publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<ActionEvidenceSignal>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
@@ -773,6 +814,7 @@ mod tests {
             }),
             evidence: Some(vec![ActionEvidence {
                 kind: ActionEvidenceKind::ValueReadback,
+                signal: None,
             }]),
             escalation: None,
             committed: None,
@@ -866,8 +908,28 @@ mod tests {
         assert_eq!(evidence["additionalProperties"], false);
         assert_eq!(evidence["required"], json!(["kind"]));
         assert_eq!(
+            evidence["properties"]
+                .as_object()
+                .expect("evidence properties")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["kind", "signal"]
+        );
+        assert_eq!(
             evidence["properties"]["kind"]["enum"],
-            json!(["value_readback", "window_change"])
+            json!(["value_readback", "observed_change"])
+        );
+        assert_eq!(
+            evidence["properties"]["signal"]["enum"],
+            json!([
+                "element_state",
+                "app_focus",
+                "window_tree",
+                "window_change",
+                null
+            ]),
+            "an optional signal is absent or one of the four published names"
         );
 
         let escalation = object_variant(&properties["escalation"]);
@@ -949,6 +1011,50 @@ mod tests {
         assert!(serde_json::from_value::<ActionResult>(escalation_extension).is_err());
     }
 
+    /// A consumer reads the signal from a machine field instead of prose, so
+    /// each published spelling must survive the wire and an unpublished one
+    /// must be rejected rather than passed through.
+    #[test]
+    fn observed_change_evidence_publishes_the_signal_it_watched() {
+        for signal in [
+            ActionEvidenceSignal::ElementState,
+            ActionEvidenceSignal::AppFocus,
+            ActionEvidenceSignal::WindowTree,
+            ActionEvidenceSignal::WindowChange,
+        ] {
+            let mut result = confirmed_result();
+            result.evidence = Some(vec![ActionEvidence {
+                kind: ActionEvidenceKind::ObservedChange,
+                signal: Some(signal),
+            }]);
+            let payload = serde_json::to_value(&result).expect("serialize");
+            assert_eq!(payload["evidence"][0]["kind"], json!("observed_change"));
+            assert_eq!(payload["evidence"][0]["signal"], json!(signal.as_wire()));
+            assert_eq!(
+                ActionEvidenceSignal::from_wire(signal.as_wire()),
+                Some(signal)
+            );
+            assert_eq!(
+                serde_json::from_value::<ActionResult>(payload).expect("deserialize"),
+                result
+            );
+        }
+
+        assert!(
+            serde_json::to_value(confirmed_result()).expect("serialize")["evidence"][0]
+                .get("signal")
+                .is_none()
+        );
+        assert_eq!(ActionEvidenceSignal::from_wire("vibes"), None);
+
+        let unpublished = json!({
+            "effect": "unverifiable",
+            "route": "accessibility",
+            "evidence": [{"kind": "observed_change", "signal": "vibes"}]
+        });
+        assert!(serde_json::from_value::<ActionResult>(unpublished).is_err());
+    }
+
     #[test]
     fn action_result_enforces_effect_invariants() {
         let mut result = confirmed_result();
@@ -981,7 +1087,8 @@ mod tests {
         );
         result.delivery = None;
         result.evidence = Some(vec![ActionEvidence {
-            kind: ActionEvidenceKind::WindowChange,
+            kind: ActionEvidenceKind::ObservedChange,
+            signal: None,
         }]);
         assert_eq!(
             result.validate_invariants(),

@@ -185,6 +185,8 @@ pub enum ActionRoute {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionEvidence {
     pub kind: EvidenceKind,
+    /// The platform's own signal name for an observed change; published as
+    /// `ActionEvidence.signal` when the contract knows the spelling.
     pub detail: String,
 }
 
@@ -193,7 +195,7 @@ pub enum EvidenceKind {
     AccessibilityReadback,
     BrowserReadback,
     ValueReadback,
-    WindowChange,
+    ObservedChange,
     NativeApiResult,
     ScreenshotComparison,
     EventReceipt,
@@ -363,17 +365,21 @@ impl ActionExecutionRecord {
             evidence: projection.evidence.map(|evidence| {
                 evidence
                     .into_iter()
-                    .map(|evidence| cua_driver_contract::ActionEvidence {
-                        kind: match evidence.kind {
+                    .map(|evidence| {
+                        let (kind, signal) = match evidence.kind {
                             ProjectedEvidenceKind::AccessibilityReadback
                             | ProjectedEvidenceKind::BrowserReadback
                             | ProjectedEvidenceKind::ValueReadback => {
-                                cua_driver_contract::ActionEvidenceKind::ValueReadback
+                                (cua_driver_contract::ActionEvidenceKind::ValueReadback, None)
                             }
-                            ProjectedEvidenceKind::WindowChange => {
-                                cua_driver_contract::ActionEvidenceKind::WindowChange
-                            }
-                        },
+                            ProjectedEvidenceKind::ObservedChange => (
+                                cua_driver_contract::ActionEvidenceKind::ObservedChange,
+                                cua_driver_contract::ActionEvidenceSignal::from_wire(
+                                    &evidence.detail,
+                                ),
+                            ),
+                        };
+                        cua_driver_contract::ActionEvidence { kind, signal }
                     })
                     .collect()
             }),
@@ -491,7 +497,7 @@ impl ActionExecutionRecord {
         // read-back, so the effect it accompanies is still `unverifiable`.
         for signal in legacy_observed_change_evidence(structured) {
             record.evidence.push(ActionEvidence {
-                kind: EvidenceKind::WindowChange,
+                kind: EvidenceKind::ObservedChange,
                 detail: signal.to_owned(),
             });
         }
@@ -679,11 +685,8 @@ fn legacy_has_publishable_readback(tool_name: &str, structured: &serde_json::Val
         && structured.get("effect").and_then(serde_json::Value::as_str) == Some("confirmed")
 }
 
-/// Signal names a platform may declare as an observed post-dispatch change; all
-/// normalize to the coarse `WindowChange` kind with the signal kept as detail.
-const OBSERVED_CHANGE_SIGNALS: [&str; 4] =
-    ["window_change", "element_state", "app_focus", "window_tree"];
-
+/// Signal names a platform may declare as an observed post-dispatch change;
+/// all normalize to the coarse `ObservedChange` kind with the signal kept.
 fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<&str> {
     structured
         .get("evidence")
@@ -692,7 +695,7 @@ fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<&str> 
             evidence
                 .iter()
                 .filter_map(|item| item.get("kind").and_then(serde_json::Value::as_str))
-                .filter(|kind| OBSERVED_CHANGE_SIGNALS.contains(kind))
+                .filter(|kind| cua_driver_contract::ActionEvidenceSignal::from_wire(kind).is_some())
                 .collect()
         })
         .unwrap_or_default()
@@ -976,7 +979,7 @@ fn projected_evidence(evidence: &[ActionEvidence]) -> Option<Vec<ActionEvidenceP
                 EvidenceKind::AccessibilityReadback => ProjectedEvidenceKind::AccessibilityReadback,
                 EvidenceKind::BrowserReadback => ProjectedEvidenceKind::BrowserReadback,
                 EvidenceKind::ValueReadback => ProjectedEvidenceKind::ValueReadback,
-                EvidenceKind::WindowChange => ProjectedEvidenceKind::WindowChange,
+                EvidenceKind::ObservedChange => ProjectedEvidenceKind::ObservedChange,
                 EvidenceKind::NativeApiResult
                 | EvidenceKind::ScreenshotComparison
                 | EvidenceKind::EventReceipt
@@ -1034,7 +1037,7 @@ fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
         EvidenceKind::AccessibilityReadback => "accessibility_readback",
         EvidenceKind::BrowserReadback => "browser_readback",
         EvidenceKind::ValueReadback => "value_readback",
-        EvidenceKind::WindowChange => "window_change",
+        EvidenceKind::ObservedChange => "observed_change",
         EvidenceKind::NativeApiResult => "native_api_result",
         EvidenceKind::ScreenshotComparison => "screenshot_comparison",
         EvidenceKind::EventReceipt => "event_receipt",
@@ -1182,7 +1185,7 @@ pub enum ProjectedEvidenceKind {
     AccessibilityReadback,
     BrowserReadback,
     ValueReadback,
-    WindowChange,
+    ObservedChange,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1890,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_change_after_dispatch_publishes_window_change_evidence() {
+    fn observed_change_after_dispatch_publishes_its_signal() {
         let record = ActionExecutionRecord::from_legacy(
             "click",
             &serde_json::json!({"delivery_mode": "background"}),
@@ -1905,9 +1908,15 @@ mod tests {
         assert_eq!(record.effect, ActionEffect::Unverifiable);
         let public = record.public_result().expect("public ActionResult");
         assert_eq!(
-            public.evidence.as_deref().map(<[_]>::len),
-            Some(1),
-            "an observed change is publishable delivery evidence"
+            public.evidence.as_deref(),
+            Some(
+                [cua_driver_contract::ActionEvidence {
+                    kind: cua_driver_contract::ActionEvidenceKind::ObservedChange,
+                    signal: Some(cua_driver_contract::ActionEvidenceSignal::WindowChange),
+                }]
+                .as_slice()
+            ),
+            "an observed change is publishable delivery evidence and names its signal"
         );
     }
 
@@ -1926,16 +1935,22 @@ mod tests {
             )
             .expect("background click with observed change should normalize");
             assert_eq!(record.evidence.len(), 1, "{signal} is an observed change");
-            assert_eq!(record.evidence[0].kind, EvidenceKind::WindowChange);
+            assert_eq!(record.evidence[0].kind, EvidenceKind::ObservedChange);
             assert_eq!(
                 record.evidence[0].detail, signal,
                 "the signal stays readable on the record"
             );
             let public = record.public_result().expect("public ActionResult");
             assert_eq!(
-                public.evidence.as_deref().map(<[_]>::len),
-                Some(1),
-                "{signal} is publishable delivery evidence"
+                public.evidence.as_deref(),
+                Some(
+                    [cua_driver_contract::ActionEvidence {
+                        kind: cua_driver_contract::ActionEvidenceKind::ObservedChange,
+                        signal: cua_driver_contract::ActionEvidenceSignal::from_wire(signal),
+                    }]
+                    .as_slice()
+                ),
+                "{signal} is publishable delivery evidence under its own name"
             );
         }
 
@@ -1953,6 +1968,28 @@ mod tests {
         assert!(
             unknown.evidence.is_empty(),
             "an undeclared kind is not evidence"
+        );
+
+        let undeclared = ActionExecutionRecord::builder(
+            ActionEffect::Unverifiable,
+            ActionTransport::MacosAxAction,
+            RequestedDelivery::Background,
+        )
+        .evidence(ActionEvidence {
+            kind: EvidenceKind::ObservedChange,
+            detail: "vibes".to_owned(),
+        })
+        .build()
+        .unwrap()
+        .public_result()
+        .unwrap();
+        assert_eq!(
+            undeclared.evidence.as_deref().and_then(<[_]>::first),
+            Some(&cua_driver_contract::ActionEvidence {
+                kind: cua_driver_contract::ActionEvidenceKind::ObservedChange,
+                signal: None,
+            }),
+            "an undeclared detail must not be published as a signal"
         );
     }
 
