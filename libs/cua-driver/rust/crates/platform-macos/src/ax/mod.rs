@@ -22,11 +22,13 @@ pub(crate) mod budget;
 pub mod cache;
 pub mod enablement;
 pub mod exact_target;
+pub mod owned;
 pub mod row_collapse;
 pub mod tree;
 pub mod window_scope;
 
 pub use cache::ElementCache;
+pub use owned::OwnedElement;
 pub use tree::{
     walk_tree, walk_tree_bounded, AXNode, TreeWalkResult, DEFAULT_MAX_DEPTH, DEFAULT_MAX_ELEMENTS,
 };

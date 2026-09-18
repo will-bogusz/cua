@@ -35,6 +35,7 @@ use crate::apps;
 use crate::ax::bindings::{
     copy_string_attr, focused_element_of_pid, kAXErrorSuccess, set_string_attr, AXUIElementRef,
 };
+use crate::ax::OwnedElement;
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::CFRelease;
@@ -1366,31 +1367,18 @@ fn await_typed_progress(
     }
 }
 
-/// A retained AX element owned for the length of one `type_text` call.
-struct OwnedElement(AXUIElementRef);
-
-impl OwnedElement {
-    fn as_ptr(&self) -> usize {
-        self.0 as usize
-    }
-}
-
-impl Drop for OwnedElement {
-    fn drop(&mut self) {
-        unsafe { CFRelease(self.0 as _) };
-    }
-}
-
 /// The focused element `type_text` may address, retained. A window-addressed
 /// request may only use focus that provably belongs to that exact window: a
 /// sibling window's focused field is not the requested target.
 fn resolve_window_focus(pid: i32, window_id: Option<u32>) -> Option<OwnedElement> {
-    match window_id {
-        Some(window_id) => {
-            unsafe { crate::ax::exact_target::focused_element_in_window(pid, window_id) }
-                .map(OwnedElement)
+    // SAFETY: both resolvers return a `+1` reference, which the guard takes
+    // over and releases when the call that holds it ends.
+    unsafe {
+        match window_id {
+            Some(window_id) => crate::ax::exact_target::focused_element_in_window(pid, window_id),
+            None => focused_element_of_pid(pid),
         }
-        None => unsafe { focused_element_of_pid(pid) }.map(OwnedElement),
+        .and_then(|element| OwnedElement::adopt(element))
     }
 }
 

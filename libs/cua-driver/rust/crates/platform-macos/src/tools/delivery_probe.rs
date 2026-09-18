@@ -43,9 +43,10 @@ use std::time::{Duration, Instant};
 
 use crate::ax::bindings::{
     ax_get_window_id, children_count, copy_ax_windows, copy_bool_attr, copy_string_attr,
-    element_screen_rect, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
-    AXUIElementSetMessagingTimeout,
+    element_screen_rect, focused_element_of_pid, kAXErrorInvalidUIElement, try_copy_string_attr,
+    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
+use crate::ax::OwnedElement;
 use crate::window_change_detector::WindowEvent;
 use core_foundation::base::{CFRelease, CFTypeRef};
 
@@ -72,42 +73,81 @@ const BLIND_SETTLE_BUDGET: Duration = Duration::from_millis(500);
 /// native AX reads, so this only keeps a cheap sample set from spinning.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
 
+/// What one read of the watched element answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ElementRead {
+    /// Identity + mutable state, comparable against another `State`.
+    State(String),
+    /// The element reported itself invalid: it was destroyed. Only reachable
+    /// because the probe holds its own reference — an unretained pointer to a
+    /// destroyed element traps instead of answering.
+    Gone,
+    /// No comparable answer (attribute missing, app busy, AX timeout).
+    #[default]
+    Unreadable,
+}
+
+impl ElementRead {
+    fn state(&self) -> Option<&str> {
+        match self {
+            ElementRead::State(state) => Some(state),
+            _ => None,
+        }
+    }
+}
+
 /// One sample of the signals the probe can compare. `None` means "not
 /// readable", which is never treated as a change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Signals {
-    /// Identity + mutable state of the clicked element.
-    pub element: Option<String>,
+    /// Identity + mutable state of the watched element.
+    pub element: ElementRead,
     /// Identity of the application's AX focused element.
     pub focus: Option<String>,
     /// Digest of the target window's capped AX subtree.
     pub tree: Option<u64>,
 }
 
-/// What the probe observed after the dispatch; `Changed` names the signal that
-/// moved, which is the `kind` its evidence row publishes.
+/// What the probe observed after the dispatch; a reaction names the signal
+/// that moved, which is the `kind` its evidence row publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Evidence {
     /// A usable signal differed after the dispatch; the app reacted.
     Changed(&'static str),
+    /// The watched element no longer exists — a dismissal (Escape on a
+    /// popover, sheet or menu) destroys the element it dismisses, so this is
+    /// the reaction itself, not a failed read. It publishes as the
+    /// `element_state` signal: the element's own state is what was watched,
+    /// and the reply's prose says it is gone.
+    ElementGone,
     /// Every usable signal was identical after the dispatch.
     Unchanged,
-    /// Nothing could be compared (element gone, window unreadable, and a
-    /// self-updating or unreadable subtree).
+    /// Nothing could be compared (element unreadable, window unreadable, and
+    /// a self-updating or unreadable subtree).
     Unusable,
 }
 
 /// The window poll's own signal: a window opened, or the frontmost
 /// application changed. Only this signal carries observed windows.
 pub const WINDOW_SIGNAL: &str = "window_change";
+/// The watched element's own state. Spelled as the action contract publishes
+/// it — an unpublished spelling is dropped from the action record, so the
+/// probe only ever names signals the contract knows.
+pub const ELEMENT_SIGNAL: &str = "element_state";
 
 impl Evidence {
     pub fn signal(self) -> &'static str {
         match self {
             Evidence::Changed(signal) => signal,
+            Evidence::ElementGone => ELEMENT_SIGNAL,
             Evidence::Unchanged => "none",
             Evidence::Unusable => "unavailable",
         }
+    }
+
+    /// The target reacted. Ends the settle wait and publishes evidence.
+    pub fn is_reaction(self) -> bool {
+        matches!(self, Evidence::Changed(_) | Evidence::ElementGone)
     }
 }
 
@@ -196,7 +236,13 @@ pub struct ProbeOutcome {
 pub struct DeliveryProbe {
     pid: i32,
     window_id: u32,
-    element_ptr: Option<usize>,
+    /// The watched element, retained for the probe's whole life. The action
+    /// being probed may destroy it — Escape dismisses the popover, sheet or
+    /// menu whose element it was — and a post-dispatch read of an unretained
+    /// pointer to a destroyed element traps inside CoreFoundation instead of
+    /// answering. Owning a reference turns that into
+    /// `kAXErrorInvalidUIElement`, which is a verdict rather than a crash.
+    element: Option<OwnedElement>,
     before: Signals,
     /// The window's subtree digest was identical across two pre-dispatch
     /// samples, so a post-dispatch difference is attributable to the action.
@@ -206,10 +252,17 @@ pub struct DeliveryProbe {
 
 impl DeliveryProbe {
     /// Sample the target before dispatch. Blocking AX work — call from a
-    /// blocking thread. `element_ptr` must stay retained by the caller.
+    /// blocking thread. `element_ptr` must be live for this call; the probe
+    /// retains it for itself, so the caller's own reference may go away
+    /// afterwards.
     pub fn capture(pid: i32, window_id: u32, element_ptr: Option<usize>) -> Self {
         let start = Instant::now();
-        let element = element_ptr.and_then(element_state);
+        // SAFETY: the caller's contract is a live pointer at capture time,
+        // which is exactly what `retain` needs.
+        let element = element_ptr.and_then(|ptr| unsafe { OwnedElement::retain(ptr) });
+        let state = element
+            .as_ref()
+            .map_or(ElementRead::Unreadable, element_state);
         let focus = focus_state(pid);
         let first = tree_digest(pid, window_id);
         let second = tree_digest(pid, window_id);
@@ -217,9 +270,9 @@ impl DeliveryProbe {
         Self {
             pid,
             window_id,
-            element_ptr,
+            element,
             before: Signals {
-                element,
+                element: state,
                 focus,
                 tree: second,
             },
@@ -246,7 +299,7 @@ impl DeliveryProbe {
             let after = self.sample();
             let evidence = classify(&self.before, &after, self.quiescent);
             let expired = Instant::now() >= deadline;
-            if matches!(evidence, Evidence::Changed(_)) || expired {
+            if evidence.is_reaction() || expired {
                 return self.outcome(evidence, start.elapsed());
             }
             // A cancelled caller stops waiting on a target it no longer wants
@@ -259,7 +312,10 @@ impl DeliveryProbe {
 
     fn sample(&self) -> Signals {
         Signals {
-            element: self.element_ptr.and_then(element_state),
+            element: self
+                .element
+                .as_ref()
+                .map_or(ElementRead::Unreadable, element_state),
             focus: focus_state(self.pid),
             tree: if self.quiescent {
                 tree_digest(self.pid, self.window_id)
@@ -289,7 +345,7 @@ impl DeliveryProbe {
 }
 
 fn settle_budget(before: &Signals) -> Duration {
-    if before.element.is_some() {
+    if before.element.state().is_some() {
         SETTLE_BUDGET
     } else {
         BLIND_SETTLE_BUDGET
@@ -297,18 +353,25 @@ fn settle_budget(before: &Signals) -> Duration {
 }
 
 /// Pure verdict over two samples. A signal counts only when both samples read
-/// it; an unreadable half is unknown, never a change.
+/// it; an unreadable half is unknown, never a change. The one exception is an
+/// element that was readable before and reports itself destroyed after: that
+/// is the reaction, not a missing read.
 pub fn classify(before: &Signals, after: &Signals, quiescent: bool) -> Evidence {
     let mut usable = false;
-    for (b, a, signal) in [
-        (&before.element, &after.element, "element_state"),
-        (&before.focus, &after.focus, "app_focus"),
-    ] {
-        if let (Some(b), Some(a)) = (b.as_ref(), a.as_ref()) {
+    match (&before.element, &after.element) {
+        (ElementRead::State(b), ElementRead::State(a)) => {
             usable = true;
             if b != a {
-                return Evidence::Changed(signal);
+                return Evidence::Changed(ELEMENT_SIGNAL);
             }
+        }
+        (ElementRead::State(_), ElementRead::Gone) => return Evidence::ElementGone,
+        _ => {}
+    }
+    if let (Some(b), Some(a)) = (before.focus.as_ref(), after.focus.as_ref()) {
+        usable = true;
+        if b != a {
+            return Evidence::Changed("app_focus");
         }
     }
     if quiescent {
@@ -326,18 +389,28 @@ pub fn classify(before: &Signals, after: &Signals, quiescent: bool) -> Evidence 
     }
 }
 
-/// Identity + mutable state of one element. `None` when the element no longer
-/// answers AX reads at all (replaced/detached node).
+/// Identity + mutable state of one element.
 ///
 /// The child count is part of that state because it is the only signal a
 /// menu-bearing control moves: a toolbar `AXMenuButton` whose menu opened
 /// keeps its role, title, value, focus, selection, enablement and frame, and
 /// gains one `AXMenu` child. Contacts' add button is exactly that control,
 /// and without this the probe called an opened menu a no-op.
-fn element_state(element_ptr: usize) -> Option<String> {
-    let element = element_ptr as AXUIElementRef;
+///
+/// The role read reports its AX error so a destroyed element
+/// (`kAXErrorInvalidUIElement`) is told apart from one that is merely busy or
+/// slow — the first is a reaction, the second is unknown.
+fn element_state(element: &OwnedElement) -> ElementRead {
+    let element = element.as_element();
+    // SAFETY: `OwnedElement` holds a reference to this element, so it is a
+    // valid AX element for every read below even if the application already
+    // destroyed the control behind it.
     unsafe {
-        let role = copy_string_attr(element, "AXRole")?;
+        let role = match try_copy_string_attr(element, "AXRole") {
+            Ok(Some(role)) => role,
+            Err(error) if error == kAXErrorInvalidUIElement => return ElementRead::Gone,
+            Ok(None) | Err(_) => return ElementRead::Unreadable,
+        };
         let title = copy_string_attr(element, "AXTitle").unwrap_or_default();
         let value = copy_string_attr(element, "AXValue").unwrap_or_default();
         let focused = copy_bool_attr(element, "AXFocused");
@@ -345,7 +418,7 @@ fn element_state(element_ptr: usize) -> Option<String> {
         let enabled = copy_bool_attr(element, "AXEnabled");
         let rect = element_screen_rect(element);
         let children = children_count(element);
-        Some(format!(
+        ElementRead::State(format!(
             "{role}|{title}|{value}|{focused:?}|{selected:?}|{enabled:?}|{rect:?}|{children:?}"
         ))
     }
@@ -354,13 +427,16 @@ fn element_state(element_ptr: usize) -> Option<String> {
 /// Identity of the app's focused element. A real click focuses the control it
 /// lands on, so this moves on delivery even when the control's own state does
 /// not.
+///
+/// This resolves the focused element afresh on every sample and owns the
+/// reference `AXFocusedUIElement` handed over, so no pointer to it survives
+/// the dispatch: a chord that destroys the focused element changes this
+/// signal, it does not leave a dangling read behind.
 fn focus_state(pid: i32) -> Option<String> {
-    unsafe {
-        let focused = focused_element_of_pid(pid)?;
-        let state = element_state(focused as usize);
-        CFRelease(focused as CFTypeRef);
-        state
-    }
+    // SAFETY: `focused_element_of_pid` returns a `+1` reference, which the
+    // guard takes over and releases when this sample ends.
+    let focused = unsafe { focused_element_of_pid(pid).and_then(|f| OwnedElement::adopt(f)) }?;
+    element_state(&focused).state().map(str::to_owned)
 }
 
 /// Digest of the target window's capped AX subtree. `None` when the walk could
@@ -419,7 +495,8 @@ pub fn apply_evidence(
         "waited_ms": waited_ms,
     });
     match outcome.evidence {
-        Evidence::Changed(signal) => {
+        Evidence::Changed(_) | Evidence::ElementGone => {
+            let signal = outcome.evidence.signal();
             let mut entry = serde_json::json!({ "kind": signal });
             if let Some(observed) = window_change.filter(|_| signal == WINDOW_SIGNAL) {
                 entry["appeared_windows"] =
@@ -428,9 +505,10 @@ pub fn apply_evidence(
             }
             structured["evidence"] = serde_json::json!([entry]);
             msg.push_str(&format!(
-                "\n🔎 Delivered: {signal} changed after the dispatch, so the app reacted. \
+                "\n🔎 Delivered: {} after the dispatch, so the app reacted. \
                  That is delivery, not the intended result — check the postcondition you \
-                 wanted."
+                 wanted.",
+                reaction_phrase(outcome.evidence)
             ));
         }
         Evidence::Unchanged => {
@@ -448,20 +526,35 @@ pub fn apply_evidence(
         Evidence::Unusable => {
             msg.push_str(
                 "\n❔ Delivery unverified: the target exposed no stable state to compare \
-                 (element gone from the tree, or the window changes on its own). Confirm the \
-                 postcondition yourself.",
+                 (neither the element nor the app's focus answered, and the window is \
+                 unreadable or changes on its own). Confirm the postcondition yourself.",
             );
         }
+    }
+}
+
+/// How a reaction reads in the reply. Every signal but one is a state that
+/// differs; a destroyed element is an absence, and "element_state changed"
+/// would leave the agent looking for a control that no longer exists.
+fn reaction_phrase(evidence: Evidence) -> String {
+    match evidence {
+        Evidence::ElementGone => "the element the probe watched is gone".to_owned(),
+        other => format!("{} changed", other.signal()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_foundation::base::CFGetRetainCount;
 
-    fn signals(element: Option<&str>, focus: Option<&str>, tree: Option<u64>) -> Signals {
+    fn state(digest: &str) -> ElementRead {
+        ElementRead::State(digest.to_owned())
+    }
+
+    fn signals(element: ElementRead, focus: Option<&str>, tree: Option<u64>) -> Signals {
         Signals {
-            element: element.map(str::to_owned),
+            element,
             focus: focus.map(str::to_owned),
             tree,
         }
@@ -471,7 +564,7 @@ mod tests {
         DeliveryProbe {
             pid: 0,
             window_id: 0,
-            element_ptr: None,
+            element: None,
             before: Signals::default(),
             quiescent: false,
             elapsed: Duration::ZERO,
@@ -481,15 +574,19 @@ mod tests {
     #[test]
     fn a_readable_element_state_is_what_buys_the_full_settle_budget() {
         assert_eq!(
-            settle_budget(&signals(Some("AXButton|New Item||"), None, None)),
+            settle_budget(&signals(state("AXButton|New Item||"), None, None)),
             SETTLE_BUDGET
         );
         assert_eq!(
-            settle_budget(&signals(Some("AXButton|New Item||"), Some("f"), Some(3))),
+            settle_budget(&signals(state("AXButton|New Item||"), Some("f"), Some(3))),
             SETTLE_BUDGET
         );
         assert_eq!(
-            settle_budget(&signals(None, Some("f"), Some(3))),
+            settle_budget(&signals(ElementRead::Unreadable, Some("f"), Some(3))),
+            BLIND_SETTLE_BUDGET
+        );
+        assert_eq!(
+            settle_budget(&signals(ElementRead::Gone, Some("f"), Some(3))),
             BLIND_SETTLE_BUDGET
         );
         assert_eq!(settle_budget(&Signals::default()), BLIND_SETTLE_BUDGET);
@@ -513,8 +610,8 @@ mod tests {
 
     #[test]
     fn element_state_change_is_delivery_evidence() {
-        let before = signals(Some("AXCheckBox||0|Some(false)"), Some("f"), Some(1));
-        let after = signals(Some("AXCheckBox||1|Some(false)"), Some("f"), Some(1));
+        let before = signals(state("AXCheckBox||0|Some(false)"), Some("f"), Some(1));
+        let after = signals(state("AXCheckBox||1|Some(false)"), Some("f"), Some(1));
         assert_eq!(
             classify(&before, &after, true),
             Evidence::Changed("element_state")
@@ -522,10 +619,86 @@ mod tests {
     }
 
     #[test]
+    fn a_destroyed_element_is_the_reaction_not_a_missing_read() {
+        // Escape on a popover: the element it dismissed answers
+        // kAXErrorInvalidUIElement afterwards. Nothing else has to have moved
+        // for the dismissal to have landed.
+        let before = signals(state("AXButton|Search||"), Some("f"), Some(9));
+        let after = signals(ElementRead::Gone, Some("f"), Some(9));
+        let evidence = classify(&before, &after, true);
+        assert_eq!(evidence, Evidence::ElementGone);
+        assert!(evidence.is_reaction(), "a dismissal did land");
+        assert_eq!(
+            reaction_phrase(evidence),
+            "the element the probe watched is gone",
+            "prose must not send the agent looking for a destroyed control"
+        );
+    }
+
+    #[test]
+    fn a_destroyed_element_publishes_a_signal_the_action_contract_keeps() {
+        // `ActionExecutionRecord::from_legacy` drops an evidence row whose
+        // signal spelling the contract does not publish, so a reaction named
+        // outside this vocabulary would vanish from the record.
+        for evidence in [Evidence::ElementGone, Evidence::Changed(ELEMENT_SIGNAL)] {
+            assert_eq!(
+                cua_driver_contract::ActionEvidenceSignal::from_wire(evidence.signal()),
+                Some(cua_driver_contract::ActionEvidenceSignal::ElementState)
+            );
+        }
+    }
+
+    #[test]
+    fn a_destroyed_element_reports_a_delivered_press_not_a_noop() {
+        let mut msg = "✅ Pressed escape on pid 4242.".to_owned();
+        let mut structured = serde_json::json!({ "path": "cgevent", "effect": "unverifiable" });
+        apply_evidence(
+            &mut msg,
+            &mut structured,
+            ProbeOutcome {
+                evidence: Evidence::ElementGone,
+                probe: Duration::from_millis(80),
+                waited: Duration::from_millis(20),
+            },
+            NoopReport {
+                signals: "focused element, app focus, window contents",
+                escalation: Some(serde_json::json!({ "target": "foreground" })),
+                advice: "",
+            },
+            None,
+        );
+        assert_eq!(structured["evidence"][0]["kind"], "element_state");
+        assert_eq!(structured["delivery_probe"]["signal"], "element_state");
+        assert_eq!(
+            structured["effect"], "unverifiable",
+            "a reaction is delivery, never the intended postcondition"
+        );
+        assert!(structured["escalation"].is_null(), "nothing to escalate");
+        assert!(
+            msg.contains("the element the probe watched is gone"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn an_element_that_merely_stopped_answering_is_not_a_reaction() {
+        let before = signals(state("AXButton|Search||"), Some("f"), Some(9));
+        let after = signals(ElementRead::Unreadable, Some("f"), Some(9));
+        assert_eq!(classify(&before, &after, true), Evidence::Unchanged);
+    }
+
+    #[test]
+    fn an_element_unreadable_before_the_dispatch_claims_nothing_after() {
+        let before = signals(ElementRead::Unreadable, None, None);
+        let after = signals(ElementRead::Gone, None, None);
+        assert_eq!(classify(&before, &after, true), Evidence::Unusable);
+    }
+
+    #[test]
     fn focus_move_is_delivery_evidence_when_element_state_holds() {
-        let before = signals(Some("AXButton|New Item||"), Some("AXWebArea|doc"), Some(7));
+        let before = signals(state("AXButton|New Item||"), Some("AXWebArea|doc"), Some(7));
         let after = signals(
-            Some("AXButton|New Item||"),
+            state("AXButton|New Item||"),
             Some("AXButton|New Item"),
             Some(7),
         );
@@ -537,8 +710,8 @@ mod tests {
 
     #[test]
     fn quiescent_window_reports_subtree_change() {
-        let before = signals(Some("AXButton|b||"), Some("f"), Some(11));
-        let after = signals(Some("AXButton|b||"), Some("f"), Some(12));
+        let before = signals(state("AXButton|b||"), Some("f"), Some(11));
+        let after = signals(state("AXButton|b||"), Some("f"), Some(12));
         assert_eq!(
             classify(&before, &after, true),
             Evidence::Changed("window_tree")
@@ -547,29 +720,71 @@ mod tests {
 
     #[test]
     fn self_updating_window_never_counts_as_delivery() {
-        let before = signals(Some("AXButton|b||"), Some("f"), Some(11));
-        let after = signals(Some("AXButton|b||"), Some("f"), Some(12));
+        let before = signals(state("AXButton|b||"), Some("f"), Some(11));
+        let after = signals(state("AXButton|b||"), Some("f"), Some(12));
         assert_eq!(classify(&before, &after, false), Evidence::Unchanged);
     }
 
     #[test]
     fn every_usable_signal_identical_is_unchanged() {
-        let before = signals(Some("AXButton|b||"), Some("f"), Some(11));
-        let after = signals(Some("AXButton|b||"), Some("f"), Some(11));
+        let before = signals(state("AXButton|b||"), Some("f"), Some(11));
+        let after = signals(state("AXButton|b||"), Some("f"), Some(11));
         assert_eq!(classify(&before, &after, true), Evidence::Unchanged);
     }
 
     #[test]
     fn one_sided_reads_are_unknown_not_change() {
-        let before = signals(Some("AXButton|b||"), None, None);
-        let after = signals(None, Some("f"), Some(4));
+        let before = signals(state("AXButton|b||"), None, None);
+        let after = signals(ElementRead::Unreadable, Some("f"), Some(4));
         assert_eq!(classify(&before, &after, true), Evidence::Unusable);
     }
 
     #[test]
     fn detached_element_with_readable_focus_still_compares_focus() {
-        let before = signals(None, Some("AXWebArea|doc"), None);
-        let after = signals(None, Some("AXWebArea|doc"), None);
+        let before = signals(ElementRead::Unreadable, Some("AXWebArea|doc"), None);
+        let after = signals(ElementRead::Unreadable, Some("AXWebArea|doc"), None);
         assert_eq!(classify(&before, &after, true), Evidence::Unchanged);
+    }
+
+    #[test]
+    fn capture_owns_the_element_it_watches() {
+        // The crash this guards: `capture` used to keep a bare pointer, so the
+        // element only lived as long as whatever the caller happened to hold.
+        // `press_key` released its focused-element reference before
+        // `compare()` ran, and reading a freed AXUIElementRef traps inside
+        // CoreFoundation instead of returning an error.
+        //
+        // A never-running pid answers every AX read immediately, so this
+        // exercises the ownership without needing a live window.
+        let element = unsafe { AXUIElementCreateApplication(-1) };
+        assert!(!element.is_null(), "AXUIElementCreateApplication");
+        let count = || unsafe { CFGetRetainCount(element as CFTypeRef) };
+        let base = count();
+
+        let probe = DeliveryProbe::capture(-1, 0, Some(element as usize));
+        assert_eq!(
+            count(),
+            base + 1,
+            "the probe must hold the watched element itself"
+        );
+
+        drop(probe);
+        assert_eq!(count(), base, "and give the reference back when dropped");
+        unsafe { CFRelease(element as CFTypeRef) };
+    }
+
+    #[test]
+    fn an_invalid_element_reads_as_gone_and_any_other_error_does_not() {
+        // What a retained-but-destroyed element answers: AX reports
+        // kAXErrorInvalidUIElement instead of trapping, and only that error
+        // means the element is gone. An app that cannot be reached at all
+        // (kAXErrorCannotComplete) says nothing about its elements.
+        let invalid = unsafe { AXUIElementCreateApplication(-1) }; // no such process
+        let guard = unsafe { OwnedElement::adopt(invalid) }.expect("element");
+        assert_eq!(element_state(&guard), ElementRead::Gone);
+
+        let unreachable = unsafe { AXUIElementCreateApplication(999_999) }; // above pid_max
+        let guard = unsafe { OwnedElement::adopt(unreachable) }.expect("element");
+        assert_eq!(element_state(&guard), ElementRead::Unreadable);
     }
 }

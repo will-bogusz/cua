@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use core_foundation::base::CFRelease;
 use cua_driver_contract::PressKeyInput;
 use cua_driver_core::{
     action_record::{
@@ -18,6 +17,7 @@ use crate::apps;
 use crate::ax::bindings::{
     copy_bool_attr, copy_string_attr, focused_element_of_pid, AXUIElementRef,
 };
+use crate::ax::OwnedElement;
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 
@@ -131,17 +131,23 @@ fn dispatch_with_ax_oracle(
     explicit_element_ptr: Option<usize>,
     dispatch: impl FnOnce(&mut dyn FnMut()) -> anyhow::Result<()>,
 ) -> anyhow::Result<(bool, Option<delivery_probe::DeliveryProbe>)> {
-    let (element_ptr, owns_element) = match explicit_element_ptr {
-        Some(ptr) => (Some(ptr), false),
+    // The focused element the oracle and the probe watch must outlive the
+    // dispatch that may destroy it, so it is owned here for the whole call
+    // (an explicit element already arrives held by the element cache).
+    let owned_focus = match explicit_element_ptr {
+        Some(_) => None,
+        // SAFETY: both resolvers return a `+1` reference, which the guard
+        // takes over and releases when this function returns.
         None => unsafe {
             match window_id {
                 Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
                 None => focused_element_of_pid(pid),
             }
-        }
-        .map(|element| (Some(element as usize), true))
-        .unwrap_or((None, false)),
+            .and_then(|element| OwnedElement::adopt(element))
+        },
     };
+    let element_ptr =
+        explicit_element_ptr.or_else(|| owned_focus.as_ref().map(OwnedElement::as_ptr));
     let before = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
     let mut probe = None;
     let result = {
@@ -163,11 +169,6 @@ fn dispatch_with_ax_oracle(
         std::thread::sleep(std::time::Duration::from_millis(60));
     }
     let after = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
-    if owns_element {
-        if let Some(ptr) = element_ptr {
-            unsafe { CFRelease(ptr as _) };
-        }
-    }
     result?;
     let changed =
         matches!((before, after), (Some(before), Some(after)) if ax_state_changed(&before, &after));
