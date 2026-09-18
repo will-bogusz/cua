@@ -438,6 +438,7 @@ impl Tool for TypeTextTool {
                     path,
                     verified,
                     delivered_chars,
+                    destination_resolved,
                 } = outcome;
                 // SURFACE-AWARE VERIFICATION. On any web-content surface —
                 // Chromium/WebKit/Electron — AXValue is not independent renderer
@@ -463,36 +464,37 @@ impl Tool for TypeTextTool {
                 // CGEvent rung the app may have dropped). Don't dress that as a
                 // confirmed insert — tell the agent to look, and point at the
                 // right next rung.
+                let unconfirmed =
+                    Unconfirmed::of(destination_resolved, untrusted_web_readback, path);
                 let (mark, note) = if verified {
                     ("✅ Inserted", String::new())
-                } else if untrusted_web_readback {
-                    let next_step = if electron_web_content && used_pixel_focus {
-                        "The pixel-focus rung already ran, so do not repeat it; verify the \
-                         result via the screenshot."
-                    } else {
-                        "For a browser tab use the `page` tool (it drives the DOM); for an \
-                         embedded web view, re-type with the px form (x,y)."
-                    };
-                    (
-                        "📨 Sent (unverified)",
-                        format!(
-                            " — web-content surface (Chromium / WebKit / Electron): \
-                             AXValue read-back is not independent proof that the \
-                             renderer/DOM observed the input. {next_step}"
-                        ),
-                    )
-                } else if path == PATH_KEY_EVENTS_FG {
-                    (
-                        "📨 Sent (unverified)",
-                        " — driver could not confirm; verify via screenshot.".to_string(),
-                    )
                 } else {
-                    (
-                        "📨 Sent (unverified)",
-                        " — driver could not confirm the text landed; verify via screenshot, \
-                      and re-call with delivery_mode:\"foreground\" if it didn't."
-                            .to_string(),
-                    )
+                    let note = match unconfirmed {
+                        Unconfirmed::NoDestination => no_destination_note(pid, window_id),
+                        Unconfirmed::WebReadback => {
+                            let next_step = if electron_web_content && used_pixel_focus {
+                                "The pixel-focus rung already ran, so do not repeat it; verify \
+                                 the result via the screenshot."
+                            } else {
+                                "For a browser tab use the `page` tool (it drives the DOM); for \
+                                 an embedded web view, re-type with the px form (x,y)."
+                            };
+                            format!(
+                                " — web-content surface (Chromium / WebKit / Electron): \
+                                 AXValue read-back is not independent proof that the \
+                                 renderer/DOM observed the input. {next_step}"
+                            )
+                        }
+                        Unconfirmed::ForegroundKeystrokes => {
+                            " — driver could not confirm; verify via screenshot.".to_string()
+                        }
+                        Unconfirmed::BackgroundKeystrokes => {
+                            " — driver could not confirm the text landed; verify via screenshot, \
+                              and re-call with delivery_mode:\"foreground\" if it didn't."
+                                .to_string()
+                        }
+                    };
+                    ("📨 Sent (unverified)", note)
                 };
                 // A native single-line text control's value is a binding
                 // target: AppKit hands it to the app's own model when the edit
@@ -569,12 +571,13 @@ impl Tool for TypeTextTool {
                                 "reason": reason,
                             });
                         }
-                    } else if !verified && path != PATH_KEY_EVENTS_FG {
+                    } else if let Some(target) = (!verified)
+                        .then(|| unconfirmed.escalation_target())
+                        .flatten()
+                    {
                         s["escalation"] = serde_json::json!({
-                            "recommended": "foreground",
-                            "reason": "background insert could not be confirmed — \
-                                       re-call with delivery_mode:\"foreground\" if a \
-                                       screenshot shows the text didn't land."
+                            "recommended": target,
+                            "reason": "effect_unconfirmed",
                         });
                     }
                     s
@@ -761,6 +764,62 @@ fn path_has_untrusted_web_readback(path: &str) -> bool {
     path == PATH_AX || path == PATH_KEY_EVENTS || path == PATH_KEY_EVENTS_FG
 }
 
+/// Why an insertion's read-back could not confirm it, in precedence order.
+///
+/// The escalation target follows from the state, not from the path token: a
+/// request that never resolved a field cannot be helped by fronting the
+/// window or by re-capturing it, because neither produces a field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unconfirmed {
+    NoDestination,
+    WebReadback,
+    ForegroundKeystrokes,
+    BackgroundKeystrokes,
+}
+
+impl Unconfirmed {
+    fn of(destination_resolved: bool, untrusted_web_readback: bool, path: &str) -> Self {
+        if !destination_resolved {
+            Self::NoDestination
+        } else if untrusted_web_readback {
+            Self::WebReadback
+        } else if path == PATH_KEY_EVENTS_FG {
+            Self::ForegroundKeystrokes
+        } else {
+            Self::BackgroundKeystrokes
+        }
+    }
+
+    /// The rung that can still deliver, or `None` when this state has no
+    /// better one. `WebReadback` chooses between `px` and `page` from surface
+    /// facts the caller holds.
+    fn escalation_target(self) -> Option<&'static str> {
+        match self {
+            Self::NoDestination => Some("element"),
+            Self::WebReadback | Self::ForegroundKeystrokes => None,
+            Self::BackgroundKeystrokes => Some("foreground"),
+        }
+    }
+}
+
+/// The reply for keystrokes posted with no resolvable text destination.
+///
+/// Catalyst-style targets accept keystrokes without publishing
+/// `AXFocusedUIElement`, so the post is still worth making — but there is no
+/// field to focus and none to read back, and a capture cannot supply one.
+/// State that, and name the one addressing form that can.
+fn no_destination_note(pid: i32, window_id: Option<u32>) -> String {
+    let scope = match window_id {
+        Some(window_id) => format!("window {window_id}"),
+        None => format!("pid {pid}"),
+    };
+    format!(
+        " — no focused text element could be resolved in {scope}, so the keystrokes were \
+         posted blind and no field can be read back. Address the field itself: pass \
+         element_index (or element_token) for it on this call, or use set_value."
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SurfaceVerification {
     verified: bool,
@@ -875,6 +934,9 @@ struct TypeTextOutcome {
     /// Exact when AX exposed the target value. `None` means delivery could not
     /// be observed, so the existing unverifiable contract remains in force.
     delivered_chars: Option<usize>,
+    /// Whether a text destination resolved at all. `false` means the
+    /// keystrokes were posted with nothing to focus and no value to read.
+    destination_resolved: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1243,6 +1305,19 @@ impl Drop for OwnedElement {
     }
 }
 
+/// The focused element `type_text` may address, retained. A window-addressed
+/// request may only use focus that provably belongs to that exact window: a
+/// sibling window's focused field is not the requested target.
+fn resolve_window_focus(pid: i32, window_id: Option<u32>) -> Option<OwnedElement> {
+    match window_id {
+        Some(window_id) => {
+            unsafe { crate::ax::exact_target::focused_element_in_window(pid, window_id) }
+                .map(OwnedElement)
+        }
+        None => unsafe { focused_element_of_pid(pid) }.map(OwnedElement),
+    }
+}
+
 /// Best-effort-background ladder for `type_text`.
 ///
 /// - `delivery_mode == Background` (default): AX insert → read-back; on a
@@ -1269,17 +1344,14 @@ fn type_text_blocking(
     // that window.
     let resolved_focus = match element_ptr_and_idx {
         Some(_) => None,
-        None => match window_id {
-            Some(wid) => unsafe { crate::ax::exact_target::focused_element_in_window(pid, wid) }
-                .map(OwnedElement),
-            None => unsafe { focused_element_of_pid(pid) }.map(OwnedElement),
-        },
+        None => resolve_window_focus(pid, window_id),
     };
     let target = element_ptr_and_idx.or_else(|| {
         resolved_focus
             .as_ref()
             .map(|element| (element.as_ptr(), None))
     });
+    let destination_resolved = target.is_some();
 
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty.
@@ -1316,13 +1388,23 @@ fn type_text_blocking(
         // dropped. 200ms covers that re-grab without penalizing an already
         // armed interactive stream on every text chunk.
         let foreground_settle_ms = foreground_settle_ms(pid, apps::frontmost_pid());
-        let do_type = || {
+        // Focus resolved before the front is the stronger target: the
+        // activation installs the window's remembered first responder, which
+        // is not what the agent addressed. When nothing resolved, look again
+        // inside the activation rather than typing blind.
+        let mut late_focus: Option<OwnedElement> = None;
+        let mut destination = target;
+        let mut do_type = || {
+            if destination.is_none() {
+                late_focus = resolve_window_focus(pid, window_id);
+                destination = late_focus.as_ref().map(|element| (element.as_ptr(), None));
+            }
             cgevent_type_verified(
                 pid,
                 text,
                 delay_ms,
                 before.as_deref(),
-                target,
+                destination,
                 foreground_settle_ms,
                 window_id,
             )
@@ -1380,6 +1462,7 @@ fn type_text_blocking(
             },
             delivered_chars,
             verified,
+            destination_resolved: destination.is_some(),
         }));
     }
 
@@ -1420,6 +1503,7 @@ fn type_text_blocking(
             path: PATH_KEY_EVENTS,
             verified,
             delivered_chars,
+            destination_resolved,
         }));
     }
 
@@ -1472,6 +1556,7 @@ fn type_text_blocking(
                 path: PATH_AX,
                 verified: true,
                 delivered_chars: Some(text.chars().count()),
+                destination_resolved: true,
             }));
         }
         if let Some(TypedProgress::Partial(delivered_chars)) = ax_progress {
@@ -1481,6 +1566,7 @@ fn type_text_blocking(
                 path: PATH_AX,
                 verified: false,
                 delivered_chars: Some(delivered_chars),
+                destination_resolved: true,
             }));
         }
         ax_attempt = match ax_progress {
@@ -1534,12 +1620,57 @@ fn type_text_blocking(
         path: PATH_KEY_EVENTS,
         verified,
         delivered_chars,
+        destination_resolved,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request that resolved no text destination escalates to the element
+    /// on BOTH keystroke paths. The foreground rung used to be excluded from
+    /// escalation entirely, so a window-scoped foreground type that landed
+    /// nowhere told the agent only to look at a screenshot.
+    #[test]
+    fn no_text_destination_escalates_to_the_element_on_either_path() {
+        for path in [PATH_KEY_EVENTS, PATH_KEY_EVENTS_FG, PATH_AX] {
+            let state = Unconfirmed::of(
+                /*destination_resolved=*/ false, /*untrusted_web_readback=*/ false, path,
+            );
+            assert_eq!(state, Unconfirmed::NoDestination, "{path}");
+            assert_eq!(state.escalation_target(), Some("element"), "{path}");
+        }
+    }
+
+    /// The no-destination state outranks the web-content surface: without a
+    /// field there is no read-back to distrust, and `px`/`page` cannot supply
+    /// one either.
+    #[test]
+    fn no_text_destination_outranks_the_web_readback_state() {
+        assert_eq!(
+            Unconfirmed::of(false, true, PATH_KEY_EVENTS),
+            Unconfirmed::NoDestination
+        );
+    }
+
+    /// With a destination in hand the path still decides: the background rung
+    /// can escalate to foreground, the foreground rung is already last.
+    #[test]
+    fn a_resolved_destination_escalates_by_path() {
+        assert_eq!(
+            Unconfirmed::of(true, false, PATH_KEY_EVENTS).escalation_target(),
+            Some("foreground")
+        );
+        assert_eq!(
+            Unconfirmed::of(true, false, PATH_KEY_EVENTS_FG).escalation_target(),
+            None
+        );
+        assert_eq!(
+            Unconfirmed::of(true, true, PATH_KEY_EVENTS).escalation_target(),
+            None
+        );
+    }
 
     /// Sanity-check that the terminal short-circuit can be expressed as a
     /// pure function of `is_terminal_target`: when true, the code goes
