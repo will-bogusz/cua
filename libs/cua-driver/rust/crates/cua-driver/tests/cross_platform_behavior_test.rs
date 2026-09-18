@@ -913,6 +913,7 @@ fn sdk_background_click(fixture: &Fixture, token: String) -> ClickInput {
         session: None,
         button: None,
         count: None,
+        detect_window_change: None,
     }
 }
 
