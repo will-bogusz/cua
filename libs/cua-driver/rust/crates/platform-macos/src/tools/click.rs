@@ -185,6 +185,21 @@ fn dispatch_ax_action(
     }
 }
 
+/// The requested AX action and whether the caller named it; an omitted `action` is a plain click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestedAction<'a> {
+    action: &'a str,
+    named_by_caller: bool,
+}
+
+fn press_route_advice(press_is_advertised: bool) -> &'static str {
+    if press_is_advertised {
+        " The row's own press action is available as perform(\"press\")."
+    } else {
+        ""
+    }
+}
+
 /// What a reply to `AXUIElementPerformAction` licenses the driver to do next.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AxReplyDisposition {
@@ -638,6 +653,7 @@ impl Tool for ClickTool {
         let y = args
             .opt_f64("y")
             .or_else(|| args.opt_i64("y").map(|i| i as f64));
+        let action_named_by_caller = args.opt_str("action").is_some();
         let action = args.str_or("action", "press");
         // Surface 5: optional `button` arg, default "left" preserves legacy behaviour.
         // Pixel path: routes to left/right/middle CGEvent primitives.
@@ -1006,7 +1022,10 @@ impl Tool for ClickTool {
                                     idx,
                                     pid,
                                     wid,
-                                    &action_clone,
+                                    RequestedAction {
+                                        action: &action_clone,
+                                        named_by_caller: action_named_by_caller,
+                                    },
                                     &ck,
                                     selection_pixel,
                                     menu_pixel,
@@ -1040,7 +1059,10 @@ impl Tool for ClickTool {
                                 idx,
                                 pid,
                                 wid,
-                                &action_clone,
+                                RequestedAction {
+                                    action: &action_clone,
+                                    named_by_caller: action_named_by_caller,
+                                },
                                 &ck,
                                 selection_pixel,
                                 menu_pixel,
@@ -1835,7 +1857,7 @@ fn perform_ax_click(
     idx: usize,
     pid: i32,
     window_id: u32,
-    action_str: &str,
+    requested: RequestedAction<'_>,
     cursor_key: &str,
     selection_pixel: Option<SelectionPixelTarget>,
     menu_pixel: Option<SelectionPixelTarget>,
@@ -1847,9 +1869,9 @@ fn perform_ax_click(
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
     let advertised = crate::ax::actions::split(unsafe { copy_action_names(element) });
-    let ax_action = resolve_ax_action(action_str, &advertised).ok_or_else(|| {
+    let ax_action = resolve_ax_action(requested.action, &advertised).ok_or_else(|| {
         anyhow::Error::new(UnknownAxAction {
-            requested: action_str.to_owned(),
+            requested: requested.action.to_owned(),
             advertised: advertised.names(),
         })
     })?;
@@ -1863,11 +1885,19 @@ fn perform_ax_click(
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
 
-    // A click on an AppKit collection item is frequently represented by a
-    // label child or row that does not advertise AXPress. Prefer a bounded,
-    // read-back-verified AXSelected write over dispatching a known hollow press
-    // or forcing the caller onto a less stable pixel coordinate.
-    if ax_action == "AXPress" && !advertised.advertises(&ax_action) {
+    // On a collection row the pointer gesture is select, so a plain click takes
+    // the bounded, read-back-verified AXSelected write whether or not the
+    // element advertises AXPress: press is the application's own default
+    // action, reachable only when the caller names it. Elsewhere this is still
+    // the path for an item whose selectable object is an ancestor.
+    let press_is_advertised = advertised.advertises(&ax_action);
+    if ax_action == "AXPress"
+        && (!press_is_advertised
+            || (!requested.named_by_caller
+                && crate::input::ax_actions::click_selects_role(&role)
+                && crate::input::ax_actions::exposes_selected(element_ptr)))
+    {
+        let press_route = press_route_advice(press_is_advertised);
         if modifiers.is_empty() {
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr)
@@ -1875,7 +1905,7 @@ fn perform_ax_click(
                 return Ok(AxClickOutcome {
                     summary: format!(
                         "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\"; \
-                         confirmed AXSelected=true."
+                         confirmed AXSelected=true.{press_route}"
                     ),
                     selection_verified: true,
                     ..AxClickOutcome::default()
@@ -1947,7 +1977,7 @@ fn perform_ax_click(
                                         "✅ Selected nearest {selected_role} for [{idx}] {role} \
                                          \"{title}\"; AX selection write was unavailable, so a \
                                          coordinate click was delivered and confirmed by stable \
-                                         AXSelected read-back."
+                                         AXSelected read-back.{press_route}"
                                     ),
                                     selection_verified: true,
                                     selection_via_pixel: true,

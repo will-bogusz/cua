@@ -9,6 +9,16 @@ fn is_selectable_container_role(role: &str) -> bool {
     matches!(role, "AXRow" | "AXCell" | "AXListItem" | "AXImage")
 }
 
+/// Roles whose pointer gesture is *select*; `AXImage` is excluded because an image button owns a real press.
+pub fn click_selects_role(role: &str) -> bool {
+    matches!(role, "AXRow" | "AXCell" | "AXListItem")
+}
+
+/// Whether the element itself publishes a readable `AXSelected` state.
+pub fn exposes_selected(element_ptr: usize) -> bool {
+    unsafe { copy_bool_attr(element_ptr as AXUIElementRef, "AXSelected") }.is_some()
+}
+
 /// Select the nearest list-like element at or above `element_ptr` and confirm
 /// the write through `AXSelected` read-back.
 ///

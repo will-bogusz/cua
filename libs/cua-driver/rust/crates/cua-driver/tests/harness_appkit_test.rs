@@ -853,9 +853,7 @@ fn harness_appkit_set_value_commits_the_edit() {
             // value. `committed=commit-cua` is the commit label; a bare
             // `commit-cua` static text can only be the mirror.
             assert!(
-                after
-                    .tree_text()
-                    .contains("AXStaticText = \"commit-cua\""),
+                after.tree_text().contains("AXStaticText = \"commit-cua\""),
                 "controlTextDidChange never fired, so the value was echoed rather than typed:\n{}",
                 after.tree_text()
             );
@@ -965,6 +963,81 @@ fn harness_appkit_click_on_a_text_role_focuses_it() {
                 after.tree_text().contains("focus-cua"),
                 "the click did not leave the field focused:\n{}",
                 after.tree_text()
+            );
+        },
+    );
+}
+
+/// A collection row that advertises `AXPress` used to have that press
+/// dispatched by a plain `click`, so Reminders completed a reminder where
+/// every other app selected a row. A click on a row means select; the row's
+/// own default action stays reachable through a named `action:"press"`.
+#[test]
+#[ignore]
+fn harness_appkit_click_on_a_selectable_row_selects_without_pressing() {
+    run_background_case(
+        "click_selectable_row",
+        DriverRoute::MacosAxValue,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before
+                    .tree_text()
+                    .contains("row_pressed=0 row_selected=false"),
+                "pressable row did not start unselected and unpressed:\n{}",
+                before.tree_text()
+            );
+            let clicked = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "row-pressable")
+                }),
+            );
+            assert!(!clicked.is_error(), "click failed: {}", clicked.text());
+            assert!(
+                clicked.text().contains("Selected nearest AXRow"),
+                "a plain click on a selectable row did not take the select route: {}",
+                clicked.text()
+            );
+            assert!(
+                clicked.text().contains("perform(\"press\")"),
+                "the reply did not name the row's own press action: {}",
+                clicked.text()
+            );
+            assert_eq!(
+                clicked.action_effect(),
+                Some("confirmed"),
+                "selecting a row is read-back verifiable: {}",
+                clicked.raw
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after
+                    .tree_text()
+                    .contains("row_pressed=0 row_selected=true"),
+                "the click pressed the row instead of selecting it:\n{}",
+                after.tree_text()
+            );
+
+            let pressed = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&after, "row-pressable"),
+                    "action": "press"
+                }),
+            );
+            assert!(!pressed.is_error(), "press failed: {}", pressed.text());
+            std::thread::sleep(Duration::from_millis(300));
+            let post = snapshot_elements(driver, pid, wid);
+            assert!(
+                post.tree_text().contains("row_pressed=1"),
+                "a named press did not reach the row's own action:\n{}",
+                post.tree_text()
             );
         },
     );
