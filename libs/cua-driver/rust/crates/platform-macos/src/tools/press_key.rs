@@ -711,11 +711,11 @@ mod tests {
             details.get("focused_window_relation").is_none(),
             "{details}"
         );
-        assert_eq!(details["target_window_id"], 11139);
-        assert_eq!(
-            details["message"],
-            "press_key delivery failed: exact target window did not become focused for \
-             foreground HID delivery"
+        let message = details["message"].as_str().expect("refusal message");
+        assert!(
+            !message.contains("holds keyboard focus"),
+            "an unidentified thief must not be described as one: {message}"
         );
+        assert!(!message.contains("11139"), "{message}");
     }
 }

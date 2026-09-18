@@ -804,7 +804,7 @@ impl ForegroundActivationRefused {
 
 impl std::fmt::Display for ForegroundActivationRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("exact target window did not become focused for foreground HID delivery")?;
+        f.write_str("exact target window did not become the application's key window")?;
         let Some(focused) = self.focused_window_id else {
             return Ok(());
         };
