@@ -13,7 +13,25 @@ use crate::apps;
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 
+use super::delivery_probe;
 use super::ToolState;
+
+/// What the probe watched, and what it means for a chord that moved nothing.
+///
+/// A chord's effect is whatever the application binds it to, so the probe can
+/// only report that nothing observable reacted. It is never turned into a
+/// retry: the post may have landed invisibly, and pressing twice is worse.
+fn chord_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
+    delivery_probe::NoopReport {
+        signals: if polled {
+            "focused element, app focus, window contents, new windows"
+        } else {
+            "focused element, app focus, window contents"
+        },
+        escalation: None,
+        advice: "",
+    }
+}
 
 pub struct HotkeyTool {
     state: Arc<ToolState>,
@@ -406,75 +424,101 @@ impl Tool for HotkeyTool {
             prior_front,
             "hotkey.CGEvent",
             || async move {
-                cua_driver_core::operation::spawn_blocking(move || {
-                    let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                    match (fg, coordinate_focus, window_id, element_ptr) {
-                        // Chrome's native omnibox and Chromium/Electron inputs
-                        // require a genuine foreground HID chord. Keep the exact
-                        // target frontmost until both key events are consumed;
-                        // otherwise Cmd+A/Cmd+V can be silently ignored.
-                        (true, true, Some(wid), _) => {
-                            crate::input::skylight::with_foreground_hid_activation(
-                                pid as libc::pid_t,
+                cua_driver_core::operation::spawn_blocking(
+                    move || -> anyhow::Result<Option<delivery_probe::DeliveryProbe>> {
+                        let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                        // Capture immediately before the key events, inside any
+                        // activation: fronting the window moves the app's focused
+                        // element itself, and that move is not the chord's effect.
+                        let mut probe = None;
+                        let mut capture = |wid: u32| {
+                            probe = Some(delivery_probe::DeliveryProbe::capture(
+                                pid,
                                 wid,
-                                || {
-                                    if screen_sharing_target {
+                                element_ptr,
+                            ));
+                        };
+                        match (fg, coordinate_focus, window_id, element_ptr) {
+                            // Chrome's native omnibox and Chromium/Electron inputs
+                            // require a genuine foreground HID chord. Keep the exact
+                            // target frontmost until both key events are consumed;
+                            // otherwise Cmd+A/Cmd+V can be silently ignored.
+                            (true, true, Some(wid), _) => {
+                                crate::input::skylight::with_foreground_hid_activation(
+                                    pid as libc::pid_t,
+                                    wid,
+                                    || {
+                                        capture(wid);
+                                        if screen_sharing_target {
+                                            crate::input::keyboard::press_key_bare_global(&key, &m)
+                                        } else {
+                                            crate::input::keyboard::press_key_global(&key, &m)
+                                        }
+                                    },
+                                )?;
+                            }
+                            // An AX-addressed chord has the same renderer-focus
+                            // requirement as the px form. Activate the exact window,
+                            // establish and confirm the requested child focus after
+                            // activation, then use the guarded global HID queue.
+                            (true, false, Some(wid), Some(ptr)) => {
+                                crate::input::skylight::with_foreground_hid_activation(
+                                    pid as libc::pid_t,
+                                    wid,
+                                    || {
+                                        focus_hotkey_element(pid, ptr)?;
+                                        capture(wid);
                                         crate::input::keyboard::press_key_bare_global(&key, &m)
-                                    } else {
-                                        crate::input::keyboard::press_key_global(&key, &m)
-                                    }
-                                },
-                            )?;
-                            Ok(())
+                                    },
+                                )?;
+                            }
+                            // Screen Sharing is an input forwarder: modifier flags
+                            // on a PID-routed base-key event are not relayed to the
+                            // guest. Emit the physical modifier down/base/up
+                            // sequence through the guarded foreground HID path.
+                            (true, false, Some(wid), None)
+                                if crate::input::keyboard::is_screen_sharing_pid(pid) =>
+                            {
+                                crate::input::skylight::with_foreground_hid_activation(
+                                    pid as libc::pid_t,
+                                    wid,
+                                    || {
+                                        capture(wid);
+                                        crate::input::keyboard::press_key_bare_global(&key, &m)
+                                    },
+                                )?;
+                            }
+                            // foreground rung: briefly front the window so NSMenu key
+                            // equivalents dispatch, then restore prior frontmost.
+                            (true, false, Some(wid), None) => {
+                                crate::input::skylight::with_menu_shortcut_activation(
+                                    pid as libc::pid_t,
+                                    wid,
+                                    || {
+                                        capture(wid);
+                                        crate::input::keyboard::hotkey_no_auth(pid, &key, &m)
+                                    },
+                                )?;
+                            }
+                            // background (default): auth-envelope post to the pid, no
+                            // raise — even when window_id was supplied for targeting.
+                            (false, false, _, Some(ptr)) => {
+                                focus_hotkey_element(pid, ptr)?;
+                                if let Some(wid) = window_id {
+                                    capture(wid);
+                                }
+                                crate::input::keyboard::hotkey(pid, &key, &m)?;
+                            }
+                            _ => {
+                                if let Some(wid) = window_id {
+                                    capture(wid);
+                                }
+                                crate::input::keyboard::hotkey(pid, &key, &m)?;
+                            }
                         }
-                        // An AX-addressed chord has the same renderer-focus
-                        // requirement as the px form. Activate the exact window,
-                        // establish and confirm the requested child focus after
-                        // activation, then use the guarded global HID queue.
-                        (true, false, Some(wid), Some(ptr)) => {
-                            crate::input::skylight::with_foreground_hid_activation(
-                                pid as libc::pid_t,
-                                wid,
-                                || {
-                                    focus_hotkey_element(pid, ptr)?;
-                                    crate::input::keyboard::press_key_bare_global(&key, &m)
-                                },
-                            )?;
-                            Ok(())
-                        }
-                        // Screen Sharing is an input forwarder: modifier flags
-                        // on a PID-routed base-key event are not relayed to the
-                        // guest. Emit the physical modifier down/base/up
-                        // sequence through the guarded foreground HID path.
-                        (true, false, Some(wid), None)
-                            if crate::input::keyboard::is_screen_sharing_pid(pid) =>
-                        {
-                            crate::input::skylight::with_foreground_hid_activation(
-                                pid as libc::pid_t,
-                                wid,
-                                || crate::input::keyboard::press_key_bare_global(&key, &m),
-                            )?;
-                            Ok(())
-                        }
-                        // foreground rung: briefly front the window so NSMenu key
-                        // equivalents dispatch, then restore prior frontmost.
-                        (true, false, Some(wid), None) => {
-                            crate::input::skylight::with_menu_shortcut_activation(
-                                pid as libc::pid_t,
-                                wid,
-                                || crate::input::keyboard::hotkey_no_auth(pid, &key, &m),
-                            )?;
-                            Ok(())
-                        }
-                        // background (default): auth-envelope post to the pid, no
-                        // raise — even when window_id was supplied for targeting.
-                        (false, false, _, Some(ptr)) => {
-                            focus_hotkey_element(pid, ptr)?;
-                            crate::input::keyboard::hotkey(pid, &key, &m)
-                        }
-                        _ => crate::input::keyboard::hotkey(pid, &key, &m),
-                    }
-                })
+                        Ok(probe)
+                    },
+                )
                 .await
             },
         )
@@ -483,15 +527,42 @@ impl Tool for HotkeyTool {
         let changes = super::finish_window_observation(snapshot, &args).await;
 
         match result {
-            Ok(Ok(())) => {
+            Ok(Ok(probe)) => {
                 let label = if fg {
                     " (delivery_mode:foreground)"
                 } else {
                     ""
                 };
-                // A combo is never read-back-verifiable. On the background rung,
-                // point the agent at the foreground escalation for menu shortcuts
-                // an app drops in the background — same contract as type_text.
+                let evidence = if changes.needs_restore() {
+                    probe.as_ref().map(|probe| {
+                        probe.settled(delivery_probe::Evidence::Changed(
+                            delivery_probe::WINDOW_SIGNAL,
+                        ))
+                    })
+                } else if let Some(probe) = probe {
+                    cua_driver_core::operation::spawn_blocking(move || probe.compare())
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                let window_change = if evidence.is_some() && changes.needs_restore() {
+                    let appeared = changes.new_windows.clone();
+                    cua_driver_core::operation::spawn_blocking(move || {
+                        delivery_probe::WindowChangeEvidence::observe(pid, window_id, &appeared)
+                    })
+                    .await
+                    .ok()
+                } else {
+                    None
+                };
+                let mut msg = format!(
+                    "Pressed {key_display} on pid {pid}{label}.{}",
+                    changes.result_suffix()
+                );
+                // A combo has no general postcondition, so the reply never
+                // claims the intended effect; the probe answers only whether
+                // the target reacted at all.
                 let mut structured = serde_json::json!({
                     "path": if fg { "key_events_fg" } else { "key_events" },
                     "verified": false,
@@ -506,11 +577,16 @@ impl Tool for HotkeyTool {
                                    pixel-click to focus then type_text instead.)"
                     });
                 }
-                ToolResult::text(format!(
-                    "Pressed {key_display} on pid {pid}{label}.{}",
-                    changes.result_suffix()
-                ))
-                .with_structured(structured)
+                if let Some(outcome) = evidence {
+                    delivery_probe::apply_evidence(
+                        &mut msg,
+                        &mut structured,
+                        outcome,
+                        chord_noop_report(changes.polled),
+                        window_change.as_ref(),
+                    );
+                }
+                ToolResult::text(msg).with_structured(structured)
             }
             Ok(Err(e)) => ToolResult::error(format!("hotkey failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),

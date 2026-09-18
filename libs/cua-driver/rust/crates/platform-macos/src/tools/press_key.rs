@@ -21,6 +21,7 @@ use crate::ax::bindings::{
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 
+use super::delivery_probe;
 use super::ToolState;
 
 pub struct PressKeyTool {
@@ -41,18 +42,38 @@ struct AxKeyState {
     selected: Option<bool>,
 }
 
-#[derive(Debug)]
 enum PressKeyDeliveryOutcome {
     Confirmed,
-    Unverifiable,
+    /// The addressed control's own value/selection did not move, so the
+    /// delivery probe's wider verdict is what the reply has to carry.
+    Unverifiable(Option<delivery_probe::DeliveryProbe>),
     Failed(anyhow::Error),
 }
 
-fn map_delivery_outcome(result: anyhow::Result<bool>) -> PressKeyDeliveryOutcome {
+fn map_delivery_outcome(
+    result: anyhow::Result<(bool, Option<delivery_probe::DeliveryProbe>)>,
+) -> PressKeyDeliveryOutcome {
     match result {
-        Ok(true) => PressKeyDeliveryOutcome::Confirmed,
-        Ok(false) => PressKeyDeliveryOutcome::Unverifiable,
+        Ok((true, _)) => PressKeyDeliveryOutcome::Confirmed,
+        Ok((false, probe)) => PressKeyDeliveryOutcome::Unverifiable(probe),
         Err(error) => PressKeyDeliveryOutcome::Failed(error),
+    }
+}
+
+/// What the probe watched, for a key press whose control did not move.
+///
+/// A single key has no general postcondition either, so the probe reports only
+/// whether anything reacted. It is never turned into a retry: the post may
+/// have landed invisibly, and pressing twice is worse.
+fn key_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
+    delivery_probe::NoopReport {
+        signals: if polled {
+            "focused element, app focus, window contents, new windows"
+        } else {
+            "focused element, app focus, window contents"
+        },
+        escalation: None,
+        advice: "",
     }
 }
 
@@ -88,12 +109,17 @@ fn read_ax_key_state(pid: i32, window_id: Option<u32>, element_ptr: usize) -> Op
     (state.value.is_some() || state.selected.is_some()).then_some(state)
 }
 
+/// Post a key and report whether the addressed control's own value/selection
+/// moved. `dispatch` is handed a `capture` callback it MUST call immediately
+/// before posting: an activation moves the app's focused element itself, and
+/// that move is not the key's effect, so the wider delivery probe can only be
+/// captured inside the activation.
 fn dispatch_with_ax_oracle(
     pid: i32,
     window_id: Option<u32>,
     explicit_element_ptr: Option<usize>,
-    dispatch: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<bool> {
+    dispatch: impl FnOnce(&mut dyn FnMut()) -> anyhow::Result<()>,
+) -> anyhow::Result<(bool, Option<delivery_probe::DeliveryProbe>)> {
     let (element_ptr, owns_element) = match explicit_element_ptr {
         Some(ptr) => (Some(ptr), false),
         None => unsafe {
@@ -106,7 +132,19 @@ fn dispatch_with_ax_oracle(
         .unwrap_or((None, false)),
     };
     let before = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
-    let result = dispatch();
+    let mut probe = None;
+    let result = {
+        let mut capture = || {
+            if let Some(wid) = window_id {
+                probe = Some(delivery_probe::DeliveryProbe::capture(
+                    pid,
+                    wid,
+                    element_ptr,
+                ));
+            }
+        };
+        dispatch(&mut capture)
+    };
     // Native controls normally publish their new value/selection on the next
     // run-loop turn. Keep this bounded and reuse the exact retained element so
     // a focus move cannot become false confirmation from a different control.
@@ -120,7 +158,9 @@ fn dispatch_with_ax_oracle(
         }
     }
     result?;
-    Ok(matches!((before, after), (Some(before), Some(after)) if ax_state_changed(&before, &after)))
+    let changed =
+        matches!((before, after), (Some(before), Some(after)) if ax_state_changed(&before, &after));
+    Ok((changed, probe))
 }
 
 fn ax_state_changed(before: &AxKeyState, after: &AxKeyState) -> bool {
@@ -466,7 +506,7 @@ impl Tool for PressKeyTool {
                                 "delivery_mode=foreground requires window_id for press_key"
                             )
                         })?;
-                        return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
+                        return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, |capture| {
                             crate::input::skylight::with_foreground_hid_activation(
                                 pid as libc::pid_t,
                                 wid,
@@ -479,13 +519,15 @@ impl Tool for PressKeyTool {
                                         let _ =
                                             crate::input::ax_actions::focus_element(element_ptr);
                                     }
+                                    capture();
                                     crate::input::keyboard::press_key_bare_global(&key, &m)
                                 },
                             )
                         });
                     }
                     // background (default): auth-envelope post, no raise.
-                    dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
+                    dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, |capture| {
+                        capture();
                         crate::input::keyboard::press_key(pid, &key, &m)
                     })
                 })
@@ -503,29 +545,62 @@ impl Tool for PressKeyTool {
             }
         };
 
-        match delivery_outcome {
-            outcome @ (PressKeyDeliveryOutcome::Confirmed
-            | PressKeyDeliveryOutcome::Unverifiable) => {
-                let confirmed = matches!(outcome, PressKeyDeliveryOutcome::Confirmed);
-                let label = if fg {
-                    " (delivery_mode:foreground)"
-                } else {
-                    ""
-                };
-                let structured = serde_json::json!({
-                    "path": if fg { "key_events_fg" } else { "key_events" },
-                    "verified": confirmed,
-                    "effect": if confirmed { "confirmed" } else { "unverifiable" },
-                });
-                ToolResult::text(format!(
-                    "✅ Pressed {display_key} on pid {pid}{label}.{}",
-                    changes.result_suffix()
+        let (confirmed, probe) = match delivery_outcome {
+            PressKeyDeliveryOutcome::Confirmed => (true, None),
+            PressKeyDeliveryOutcome::Unverifiable(probe) => (false, probe),
+            PressKeyDeliveryOutcome::Failed(error) => return delivery_failed(error),
+        };
+        let label = if fg {
+            " (delivery_mode:foreground)"
+        } else {
+            ""
+        };
+        let evidence = if confirmed {
+            None
+        } else if changes.needs_restore() {
+            probe.as_ref().map(|probe| {
+                probe.settled(delivery_probe::Evidence::Changed(
+                    delivery_probe::WINDOW_SIGNAL,
                 ))
-                .with_structured(structured)
-                .with_action_record(action_record(confirmed, fg))
-            }
-            PressKeyDeliveryOutcome::Failed(error) => delivery_failed(error),
+            })
+        } else if let Some(probe) = probe {
+            cua_driver_core::operation::spawn_blocking(move || probe.compare())
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let window_change = if evidence.is_some() && changes.needs_restore() {
+            let appeared = changes.new_windows.clone();
+            cua_driver_core::operation::spawn_blocking(move || {
+                delivery_probe::WindowChangeEvidence::observe(pid, window_id, &appeared)
+            })
+            .await
+            .ok()
+        } else {
+            None
+        };
+        let mut msg = format!(
+            "✅ Pressed {display_key} on pid {pid}{label}.{}",
+            changes.result_suffix()
+        );
+        let mut structured = serde_json::json!({
+            "path": if fg { "key_events_fg" } else { "key_events" },
+            "verified": confirmed,
+            "effect": if confirmed { "confirmed" } else { "unverifiable" },
+        });
+        if let Some(outcome) = evidence {
+            delivery_probe::apply_evidence(
+                &mut msg,
+                &mut structured,
+                outcome,
+                key_noop_report(changes.polled),
+                window_change.as_ref(),
+            );
         }
+        ToolResult::text(msg)
+            .with_structured(structured)
+            .with_action_record(action_record(confirmed, fg))
     }
 }
 
@@ -536,12 +611,12 @@ mod tests {
     #[test]
     fn delivery_outcome_mapper_distinguishes_confirmed_unverifiable_and_failed() {
         assert!(matches!(
-            map_delivery_outcome(Ok(true)),
+            map_delivery_outcome(Ok((true, None))),
             PressKeyDeliveryOutcome::Confirmed
         ));
         assert!(matches!(
-            map_delivery_outcome(Ok(false)),
-            PressKeyDeliveryOutcome::Unverifiable
+            map_delivery_outcome(Ok((false, None))),
+            PressKeyDeliveryOutcome::Unverifiable(None)
         ));
         let failed = map_delivery_outcome(Err(anyhow::anyhow!("post rejected")));
         assert!(matches!(failed, PressKeyDeliveryOutcome::Failed(_)));
