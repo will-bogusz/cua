@@ -182,6 +182,72 @@ impl DeliveryMode {
     }
 }
 
+/// A window one process has drawn in front of another of its own windows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObscuringWindow {
+    pub window_id: u32,
+    pub title: String,
+    pub layer: i32,
+}
+
+impl ObscuringWindow {
+    /// The `obscured_by` payload a refusal or a verified-behind reply carries.
+    pub(crate) fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "window_id": self.window_id,
+            "title": self.title,
+            "layer": self.layer,
+        })
+    }
+
+    /// How prose names the window: by its title, or as titleless.
+    pub(crate) fn describe(&self) -> String {
+        if self.title.trim().is_empty() {
+            "titleless".to_owned()
+        } else {
+            format!("titled {:?}", self.title)
+        }
+    }
+}
+
+/// Where an exact target sits in its own process's front-to-back order.
+pub(crate) struct ProcessFrontOrder {
+    pub target_is_front: bool,
+    pub in_front: Option<ObscuringWindow>,
+}
+
+/// Resolve [`ProcessFrontOrder`] from one `visible_windows()` enumeration.
+pub(crate) fn process_front_order(pid: i32, window_id: u32) -> ProcessFrontOrder {
+    let front = crate::windows::visible_windows()
+        .into_iter()
+        .filter(|window| {
+            window.pid == pid
+                && window.layer == 0
+                && !crate::cursor::overlay::is_overlay_window(window.window_id)
+        })
+        .max_by_key(|window| window.z_index);
+    let Some(front) = front else {
+        return ProcessFrontOrder {
+            target_is_front: false,
+            in_front: None,
+        };
+    };
+    if front.window_id == window_id {
+        return ProcessFrontOrder {
+            target_is_front: true,
+            in_front: None,
+        };
+    }
+    ProcessFrontOrder {
+        target_is_front: false,
+        in_front: Some(ObscuringWindow {
+            window_id: front.window_id,
+            title: front.title,
+            layer: front.layer,
+        }),
+    }
+}
+
 /// Convert a pure background-input refusal into the structured refusal result
 /// shape shared by exact-target tools: `code`, `effect: "refused"`, the
 /// requested target, and the safe next route when one exists. No actuator ran.

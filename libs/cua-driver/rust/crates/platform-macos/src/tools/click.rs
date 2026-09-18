@@ -257,6 +257,89 @@ fn ax_reply_summary(
     }
 }
 
+/// The application itself reports the addressed control disabled, with the
+/// focus and window-order state that decides which routes are real.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ElementDisabled {
+    action: String,
+    role: String,
+    label: String,
+    window_id: u32,
+    pid: i32,
+    foreground: bool,
+    front_in_process: bool,
+    obscuring_window: Option<super::ObscuringWindow>,
+}
+
+impl ElementDisabled {
+    fn reason(&self) -> String {
+        let Self {
+            action,
+            role,
+            label,
+            window_id,
+            pid,
+            ..
+        } = self;
+        if role == "AXMenuItem" {
+            return format!(
+                "{action} was not dispatched: the {role} \"{label}\" of an open menu reports \
+                 AXEnabled=false. A menu item's enabled state tracks the application's own \
+                 applicability, not focus or delivery mode: it is disabled in pid {pid}'s \
+                 current state."
+            );
+        }
+        if let Some(obscuring) = &self.obscuring_window {
+            let blocker = obscuring.window_id;
+            return format!(
+                "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
+                 AXEnabled=false, and window {blocker} — pid {pid}'s own front window, {} — is \
+                 drawn in front of it. Dismiss that window, or address window {blocker} and act \
+                 on it there.",
+                obscuring.describe()
+            );
+        }
+        let order = if self.front_in_process {
+            format!("Window {window_id} is already pid {pid}'s front window")
+        } else {
+            format!("No window of pid {pid} is drawn in front of window {window_id}")
+        };
+        format!(
+            "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
+             AXEnabled=false. {order} — the application disabled this control, and neither \
+             delivery mode nor activation changes that. Satisfy its precondition or choose \
+             another control."
+        )
+    }
+
+    fn payload(&self) -> Value {
+        let mut payload = serde_json::json!({
+            "code": "element_disabled",
+            "effect": "not_dispatched",
+            "route": "ax",
+            "action": self.action,
+            "role": self.role,
+            "label": self.label,
+            "window_id": self.window_id,
+            "pid": self.pid,
+            "foreground": self.foreground,
+            "front_in_process": self.front_in_process,
+        });
+        if let Some(obscuring) = &self.obscuring_window {
+            payload["obscured_by"] = obscuring.payload();
+        }
+        payload
+    }
+}
+
+impl std::fmt::Display for ElementDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason())
+    }
+}
+
+impl std::error::Error for ElementDisabled {}
+
 fn ax_action_error(error: anyhow::Error) -> ToolResult {
     if let Some(unknown) = error.downcast_ref::<UnknownAxAction>() {
         return ToolResult::error(format!("click refused: {error}")).with_structured(
@@ -267,6 +350,9 @@ fn ax_action_error(error: anyhow::Error) -> ToolResult {
                 "advertised_actions": unknown.advertised,
             }),
         );
+    }
+    if let Some(disabled) = error.downcast_ref::<ElementDisabled>() {
+        return ToolResult::error(disabled.reason()).with_structured(disabled.payload());
     }
     if let Some(reply) = error.downcast_ref::<AxActionReplyError>() {
         ToolResult::error(format!(
@@ -1877,14 +1963,26 @@ fn perform_ax_click(
         })
     })?;
 
-    // Check the live value immediately before dispatch. Foreground assist can
+    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+    let title = unsafe { copy_label_attr(element) }.unwrap_or_default();
+
+    // Read the live value immediately before dispatch. Foreground assist can
     // enable menu items that were disabled in the cached snapshot, while a
     // background transition can disable them after that snapshot. macOS may
     // otherwise return success for a disabled action that did nothing.
-    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, &ax_action)?;
-
-    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-    let title = unsafe { copy_label_attr(element) }.unwrap_or_default();
+    if crate::input::ax_actions::ax_element_enabled(element_ptr) == Some(false) {
+        let order = super::process_front_order(pid, window_id);
+        return Err(anyhow::Error::new(ElementDisabled {
+            action: ax_action.clone(),
+            role: role.clone(),
+            label: title.clone(),
+            window_id,
+            pid,
+            foreground,
+            front_in_process: order.target_is_front,
+            obscuring_window: order.in_front,
+        }));
+    }
 
     // On a collection row the pointer gesture is select, so a plain click takes
     // the bounded, read-back-verified AXSelected write whether or not the
@@ -2655,6 +2753,102 @@ mod tests {
         let result = ax_action_error(anyhow::anyhow!("target no longer exists"));
         assert_eq!(result.is_error, Some(true));
         assert!(result.structured_content.is_none());
+    }
+
+    fn disabled(role: &str, front_in_process: bool) -> ElementDisabled {
+        ElementDisabled {
+            action: "AXPress".to_owned(),
+            role: role.to_owned(),
+            label: "Back".to_owned(),
+            window_id: 17002,
+            pid: 47983,
+            foreground: false,
+            front_in_process,
+            obscuring_window: None,
+        }
+    }
+
+    #[test]
+    fn a_disabled_control_already_in_front_names_no_route() {
+        let reason = disabled("AXButton", true).reason();
+        assert!(
+            reason.contains("window 17002 reports AXEnabled=false"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Window 17002 is already pid 47983's front window"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("neither delivery mode nor activation changes that"),
+            "{reason}"
+        );
+        for ruled_out in ["foreground", "bring_to_front"] {
+            assert!(
+                !reason.contains(ruled_out),
+                "named a route the state rules out ({ruled_out}): {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_control_behind_the_apps_own_panel_names_that_window() {
+        let mut state = disabled("AXButton", false);
+        state.obscuring_window = Some(super::super::ObscuringWindow {
+            window_id: 17013,
+            title: String::new(),
+            layer: 0,
+        });
+        let reason = state.reason();
+        assert!(
+            reason.contains(
+                "window 17013 — pid 47983's own front window, titleless — is drawn in front of it"
+            ),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Dismiss that window, or address window 17013"),
+            "{reason}"
+        );
+
+        let payload = state.payload();
+        assert_eq!(payload["code"], "element_disabled");
+        assert_eq!(payload["effect"], "not_dispatched");
+        assert_eq!(payload["front_in_process"], false);
+        assert_eq!(payload["obscured_by"]["window_id"], 17013);
+        assert_eq!(payload["obscured_by"]["layer"], 0);
+    }
+
+    #[test]
+    fn a_disabled_menu_item_is_disabled_by_app_state_not_by_focus() {
+        let reason = disabled("AXMenuItem", false).reason();
+        assert!(
+            reason
+                .contains("tracks the application's own applicability, not focus or delivery mode"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("disabled in pid 47983's current state"),
+            "{reason}"
+        );
+        assert!(!reason.contains("foreground"), "{reason}");
+    }
+
+    #[test]
+    fn a_titled_blocker_is_named_by_its_title() {
+        let mut state = disabled("AXButton", false);
+        state.obscuring_window = Some(super::super::ObscuringWindow {
+            window_id: 17018,
+            title: "Print".to_owned(),
+            layer: 0,
+        });
+        assert!(
+            state
+                .reason()
+                .contains("own front window, titled \"Print\" —"),
+            "{}",
+            state.reason()
+        );
     }
 
     /// Surface 5: schema must advertise the new `button` field with the three
