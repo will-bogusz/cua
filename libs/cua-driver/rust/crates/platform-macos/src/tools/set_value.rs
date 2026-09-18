@@ -452,6 +452,7 @@ fn commit_written_value(
     requested: &str,
     numeric: bool,
     plan: WritePlan,
+    changed: Option<bool>,
 ) -> (Option<ActionCommit>, String) {
     match plan {
         WritePlan::ValueOnly => (None, String::new()),
@@ -467,10 +468,12 @@ fn commit_written_value(
                 let after = unsafe { copy_string_attr(element, "AXValue") };
                 value_matches(after.as_deref(), requested, numeric)
             };
-            // An `AXConfirm` is not an end-of-edit the driver can read, and
-            // the value never went through the field editor, so the read-back
-            // is the only evidence there is.
-            judge_commit(dispatched, survived, false, "AXConfirm")
+            let witness = if changed == Some(true) {
+                CommitWitness::OwnConfirmAction
+            } else {
+                CommitWitness::ReadbackOnly
+            };
+            judge_commit(dispatched, survived, witness, "AXConfirm")
         }
         WritePlan::ValueThenKey(key) => {
             let focused = crate::input::ax_actions::focus_element(element as usize).is_ok();
@@ -481,33 +484,52 @@ fn commit_written_value(
                 value_matches(after.as_deref(), requested, numeric)
             };
             // The key ends the edit session, but the value in it arrived
-            // through `AXValue` rather than the field editor, so the ended
+            // through `AXValue` rather than the field editor, and a synthesized
+            // key is not the control's own advertised commit, so the ended
             // session is not evidence the app took it.
-            judge_commit(dispatched, survived, false, key)
+            judge_commit(dispatched, survived, CommitWitness::ReadbackOnly, key)
         }
     }
+}
+
+/// What was observed of the app's end-of-edit beyond the value surviving the
+/// commit gesture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitWitness {
+    /// A *typed* edit session ended with the value in place — what an AppKit
+    /// binding commits on, observed as the control losing keyboard focus after
+    /// a gesture that had established it.
+    TypedEditEnded,
+    /// The control's own advertised confirm action ran, over a value this call
+    /// provably moved the field to. `AXConfirm` is the control's action — what
+    /// Return invokes — so its handler running IS the app's end-of-edit.
+    OwnConfirmAction,
+    /// Nothing but an accessibility read-back.
+    ReadbackOnly,
 }
 
 /// What the driver may claim about the app's end-of-edit.
 ///
 /// An accessibility read-back is echoed by a bound control whether or not the
-/// application took the value, so it can only ever refute a commit. The one
-/// positive signal available is a *typed* edit session ending — which is what
-/// an AppKit binding commits on — observed as the control losing the app's own
-/// keyboard focus after a gesture that had established it.
+/// application took the value, so on its own it can only ever refute a commit.
+/// A positive verdict needs a second observation, and there are two:
 ///
-/// `typed` is what makes the ended edit mean anything, and it is measured, not
-/// assumed. On Automator's "Save as:" action parameter (2026-09-14): an
-/// `AXValue` write, a proven `AXFocused` write and a Tab that demonstrably
-/// moved focus left the written string in the control's read-back and the
-/// application still kept its own value in `document.wflow`. An ended edit
-/// session over a value the field editor never saw proves nothing, so an
-/// `AXValue` route can reach `unproven` at best; the same sequence with the
-/// value typed through the keystroke rung committed.
+/// A *typed* edit session ending is measured, not assumed. On Automator's
+/// "Save as:" action parameter (2026-09-14): an `AXValue` write, a proven
+/// `AXFocused` write and a Tab that demonstrably moved focus left the written
+/// string in the control's read-back and the application still kept its own
+/// value in `document.wflow`. An ended edit session over a value the field
+/// editor never saw proves nothing.
+///
+/// The control's own `AXConfirm` is the other. It is selected only for a
+/// control that advertises it, and performing it runs the same action handler
+/// Return does. Paired with a read-back that moved off the field's prior value
+/// — so the survival is not an echo of a value the field already held — that
+/// is the application's end-of-edit, observed.
 fn judge_commit(
     dispatched: bool,
     survived: bool,
-    typed_edit_ended: bool,
+    witness: CommitWitness,
     gesture: &str,
 ) -> (Option<ActionCommit>, String) {
     if !dispatched {
@@ -524,23 +546,30 @@ fn judge_commit(
                 .to_owned(),
         );
     }
-    if typed_edit_ended {
-        return (
+    match witness {
+        CommitWitness::TypedEditEnded => (
             Some(ActionCommit::Committed),
             format!(
                 " Committed via {gesture}: the typed edit session ended with this value in \
                  place."
             ),
-        );
-    }
-    (
-        Some(ActionCommit::Unproven),
-        format!(
-            " Commit unproven: the value survived {gesture}, but the app's own model was not \
-             observed — an accessibility read-back is echoed by a bound control whether or not \
-             the app took the value. Check the app's own output."
         ),
-    )
+        CommitWitness::OwnConfirmAction => (
+            Some(ActionCommit::Committed),
+            format!(
+                " Committed via {gesture}: the control's own confirm action ran and the value \
+                 it changed to survived it."
+            ),
+        ),
+        CommitWitness::ReadbackOnly => (
+            Some(ActionCommit::Unproven),
+            format!(
+                " Commit unproven: the value survived {gesture}, but the app's own model was \
+                 not observed — an accessibility read-back is echoed by a bound control \
+                 whether or not the app took the value. Check the app's own output."
+            ),
+        ),
+    }
 }
 
 // ── Blocking implementation (runs on spawn_blocking thread) ─────────────────
@@ -661,7 +690,7 @@ fn set_value_blocking(
                 numeric_target.is_some(),
             );
             let (committed, commit_detail) =
-                commit_written_value(element, pid, value, numeric_target.is_some(), plan);
+                commit_written_value(element, pid, value, numeric_target.is_some(), plan, changed);
             let suffix = match (verified, changed) {
                 (Some(true), Some(false)) => " Value already matched; write was idempotent.",
                 (Some(true), _) => "",
@@ -782,7 +811,12 @@ fn retype_blocking(
     } else {
         (false, false)
     };
-    let (committed, commit_detail) = judge_commit(dispatched, survived, edit_ended, end);
+    let witness = if edit_ended {
+        CommitWitness::TypedEditEnded
+    } else {
+        CommitWitness::ReadbackOnly
+    };
+    let (committed, commit_detail) = judge_commit(dispatched, survived, witness, end);
 
     let after = unsafe { copy_string_attr(element, "AXValue") };
     let (verified, changed) = classify_write(before.as_deref(), after.as_deref(), value, false);
@@ -1136,7 +1170,8 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, commit_written_value,
-        judge_commit, refused_keystroke_plan, write_plan, SetValueOutcome, ToolResult, WritePlan,
+        judge_commit, refused_keystroke_plan, write_plan, CommitWitness, SetValueOutcome,
+        ToolResult, WritePlan,
     };
     use cua_driver_contract::ActionCommit;
 
@@ -1231,6 +1266,7 @@ mod tests {
             "value",
             false,
             WritePlan::ValueOnly,
+            Some(true),
         );
         assert_eq!(committed, None, "a slider write has nothing to commit");
         assert!(detail.is_empty());
@@ -1243,7 +1279,7 @@ mod tests {
         let plan = write_plan("AXTextArea", "", &[], "name.txt");
         assert!(matches!(plan, WritePlan::Blocked(_)), "{plan:?}");
         let (committed, detail) =
-            commit_written_value(std::ptr::null_mut(), 0, "value", false, plan);
+            commit_written_value(std::ptr::null_mut(), 0, "value", false, plan, Some(true));
         assert_eq!(committed, Some(ActionCommit::NotCommitted));
         assert!(detail.contains("Not committed"), "{detail}");
     }
@@ -1255,27 +1291,58 @@ mod tests {
     /// `AXValue` write plus a Tab that moved focus survived the read-back and
     /// the app still kept its own value on disk.
     #[test]
-    fn only_a_typed_ended_edit_is_a_commit() {
-        let (committed, detail) = judge_commit(true, true, false, "AXConfirm");
+    fn a_readback_alone_is_never_a_commit() {
+        let (committed, detail) =
+            judge_commit(true, true, CommitWitness::ReadbackOnly, "AXConfirm");
         assert_eq!(committed, Some(ActionCommit::Unproven));
         assert!(detail.contains("Commit unproven"), "{detail}");
 
         // The AXValue + Tab route: dispatched, survived, and the edit really
         // ended — but untyped, so the only honest verdict is unproven.
         assert_eq!(
-            judge_commit(true, true, false, "tab").0,
+            judge_commit(true, true, CommitWitness::ReadbackOnly, "tab").0,
             Some(ActionCommit::Unproven)
         );
         assert_eq!(
-            judge_commit(true, true, true, "tab").0,
+            judge_commit(true, true, CommitWitness::TypedEditEnded, "tab").0,
             Some(ActionCommit::Committed)
         );
         assert_eq!(
-            judge_commit(true, false, true, "tab").0,
+            judge_commit(true, false, CommitWitness::TypedEditEnded, "tab").0,
             Some(ActionCommit::NotCommitted)
         );
         assert_eq!(
-            judge_commit(false, false, false, "tab").0,
+            judge_commit(false, false, CommitWitness::ReadbackOnly, "tab").0,
+            Some(ActionCommit::NotCommitted)
+        );
+    }
+
+    /// The control's own `AXConfirm` is its action handler — the one Return
+    /// invokes — and it is selected only for a control that advertises it. Run
+    /// over a value this call provably moved the field to, that IS the app's
+    /// end-of-edit. Every one of the 23 landed writes in the 0917 census read
+    /// back as written and still published `unproven`, so the verdict carried
+    /// no information.
+    #[test]
+    fn a_confirmed_change_on_the_controls_own_action_commits() {
+        let (committed, detail) =
+            judge_commit(true, true, CommitWitness::OwnConfirmAction, "AXConfirm");
+        assert_eq!(committed, Some(ActionCommit::Committed));
+        assert!(detail.contains("Committed via AXConfirm"), "{detail}");
+
+        // An idempotent write moved nothing, so the survival is an echo of a
+        // value the field already held and there is no commit to prove.
+        assert_eq!(
+            judge_commit(true, true, CommitWitness::ReadbackOnly, "AXConfirm").0,
+            Some(ActionCommit::Unproven)
+        );
+        // The confirm still has to have been dispatched and survived.
+        assert_eq!(
+            judge_commit(false, false, CommitWitness::OwnConfirmAction, "AXConfirm").0,
+            Some(ActionCommit::NotCommitted)
+        );
+        assert_eq!(
+            judge_commit(true, false, CommitWitness::OwnConfirmAction, "AXConfirm").0,
             Some(ActionCommit::NotCommitted)
         );
     }
