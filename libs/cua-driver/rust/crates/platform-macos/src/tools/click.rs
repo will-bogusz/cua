@@ -291,11 +291,17 @@ impl ElementDisabled {
         }
         if let Some(obscuring) = &self.obscuring_window {
             let blocker = obscuring.window_id;
+            let route = if obscuring.is_focusable() {
+                format!("Dismiss that window, or address window {blocker} and act on it there.")
+            } else {
+                "It publishes no AXWindow, so it cannot become the focused window: dismiss it, \
+                 or act on it by pixel."
+                    .to_owned()
+            };
             return format!(
                 "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
                  AXEnabled=false, and window {blocker} — pid {pid}'s own front window, {} — is \
-                 drawn in front of it. Dismiss that window, or address window {blocker} and act \
-                 on it there.",
+                 drawn in front of it. {route}",
                 obscuring.describe()
             );
         }
@@ -2791,23 +2797,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_disabled_control_behind_the_apps_own_panel_names_that_window() {
-        let mut state = disabled("AXButton", false);
-        state.obscuring_window = Some(super::super::ObscuringWindow {
-            window_id: 17013,
-            title: String::new(),
+    fn blocker(window_id: u32, title: &str, ax_backed: bool) -> super::super::ObscuringWindow {
+        super::super::ObscuringWindow {
+            window_id,
+            title: title.to_owned(),
             layer: 0,
-        });
+            ax_backed: Some(ax_backed),
+            role: ax_backed.then(|| "AXWindow".to_owned()),
+            subrole: ax_backed.then(|| "AXUnknown".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_disabled_control_behind_an_ax_backed_panel_offers_that_window() {
+        let mut state = disabled("AXButton", false);
+        state.obscuring_window = Some(blocker(17018, "", true));
         let reason = state.reason();
         assert!(
             reason.contains(
-                "window 17013 — pid 47983's own front window, titleless — is drawn in front of it"
+                "window 17018 — pid 47983's own front window, titleless, AXWindow/AXUnknown — is \
+                 drawn in front of it"
             ),
             "{reason}"
         );
         assert!(
-            reason.contains("Dismiss that window, or address window 17013"),
+            reason.contains("Dismiss that window, or address window 17018 and act on it there."),
             "{reason}"
         );
 
@@ -2815,8 +2829,36 @@ mod tests {
         assert_eq!(payload["code"], "element_disabled");
         assert_eq!(payload["effect"], "not_dispatched");
         assert_eq!(payload["front_in_process"], false);
-        assert_eq!(payload["obscured_by"]["window_id"], 17013);
+        assert_eq!(payload["obscured_by"]["window_id"], 17018);
         assert_eq!(payload["obscured_by"]["layer"], 0);
+        assert_eq!(payload["obscured_by"]["ax_backed"], true);
+        assert_eq!(payload["obscured_by"]["subrole"], "AXUnknown");
+    }
+
+    /// A layer-0 panel with no `AXWindow` can never become the focused window,
+    /// so the reply must not offer to address it.
+    #[test]
+    fn a_panel_with_no_ax_surface_is_not_offered_as_a_target() {
+        let mut state = disabled("AXButton", false);
+        state.obscuring_window = Some(blocker(17013, "", false));
+        let reason = state.reason();
+        assert!(
+            reason.contains("own front window, titleless, no AX surface — is drawn in front of it"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(
+                "It publishes no AXWindow, so it cannot become the focused window: dismiss it, \
+                 or act on it by pixel."
+            ),
+            "{reason}"
+        );
+        assert!(!reason.contains("address window"), "{reason}");
+        assert_eq!(state.payload()["obscured_by"]["ax_backed"], false);
+        assert!(
+            state.payload()["obscured_by"]["role"].is_null(),
+            "{state:?}"
+        );
     }
 
     #[test]
@@ -2837,15 +2879,11 @@ mod tests {
     #[test]
     fn a_titled_blocker_is_named_by_its_title() {
         let mut state = disabled("AXButton", false);
-        state.obscuring_window = Some(super::super::ObscuringWindow {
-            window_id: 17018,
-            title: "Print".to_owned(),
-            layer: 0,
-        });
+        state.obscuring_window = Some(blocker(17018, "Print", true));
         assert!(
             state
                 .reason()
-                .contains("own front window, titled \"Print\" —"),
+                .contains("own front window, titled \"Print\", AXWindow/AXUnknown —"),
             "{}",
             state.reason()
         );
