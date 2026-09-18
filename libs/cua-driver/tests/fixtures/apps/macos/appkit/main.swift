@@ -175,6 +175,11 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let rowHelpGroup = HelpfulGroupView()
     var rowHelpGroupPresses = 0
     let menuActionLabel = NSTextField(labelWithString: "menu_action=none")
+    // Arrange ▸ Left is the one menu command a cell fires twice (once per
+    // delivery rung), and an idempotent label makes the second firing
+    // invisible — both to the assertion and to the driver's own change probe,
+    // which then reports the landed chord as `suspected_noop`. Count it.
+    var arrangeLeftFirings = 0
     let scrollOffsetLabel = NSTextField(labelWithString: "scroll_offset=0")
     let accelCountLabel = NSTextField(labelWithString: "accel_fired=0")
     var accelCount = 0
@@ -602,7 +607,8 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     }
 
     @objc func onArrangeLeft(_ sender: NSMenuItem) {
-        menuActionLabel.stringValue = "menu_action=window_arrange_left"
+        arrangeLeftFirings += 1
+        menuActionLabel.stringValue = "menu_action=window_arrange_left#\(arrangeLeftFirings)"
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {

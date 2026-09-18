@@ -144,6 +144,14 @@ fn snapshot_elements(driver: &mut McpDriver, pid: u32, window_id: u64) -> ToolRe
     )
 }
 
+/// True when a chord reply blames a focus holder for the key-window state.
+/// `key_window_note` produces exactly two shapes — another window held focus,
+/// or the pid reported no key window at all — and both survive the closed
+/// ActionResult only as reply prose.
+fn key_window_complaint(reply_text: &str) -> bool {
+    reply_text.contains("key window when the chord was posted")
+}
+
 fn element_token_by_id(snapshot: &ToolResponse, identifier: &str) -> String {
     let index = element_index_by_id(snapshot.tree_text(), identifier)
         .unwrap_or_else(|| panic!("{identifier} element_index not found"));
@@ -1503,7 +1511,17 @@ fn harness_appkit_window_scoped_type_reaches_the_focused_field() {
 /// dispatches landed while the target window was not the app's key window,
 /// and every reply still said "Pressed cmd+option+f on pid 91895". The
 /// fixture's Window ▸ Arrange ▸ Left owns `cmd+option+l` and publishes
-/// `menu_action=window_arrange_left`.
+/// `menu_action=window_arrange_left#<firings>`.
+///
+/// Asserted on the surface a caller actually receives. The platform sets
+/// `structured["key_window"]` on every windowed chord, but the published
+/// ActionResult is the closed 0.9.0 schema, so a consumer sees only
+/// `route` / `delivery` / `effect` / `evidence` / `escalation`: the
+/// key-window fact survives as prose and, when the background rung is the
+/// one that cannot fix it, as `escalation.reason = route_unavailable`.
+/// The not-key arm has no live seam here — the fixture window is key from
+/// launch and the app owns no second key-able window — so it stays unit
+/// covered by `hotkey::tests::the_chord_reason_is_the_observed_key_window`.
 #[test]
 #[ignore]
 fn harness_appkit_menu_key_equivalent_through_hotkey() {
@@ -1537,16 +1555,21 @@ fn harness_appkit_menu_key_equivalent_through_hotkey() {
                 "background chord failed: {}",
                 background.text()
             );
+            assert!(
+                !key_window_complaint(&background.text()),
+                "the window was key, so the reply must not blame a focus holder: {}",
+                background.raw
+            );
             assert_eq!(
-                background.structured()["key_window"]["is_key"],
-                serde_json::json!(true),
-                "the reply must publish the key-window fact it observed: {}",
+                background.structured()["escalation"],
+                serde_json::Value::Null,
+                "a chord posted at a key window has no route to escalate to: {}",
                 background.raw
             );
             std::thread::sleep(Duration::from_millis(400));
             let after_background = snapshot_elements(driver, pid, wid).tree_text().to_owned();
             assert!(
-                after_background.contains("menu_action=window_arrange_left"),
+                after_background.contains("menu_action=window_arrange_left#1"),
                 "the background chord never reached NSMenu:\n{after_background}"
             );
 
@@ -1566,15 +1589,14 @@ fn harness_appkit_menu_key_equivalent_through_hotkey() {
                 "foreground chord failed: {}",
                 foreground.text()
             );
-            assert_eq!(
-                foreground.structured()["key_window"]["is_key"],
-                serde_json::json!(true),
+            assert!(
+                !key_window_complaint(&foreground.text()),
                 "the foreground rung posted at a window it had not made key: {}",
                 foreground.raw
             );
             assert_eq!(
-                foreground.structured()["path"],
-                serde_json::json!("key_events_fg"),
+                foreground.structured()["route"],
+                serde_json::json!("synthetic_events"),
                 "the menu key-equivalent branch is a PID-routed post, not the HID tap: {}",
                 foreground.raw
             );
@@ -1583,6 +1605,12 @@ fn harness_appkit_menu_key_equivalent_through_hotkey() {
                 Some("suspected_noop"),
                 "a chord that reached NSMenu was reported as a no-op: {}",
                 foreground.raw
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            let after_foreground = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                after_foreground.contains("menu_action=window_arrange_left#2"),
+                "the foreground chord never reached NSMenu:\n{after_foreground}"
             );
             Observation::delivered_with_fixture_state(Vec::new())
         },
