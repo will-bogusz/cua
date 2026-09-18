@@ -44,7 +44,7 @@ the signal the platform watched:
 | `delivery.mode` | `background`, `foreground`, `not_applicable`, `unknown` |
 | `evidence[].kind` | `value_readback`, `observed_change` |
 | `evidence[].signal` | `element_state`, `app_focus`, `window_tree`, `window_change` — optional; absent when the producer named no signal, or named one this version does not publish |
-| `escalation.target` | `pixel`, `foreground`, `page`, `session` |
+| `escalation.target` | `pixel`, `foreground`, `page`, `session`, `element`, `snapshot` |
 | `escalation.reason` | `route_unavailable`, `delivery_failed`, `effect_unconfirmed`, `suspected_noop`, `permission_required` |
 
 The action-result tools are:
@@ -136,10 +136,16 @@ An optional escalation is advice, not an automatic retry:
 | `foreground` | explicitly select foreground delivery when session policy permits |
 | `page` | bind the native window to a supported browser page route |
 | `session` | prepare or explicitly widen the session only when policy permits |
+| `element` | re-address the exact control: set its value, or act on the element instead of typing at whatever holds focus |
+| `snapshot` | re-observe before acting again; the addressed state is no longer trustworthy |
 
 SDK integrators, OpenClaw, Hermes, and other agent hosts can implement different
 policies above this same narrow fact contract without duplicating platform
 actuator details.
+
+A driver never names the harness's own observation or activation tool in
+prose. It emits one of these targets and the harness renders the route it
+actually exposes.
 
 ## Migration from 0.14
 

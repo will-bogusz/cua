@@ -81,7 +81,7 @@
             "delivery": { "enum": ["background", "foreground", "not_applicable", "unknown"] },
             "delivered_count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
             "evidence_kinds": { "type": "array", "maxItems": 16, "items": { "enum": ["accessibility_readback", "browser_readback", "value_readback", "observed_change"] } },
-            "escalation_kind": { "enum": ["activate_target", "retry_with_pixel_target", "retry_with_page_action", "refresh_page_state", "request_permission", "elevate_access", "expand_capture_scope", "prepare_session", "retry_with_foreground_delivery"] }
+            "escalation_kind": { "enum": ["activate_target", "retry_with_pixel_target", "retry_with_page_action", "refresh_page_state", "request_permission", "elevate_access", "expand_capture_scope", "prepare_session", "retry_with_foreground_delivery", "retry_with_element_target", "refresh_observation"] }
           }
         },
         {

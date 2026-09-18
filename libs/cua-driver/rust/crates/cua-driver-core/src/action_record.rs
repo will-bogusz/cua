@@ -236,6 +236,8 @@ pub enum EscalationKind {
     ExpandCaptureScope,
     PrepareSession,
     RetryWithForegroundDelivery,
+    RetryWithElementTarget,
+    RefreshObservation,
 }
 
 /// Complete internal accounting for one action execution.
@@ -418,6 +420,14 @@ impl ActionExecutionRecord {
                         ActionEscalationTarget::Session,
                         ActionEscalationReason::RouteUnavailable,
                     ),
+                    EscalationKind::RetryWithElementTarget => (
+                        ActionEscalationTarget::Element,
+                        ActionEscalationReason::EffectUnconfirmed,
+                    ),
+                    EscalationKind::RefreshObservation => (
+                        ActionEscalationTarget::Snapshot,
+                        ActionEscalationReason::RouteUnavailable,
+                    ),
                 };
                 ActionEscalation {
                     target,
@@ -503,13 +513,16 @@ impl ActionExecutionRecord {
         }
         if let Some(escalation) = structured.get("escalation") {
             let recommendation = escalation
-                .get("recommended")
+                .get("target")
+                .or_else(|| escalation.get("recommended"))
                 .and_then(serde_json::Value::as_str);
             let kind = match recommendation {
                 Some("foreground") => Some(EscalationKind::RetryWithForegroundDelivery),
                 Some("px" | "pixel") => Some(EscalationKind::RetryWithPixelTarget),
                 Some("page") => Some(EscalationKind::RetryWithPageAction),
                 Some("session") => Some(EscalationKind::ExpandCaptureScope),
+                Some("element") => Some(EscalationKind::RetryWithElementTarget),
+                Some("snapshot") => Some(EscalationKind::RefreshObservation),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -1056,6 +1069,8 @@ fn escalation_kind_name(kind: EscalationKind) -> &'static str {
         EscalationKind::ExpandCaptureScope => "expand_capture_scope",
         EscalationKind::PrepareSession => "prepare_session",
         EscalationKind::RetryWithForegroundDelivery => "retry_with_foreground_delivery",
+        EscalationKind::RetryWithElementTarget => "retry_with_element_target",
+        EscalationKind::RefreshObservation => "refresh_observation",
     }
 }
 
@@ -1438,6 +1453,16 @@ mod tests {
                 ActionEscalationTarget::Session,
                 ActionEscalationReason::RouteUnavailable,
             ),
+            (
+                EscalationKind::RetryWithElementTarget,
+                ActionEscalationTarget::Element,
+                ActionEscalationReason::EffectUnconfirmed,
+            ),
+            (
+                EscalationKind::RefreshObservation,
+                ActionEscalationTarget::Snapshot,
+                ActionEscalationReason::RouteUnavailable,
+            ),
         ];
 
         for (kind, target, reason) in cases {
@@ -1475,6 +1500,43 @@ mod tests {
             ActionEscalationReason::PermissionRequired,
             "suspected-noop classification must not hide a permission blocker"
         );
+    }
+
+    /// A driver may not name a consumer's tool in prose, so the typed target
+    /// has to survive from whichever key the producer spelled it with.
+    #[test]
+    fn element_and_snapshot_targets_reach_the_wire_from_either_producer_key() {
+        for (key, token, target, reason) in [
+            (
+                "recommended",
+                "element",
+                cua_driver_contract::ActionEscalationTarget::Element,
+                cua_driver_contract::ActionEscalationReason::EffectUnconfirmed,
+            ),
+            (
+                "target",
+                "snapshot",
+                cua_driver_contract::ActionEscalationTarget::Snapshot,
+                cua_driver_contract::ActionEscalationReason::RouteUnavailable,
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "type_text",
+                &serde_json::json!({"delivery_mode": "background"}),
+                &serde_json::json!({
+                    "path": "key_events",
+                    "effect": "unverifiable",
+                    "escalation": { key: token },
+                }),
+            )
+            .expect("legacy action should normalize");
+            let public = record.public_result().expect("public ActionResult");
+            assert_eq!(
+                public.escalation,
+                Some(cua_driver_contract::ActionEscalation { target, reason }),
+                "escalation.{key} = {token} must publish a typed target"
+            );
+        }
     }
 
     #[test]

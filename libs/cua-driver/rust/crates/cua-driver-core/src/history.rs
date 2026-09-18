@@ -2043,6 +2043,8 @@ fn valid_payload_for_event(event_type: &str, payload: &HistoryPayload) -> bool {
                             | "expand_capture_scope"
                             | "prepare_session"
                             | "retry_with_foreground_delivery"
+                            | "retry_with_element_target"
+                            | "refresh_observation"
                     )
                 })
         }
@@ -2197,6 +2199,8 @@ fn escalation_name(value: EscalationKind) -> &'static str {
         EscalationKind::ExpandCaptureScope => "expand_capture_scope",
         EscalationKind::PrepareSession => "prepare_session",
         EscalationKind::RetryWithForegroundDelivery => "retry_with_foreground_delivery",
+        EscalationKind::RetryWithElementTarget => "retry_with_element_target",
+        EscalationKind::RefreshObservation => "refresh_observation",
     }
 }
 

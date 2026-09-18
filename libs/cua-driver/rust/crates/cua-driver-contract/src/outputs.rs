@@ -583,6 +583,8 @@ pub enum ActionEscalationTarget {
     Foreground,
     Page,
     Session,
+    Element,
+    Snapshot,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
@@ -937,7 +939,14 @@ mod tests {
         assert_eq!(escalation["required"], json!(["target", "reason"]));
         assert_eq!(
             escalation["properties"]["target"]["enum"],
-            json!(["pixel", "foreground", "page", "session"])
+            json!([
+                "pixel",
+                "foreground",
+                "page",
+                "session",
+                "element",
+                "snapshot"
+            ])
         );
         assert_eq!(
             escalation["properties"]["reason"]["enum"],

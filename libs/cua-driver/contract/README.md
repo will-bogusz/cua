@@ -105,6 +105,13 @@ manifest.
 See [Action results and postcondition verification](../docs/action-result-contract.md)
 for the wire shape and 0.14 migration guidance.
 
+`escalation.target` is the driver's whole vocabulary for "where to go next":
+`pixel`, `foreground`, `page`, `session`, `element` (re-address the exact
+control), and `snapshot` (re-observe first). A driver never names a
+consumer's own tool in prose — it emits one of these and the consumer
+renders the route it actually exposes, because only the consumer knows
+which routes it has.
+
 Compatibility is tracked separately at each boundary:
 
 | Field | Current | Meaning |
