@@ -491,7 +491,7 @@ impl Tool for HotkeyTool {
                             // foreground rung: briefly front the window so NSMenu key
                             // equivalents dispatch, then restore prior frontmost.
                             (true, false, Some(wid), None) => {
-                                crate::input::skylight::with_menu_shortcut_activation(
+                                crate::input::skylight::with_menu_key_activation(
                                     pid as libc::pid_t,
                                     wid,
                                     || {

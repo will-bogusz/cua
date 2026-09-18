@@ -669,7 +669,7 @@ pub fn make_exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
 /// seen the background rungs fail (clicks) or the field is unverifiable +
 /// focus-sensitive (Catalyst typing).
 ///
-/// ## Why this does not delegate to [`with_menu_shortcut_activation`]
+/// ## Why this does not delegate to [`with_menu_key_activation`]
 ///
 /// It used to. That helper posts `set_front` and calls `action` immediately,
 /// which is correct for its own purpose: NSMenu key dispatch only needs the key
@@ -828,7 +828,7 @@ impl std::error::Error for ForegroundActivationRefused {}
 
 /// Activate an exact target window for a global HID keyboard action.
 ///
-/// Unlike [`with_menu_shortcut_activation`], this helper must not run `action`
+/// Unlike [`with_menu_key_activation`], this helper must not run `action`
 /// when the private foreground SPI is unavailable: a global HID event has no
 /// pid addressing and would otherwise land in whichever application is
 /// currently frontmost. The short settles keep the target frontmost until
@@ -897,55 +897,60 @@ fn preserves_exact_existing_focus(
         && focused_window_id == Some(target_window_id)
 }
 
-/// Activate `target_pid`'s window `target_wid` for NSMenu key dispatch, run `action`,
-/// then immediately restore the prior frontmost process.
+/// Make `target_wid` the application's key window, run `action`, then restore
+/// the prior frontmost process.
 ///
-/// The entire activate → action → restore sequence is < 1 ms — a 5 ms UX monitor
-/// never observes the intermediate frontmost state. NSMenu still fires because the
-/// key event is already enqueued in the target's run-loop queue before we restore.
+/// NSMenu validates a key equivalent against the application's KEY window, not
+/// merely against its frontmost process. A `kCPSNoWindows` (0x400) front never
+/// establishes one: measured on Notes, 0 of 12 chord dispatches landed while
+/// the target window was not key and 6 of 6 landed once it was, and the
+/// front-and-restore additionally collapsed the toolbar's own search control
+/// (`AXEnabled` true → false). So front the window as user-generated (0x200,
+/// which permits AppKit to install the native key window before it validates
+/// NSMenu), then wait for the application to report the window focused.
 ///
-/// Returns `Ok(true)` when activation succeeded, `Ok(false)` when SPIs unavailable.
-pub fn with_menu_shortcut_activation(
+/// A window that will not take key is refused with the focus holder, not
+/// posted at blindly: without a key window the chord provably cannot dispatch.
+pub fn with_menu_key_activation(
     target_pid: libc::pid_t,
     target_wid: u32,
     action: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<bool> {
-    let set_front = match set_front_process_fn() {
-        Some(f) => f,
-        None => {
-            // SPIs unavailable — run action anyway without activation.
-            action()?;
-            return Ok(false);
-        }
-    };
+) -> anyhow::Result<()> {
+    let set_front = set_front_process_fn()
+        .ok_or_else(|| anyhow::anyhow!("menu key-equivalent delivery is unavailable"))?;
 
-    // Capture prior frontmost PSN.
     let mut prev_psn = [0u8; 8];
     let prev_ok = get_front_process_fn()
         .map(|f| unsafe { f(prev_psn.as_mut_ptr() as *mut c_void) } == 0)
         .unwrap_or(false);
 
-    // Resolve target PSN.
     let mut target_psn = [0u8; 8];
-    let target_ok = get_process_psn_for_window(target_wid, target_pid, &mut target_psn);
-    if !target_ok {
-        action()?;
-        return Ok(false);
+    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
+        anyhow::bail!("could not resolve target window for menu key-equivalent delivery");
     }
 
-    // Make target WindowServer-frontmost (kCPSNoWindows = 0x400).
-    unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
+    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
+    if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
+    {
+        return action();
+    }
 
-    // Run action then restore — even if action fails.
+    if !make_exact_window_key(target_pid, target_wid) {
+        return Err(ForegroundActivationRefused::observe(target_pid, target_wid).into());
+    }
+    if !await_window_focused(target_pid, target_wid) {
+        if prev_ok {
+            unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
+        }
+        return Err(ForegroundActivationRefused::observe(target_pid, target_wid).into());
+    }
+
     let result = action();
-
-    // Restore prior frontmost (windowID=0, options=0x400).
+    std::thread::sleep(std::time::Duration::from_millis(40));
     if prev_ok {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
-
-    result?;
-    Ok(true)
+    result
 }
 
 #[cfg(test)]
