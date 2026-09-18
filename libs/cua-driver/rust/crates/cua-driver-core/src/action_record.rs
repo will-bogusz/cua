@@ -185,6 +185,8 @@ pub enum ActionRoute {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionEvidence {
     pub kind: EvidenceKind,
+    /// The platform's own signal name for an observed change; published as
+    /// `ActionEvidence.signal` when the contract knows the spelling.
     pub detail: String,
 }
 
@@ -193,7 +195,7 @@ pub enum EvidenceKind {
     AccessibilityReadback,
     BrowserReadback,
     ValueReadback,
-    WindowChange,
+    ObservedChange,
     NativeApiResult,
     ScreenshotComparison,
     EventReceipt,
@@ -220,6 +222,9 @@ pub struct ActionFallback {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionEscalation {
     pub kind: EscalationKind,
+    /// The platform's own `escalation.reason`. Published verbatim when it
+    /// spells a reason the contract knows; otherwise the escalation target's
+    /// own reason stands, because no observation was reported.
     pub detail: Option<String>,
 }
 
@@ -234,6 +239,8 @@ pub enum EscalationKind {
     ExpandCaptureScope,
     PrepareSession,
     RetryWithForegroundDelivery,
+    RetryWithElementTarget,
+    RefreshObservation,
 }
 
 /// Complete internal accounting for one action execution.
@@ -363,17 +370,21 @@ impl ActionExecutionRecord {
             evidence: projection.evidence.map(|evidence| {
                 evidence
                     .into_iter()
-                    .map(|evidence| cua_driver_contract::ActionEvidence {
-                        kind: match evidence.kind {
+                    .map(|evidence| {
+                        let (kind, signal) = match evidence.kind {
                             ProjectedEvidenceKind::AccessibilityReadback
                             | ProjectedEvidenceKind::BrowserReadback
                             | ProjectedEvidenceKind::ValueReadback => {
-                                cua_driver_contract::ActionEvidenceKind::ValueReadback
+                                (cua_driver_contract::ActionEvidenceKind::ValueReadback, None)
                             }
-                            ProjectedEvidenceKind::WindowChange => {
-                                cua_driver_contract::ActionEvidenceKind::WindowChange
-                            }
-                        },
+                            ProjectedEvidenceKind::ObservedChange => (
+                                cua_driver_contract::ActionEvidenceKind::ObservedChange,
+                                cua_driver_contract::ActionEvidenceSignal::from_wire(
+                                    &evidence.detail,
+                                ),
+                            ),
+                        };
+                        cua_driver_contract::ActionEvidence { kind, signal }
                     })
                     .collect()
             }),
@@ -382,11 +393,11 @@ impl ActionExecutionRecord {
                     ActionEscalation, ActionEscalationReason, ActionEscalationTarget,
                 };
 
-                let (target, reason) = match escalation.kind {
+                let (target, unobserved_reason) = match escalation.kind {
                     EscalationKind::ActivateTarget
                     | EscalationKind::RetryWithForegroundDelivery => (
                         ActionEscalationTarget::Foreground,
-                        ActionEscalationReason::DeliveryFailed,
+                        ActionEscalationReason::EffectUnconfirmed,
                     ),
                     EscalationKind::RetryWithPixelTarget => (
                         ActionEscalationTarget::Pixel,
@@ -412,7 +423,20 @@ impl ActionExecutionRecord {
                         ActionEscalationTarget::Session,
                         ActionEscalationReason::RouteUnavailable,
                     ),
+                    EscalationKind::RetryWithElementTarget => (
+                        ActionEscalationTarget::Element,
+                        ActionEscalationReason::EffectUnconfirmed,
+                    ),
+                    EscalationKind::RefreshObservation => (
+                        ActionEscalationTarget::Snapshot,
+                        ActionEscalationReason::RouteUnavailable,
+                    ),
                 };
+                let reason = escalation
+                    .detail
+                    .as_deref()
+                    .and_then(observed_escalation_reason)
+                    .unwrap_or(unobserved_reason);
                 ActionEscalation {
                     target,
                     reason: if projection.effect == ActionEffect::SuspectedNoop
@@ -491,19 +515,22 @@ impl ActionExecutionRecord {
         // read-back, so the effect it accompanies is still `unverifiable`.
         for signal in legacy_observed_change_evidence(structured) {
             record.evidence.push(ActionEvidence {
-                kind: EvidenceKind::WindowChange,
+                kind: EvidenceKind::ObservedChange,
                 detail: signal.to_owned(),
             });
         }
         if let Some(escalation) = structured.get("escalation") {
             let recommendation = escalation
-                .get("recommended")
+                .get("target")
+                .or_else(|| escalation.get("recommended"))
                 .and_then(serde_json::Value::as_str);
             let kind = match recommendation {
                 Some("foreground") => Some(EscalationKind::RetryWithForegroundDelivery),
                 Some("px" | "pixel") => Some(EscalationKind::RetryWithPixelTarget),
                 Some("page") => Some(EscalationKind::RetryWithPageAction),
                 Some("session") => Some(EscalationKind::ExpandCaptureScope),
+                Some("element") => Some(EscalationKind::RetryWithElementTarget),
+                Some("snapshot") => Some(EscalationKind::RefreshObservation),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -679,11 +706,8 @@ fn legacy_has_publishable_readback(tool_name: &str, structured: &serde_json::Val
         && structured.get("effect").and_then(serde_json::Value::as_str) == Some("confirmed")
 }
 
-/// Signal names a platform may declare as an observed post-dispatch change; all
-/// normalize to the coarse `WindowChange` kind with the signal kept as detail.
-const OBSERVED_CHANGE_SIGNALS: [&str; 4] =
-    ["window_change", "element_state", "app_focus", "window_tree"];
-
+/// Signal names a platform may declare as an observed post-dispatch change;
+/// all normalize to the coarse `ObservedChange` kind with the signal kept.
 fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<&str> {
     structured
         .get("evidence")
@@ -692,10 +716,17 @@ fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<&str> 
             evidence
                 .iter()
                 .filter_map(|item| item.get("kind").and_then(serde_json::Value::as_str))
-                .filter(|kind| OBSERVED_CHANGE_SIGNALS.contains(kind))
+                .filter(|kind| cua_driver_contract::ActionEvidenceSignal::from_wire(kind).is_some())
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Only a published reason spelling counts as an observation. Prose yields
+/// `None`, so the escalation target's own reason stands instead of the
+/// platform being credited with a delivery failure it never probed for.
+fn observed_escalation_reason(raw: &str) -> Option<cua_driver_contract::ActionEscalationReason> {
+    serde_json::from_value(serde_json::Value::String(raw.to_owned())).ok()
 }
 
 fn transport_from_legacy(
@@ -743,7 +774,9 @@ fn transport_from_legacy(
         "cua_compositor_inject" | "wayland_cua_compositor" => {
             ActionTransport::LinuxCuaCompositorInject
         }
-        "hid" | "cgevent_hid" | "cgevent_fg" => ActionTransport::MacosCgEventHid,
+        "hid" | "cgevent_hid" | "cgevent_fg" | "key_events_hid_fg" => {
+            ActionTransport::MacosCgEventHid
+        }
         "cgevent" => {
             if args
                 .get("delivery_mode")
@@ -764,11 +797,7 @@ fn transport_from_legacy(
                     .and_then(serde_json::Value::as_str)
                     == Some("foreground");
             if cfg!(target_os = "macos") {
-                if foreground {
-                    ActionTransport::MacosCgEventHid
-                } else {
-                    ActionTransport::MacosCgEventPid
-                }
+                ActionTransport::MacosCgEventPid
             } else if cfg!(target_os = "windows") {
                 if foreground {
                     ActionTransport::WindowsSendInput
@@ -976,7 +1005,7 @@ fn projected_evidence(evidence: &[ActionEvidence]) -> Option<Vec<ActionEvidenceP
                 EvidenceKind::AccessibilityReadback => ProjectedEvidenceKind::AccessibilityReadback,
                 EvidenceKind::BrowserReadback => ProjectedEvidenceKind::BrowserReadback,
                 EvidenceKind::ValueReadback => ProjectedEvidenceKind::ValueReadback,
-                EvidenceKind::WindowChange => ProjectedEvidenceKind::WindowChange,
+                EvidenceKind::ObservedChange => ProjectedEvidenceKind::ObservedChange,
                 EvidenceKind::NativeApiResult
                 | EvidenceKind::ScreenshotComparison
                 | EvidenceKind::EventReceipt
@@ -1034,7 +1063,7 @@ fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
         EvidenceKind::AccessibilityReadback => "accessibility_readback",
         EvidenceKind::BrowserReadback => "browser_readback",
         EvidenceKind::ValueReadback => "value_readback",
-        EvidenceKind::WindowChange => "window_change",
+        EvidenceKind::ObservedChange => "observed_change",
         EvidenceKind::NativeApiResult => "native_api_result",
         EvidenceKind::ScreenshotComparison => "screenshot_comparison",
         EvidenceKind::EventReceipt => "event_receipt",
@@ -1053,6 +1082,8 @@ fn escalation_kind_name(kind: EscalationKind) -> &'static str {
         EscalationKind::ExpandCaptureScope => "expand_capture_scope",
         EscalationKind::PrepareSession => "prepare_session",
         EscalationKind::RetryWithForegroundDelivery => "retry_with_foreground_delivery",
+        EscalationKind::RetryWithElementTarget => "retry_with_element_target",
+        EscalationKind::RefreshObservation => "refresh_observation",
     }
 }
 
@@ -1182,7 +1213,7 @@ pub enum ProjectedEvidenceKind {
     AccessibilityReadback,
     BrowserReadback,
     ValueReadback,
-    WindowChange,
+    ObservedChange,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1418,7 +1449,7 @@ mod tests {
             (
                 EscalationKind::RetryWithForegroundDelivery,
                 ActionEscalationTarget::Foreground,
-                ActionEscalationReason::DeliveryFailed,
+                ActionEscalationReason::EffectUnconfirmed,
             ),
             (
                 EscalationKind::RequestPermission,
@@ -1433,6 +1464,16 @@ mod tests {
             (
                 EscalationKind::PrepareSession,
                 ActionEscalationTarget::Session,
+                ActionEscalationReason::RouteUnavailable,
+            ),
+            (
+                EscalationKind::RetryWithElementTarget,
+                ActionEscalationTarget::Element,
+                ActionEscalationReason::EffectUnconfirmed,
+            ),
+            (
+                EscalationKind::RefreshObservation,
+                ActionEscalationTarget::Snapshot,
                 ActionEscalationReason::RouteUnavailable,
             ),
         ];
@@ -1472,6 +1513,43 @@ mod tests {
             ActionEscalationReason::PermissionRequired,
             "suspected-noop classification must not hide a permission blocker"
         );
+    }
+
+    /// A driver may not name a consumer's tool in prose, so the typed target
+    /// has to survive from whichever key the producer spelled it with.
+    #[test]
+    fn element_and_snapshot_targets_reach_the_wire_from_either_producer_key() {
+        for (key, token, target, reason) in [
+            (
+                "recommended",
+                "element",
+                cua_driver_contract::ActionEscalationTarget::Element,
+                cua_driver_contract::ActionEscalationReason::EffectUnconfirmed,
+            ),
+            (
+                "target",
+                "snapshot",
+                cua_driver_contract::ActionEscalationTarget::Snapshot,
+                cua_driver_contract::ActionEscalationReason::RouteUnavailable,
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "type_text",
+                &serde_json::json!({"delivery_mode": "background"}),
+                &serde_json::json!({
+                    "path": "key_events",
+                    "effect": "unverifiable",
+                    "escalation": { key: token },
+                }),
+            )
+            .expect("legacy action should normalize");
+            let public = record.public_result().expect("public ActionResult");
+            assert_eq!(
+                public.escalation,
+                Some(cua_driver_contract::ActionEscalation { target, reason }),
+                "escalation.{key} = {token} must publish a typed target"
+            );
+        }
     }
 
     #[test]
@@ -1890,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_change_after_dispatch_publishes_window_change_evidence() {
+    fn observed_change_after_dispatch_publishes_its_signal() {
         let record = ActionExecutionRecord::from_legacy(
             "click",
             &serde_json::json!({"delivery_mode": "background"}),
@@ -1905,9 +1983,15 @@ mod tests {
         assert_eq!(record.effect, ActionEffect::Unverifiable);
         let public = record.public_result().expect("public ActionResult");
         assert_eq!(
-            public.evidence.as_deref().map(<[_]>::len),
-            Some(1),
-            "an observed change is publishable delivery evidence"
+            public.evidence.as_deref(),
+            Some(
+                [cua_driver_contract::ActionEvidence {
+                    kind: cua_driver_contract::ActionEvidenceKind::ObservedChange,
+                    signal: Some(cua_driver_contract::ActionEvidenceSignal::WindowChange),
+                }]
+                .as_slice()
+            ),
+            "an observed change is publishable delivery evidence and names its signal"
         );
     }
 
@@ -1926,16 +2010,22 @@ mod tests {
             )
             .expect("background click with observed change should normalize");
             assert_eq!(record.evidence.len(), 1, "{signal} is an observed change");
-            assert_eq!(record.evidence[0].kind, EvidenceKind::WindowChange);
+            assert_eq!(record.evidence[0].kind, EvidenceKind::ObservedChange);
             assert_eq!(
                 record.evidence[0].detail, signal,
                 "the signal stays readable on the record"
             );
             let public = record.public_result().expect("public ActionResult");
             assert_eq!(
-                public.evidence.as_deref().map(<[_]>::len),
-                Some(1),
-                "{signal} is publishable delivery evidence"
+                public.evidence.as_deref(),
+                Some(
+                    [cua_driver_contract::ActionEvidence {
+                        kind: cua_driver_contract::ActionEvidenceKind::ObservedChange,
+                        signal: cua_driver_contract::ActionEvidenceSignal::from_wire(signal),
+                    }]
+                    .as_slice()
+                ),
+                "{signal} is publishable delivery evidence under its own name"
             );
         }
 
@@ -1953,6 +2043,28 @@ mod tests {
         assert!(
             unknown.evidence.is_empty(),
             "an undeclared kind is not evidence"
+        );
+
+        let undeclared = ActionExecutionRecord::builder(
+            ActionEffect::Unverifiable,
+            ActionTransport::MacosAxAction,
+            RequestedDelivery::Background,
+        )
+        .evidence(ActionEvidence {
+            kind: EvidenceKind::ObservedChange,
+            detail: "vibes".to_owned(),
+        })
+        .build()
+        .unwrap()
+        .public_result()
+        .unwrap();
+        assert_eq!(
+            undeclared.evidence.as_deref().and_then(<[_]>::first),
+            Some(&cua_driver_contract::ActionEvidence {
+                kind: cua_driver_contract::ActionEvidenceKind::ObservedChange,
+                signal: None,
+            }),
+            "an undeclared detail must not be published as a signal"
         );
     }
 
@@ -2002,6 +2114,74 @@ mod tests {
             escalation.target,
             cua_driver_contract::ActionEscalationTarget::Foreground
         );
+    }
+
+    /// A foreground escalation used to mint `delivery_failed` from its own
+    /// target, so an unprobed post reported a delivery failure nobody
+    /// observed. Only a reason the platform actually spelled may be published.
+    #[test]
+    fn an_unprobed_post_does_not_claim_an_observed_delivery_failure() {
+        for (declared, expected) in [
+            (
+                "a background combo didn't land? menu key-equivalents often \
+                 need the window fronted",
+                cua_driver_contract::ActionEscalationReason::EffectUnconfirmed,
+            ),
+            (
+                "delivery_failed",
+                cua_driver_contract::ActionEscalationReason::DeliveryFailed,
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "hotkey",
+                &serde_json::json!({"delivery_mode": "background"}),
+                &serde_json::json!({
+                    "path": "key_events",
+                    "verified": false,
+                    "effect": "unverifiable",
+                    "escalation": {
+                        "recommended": "foreground",
+                        "reason": declared,
+                    },
+                }),
+            )
+            .expect("background hotkey should normalize");
+            let escalation = record
+                .public_result()
+                .expect("public ActionResult")
+                .escalation
+                .expect("the producer named a rung");
+            assert_eq!(
+                escalation.target,
+                cua_driver_contract::ActionEscalationTarget::Foreground
+            );
+            assert_eq!(
+                escalation.reason, expected,
+                "published reason for a producer reason of {declared:?}"
+            );
+        }
+    }
+
+    /// The macOS foreground key rungs post to the pid; only the guarded HID
+    /// branches use the event tap. One label cannot carry both.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_foreground_key_post_is_not_the_global_input_tap() {
+        for (path, route) in [
+            ("key_events_fg", ActionRoute::SyntheticEvents),
+            ("key_events_hid_fg", ActionRoute::GlobalInput),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "hotkey",
+                &serde_json::json!({"delivery_mode": "foreground"}),
+                &serde_json::json!({
+                    "path": path,
+                    "effect": "unverifiable",
+                }),
+            )
+            .expect("foreground hotkey should normalize");
+            assert_eq!(record.transport.route(), route, "route for path {path}");
+        }
     }
 
     #[test]
@@ -2069,6 +2249,7 @@ mod tests {
             "trusted",
             "key_events",
             "key_events_fg",
+            "key_events_hid_fg",
             "pixel",
         ];
         for path in paths {

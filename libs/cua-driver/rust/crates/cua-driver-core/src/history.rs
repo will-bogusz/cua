@@ -2028,7 +2028,7 @@ fn valid_payload_for_event(event_type: &str, payload: &HistoryPayload) -> bool {
                         "accessibility_readback"
                             | "browser_readback"
                             | "value_readback"
-                            | "window_change"
+                            | "observed_change"
                     )
                 })
                 && escalation_kind.as_deref().is_none_or(|value| {
@@ -2043,6 +2043,8 @@ fn valid_payload_for_event(event_type: &str, payload: &HistoryPayload) -> bool {
                             | "expand_capture_scope"
                             | "prepare_session"
                             | "retry_with_foreground_delivery"
+                            | "retry_with_element_target"
+                            | "refresh_observation"
                     )
                 })
         }
@@ -2182,7 +2184,7 @@ fn evidence_name(value: ProjectedEvidenceKind) -> &'static str {
         ProjectedEvidenceKind::AccessibilityReadback => "accessibility_readback",
         ProjectedEvidenceKind::BrowserReadback => "browser_readback",
         ProjectedEvidenceKind::ValueReadback => "value_readback",
-        ProjectedEvidenceKind::WindowChange => "window_change",
+        ProjectedEvidenceKind::ObservedChange => "observed_change",
     }
 }
 
@@ -2197,6 +2199,8 @@ fn escalation_name(value: EscalationKind) -> &'static str {
         EscalationKind::ExpandCaptureScope => "expand_capture_scope",
         EscalationKind::PrepareSession => "prepare_session",
         EscalationKind::RetryWithForegroundDelivery => "retry_with_foreground_delivery",
+        EscalationKind::RetryWithElementTarget => "retry_with_element_target",
+        EscalationKind::RefreshObservation => "refresh_observation",
     }
 }
 
