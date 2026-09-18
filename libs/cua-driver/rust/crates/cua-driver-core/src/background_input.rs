@@ -299,7 +299,8 @@ pub fn decide_background_input(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
                 format!(
                     "this element belongs to attached sheet {window_id} (pid {pid}) of \
-                     window {} — acquire that window id and act there",
+                     window {}, which is a separate window; address that sheet and act \
+                     there",
                     target.window_id
                 ),
                 Some(BackgroundAdvice::AcquireWindow),
@@ -314,18 +315,33 @@ pub fn decide_background_input(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
                 format!(
                     "this element belongs to window {window_id} ({owner}), not to the \
-                     requested window {} — acquire that window id and act there",
+                     requested window {}; address that window and act there",
                     target.window_id
                 ),
                 Some(BackgroundAdvice::AcquireWindow),
             );
         }
-        ElementAncestry::Unproven | ElementAncestry::ProvenAppMenu => {
+        ElementAncestry::ProvenAppMenu => {
+            return refuse(
+                refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
+                format!(
+                    "this element belongs to pid {}'s own menu bar, which is \
+                     process-scoped and has no window ancestry by construction; a \
+                     window-stamped pointer event or a process-scoped keystroke would \
+                     land somewhere other than the menu row that was addressed. A \
+                     semantic action on the row itself is exactly addressed",
+                    target.pid
+                ),
+                Some(BackgroundAdvice::Element),
+            );
+        }
+        ElementAncestry::Unproven => {
             return refuse(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
                 format!(
                     "the addressed element could not be proven to belong to window {}; \
-                     take a fresh get_window_state snapshot and re-address it",
+                     re-observe the window and re-address the element from that \
+                     observation",
                     target.window_id
                 ),
                 Some(BackgroundAdvice::Snapshot),
@@ -399,8 +415,8 @@ pub fn decide_background_input(
                     format!(
                         "pid {} owns {} other eligible top-level window(s); process-scoped \
                          key events cannot be proven to reach window {} and could mutate a \
-                         sibling window. Use an exact element action, the page tool for \
-                         browser content, or delivery_mode:\"foreground\"",
+                         sibling window. Address the field itself with an exact element \
+                         action, or request foreground delivery",
                         target.pid, facts.competing_keyboard_destinations, target.window_id
                     ),
                     Some(BackgroundAdvice::Element),
@@ -802,7 +818,43 @@ mod tests {
             let reason = reason_of(decision);
             assert!(reason.contains("attached sheet 705"), "{reason}");
             assert!(reason.contains("pid 42"), "{reason}");
-            assert!(reason.contains("acquire that window id"), "{reason}");
+            assert!(
+                reason.contains("address that sheet and act there"),
+                "{reason}"
+            );
+        }
+    }
+
+    /// A menu row whose owning application WAS proven is not an unproven
+    /// address. Merging it into the `Unproven` arm told a caller its own
+    /// proven target "could not be proven", and pointed it at a re-observation
+    /// that cannot change the answer.
+    #[test]
+    fn a_proven_app_menu_row_is_not_told_it_could_not_be_proven() {
+        let mut facts = matched_facts();
+        facts.element = ElementAncestry::ProvenAppMenu;
+        assert!(decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute());
+        for action in [
+            BackgroundAction::WindowPointer,
+            BackgroundAction::InsertText,
+            BackgroundAction::GenericKey,
+        ] {
+            let BackgroundInputDecision::Refuse(refusal) =
+                decide_background_input(TARGET, &facts, action)
+            else {
+                panic!("a window-aimed route on a menu row must refuse: {action:?}");
+            };
+            assert!(
+                refusal.reason.contains("pid 42's own menu bar"),
+                "{}",
+                refusal.reason
+            );
+            assert!(
+                !refusal.reason.contains("could not be proven"),
+                "a proven menu row was told it was unproven: {}",
+                refusal.reason
+            );
+            assert_eq!(refusal.advice, Some(BackgroundAdvice::Element));
         }
     }
 
