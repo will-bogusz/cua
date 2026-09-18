@@ -1228,6 +1228,21 @@ fn await_typed_progress(
     }
 }
 
+/// A retained AX element owned for the length of one `type_text` call.
+struct OwnedElement(AXUIElementRef);
+
+impl OwnedElement {
+    fn as_ptr(&self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Drop for OwnedElement {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as _) };
+    }
+}
+
 /// Best-effort-background ladder for `type_text`.
 ///
 /// - `delivery_mode == Background` (default): AX insert → read-back; on a
@@ -1248,11 +1263,27 @@ fn type_text_blocking(
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
 ) -> anyhow::Result<TypeTextDelivery> {
+    // One destination for every rung: the read-back, the AX write and the
+    // keystroke rung's focus re-apply must address the same object, and a
+    // window-addressed request may only use focus that provably belongs to
+    // that window.
+    let resolved_focus = match element_ptr_and_idx {
+        Some(_) => None,
+        None => match window_id {
+            Some(wid) => unsafe { crate::ax::exact_target::focused_element_in_window(pid, wid) }
+                .map(OwnedElement),
+            None => unsafe { focused_element_of_pid(pid) }.map(OwnedElement),
+        },
+    };
+    let target = element_ptr_and_idx.or_else(|| {
+        resolved_focus
+            .as_ref()
+            .map(|element| (element.as_ptr(), None))
+    });
+
     // Original field value before any rung drives read-back verification only.
-    // An unreadable value is not evidence that the field is empty — and for a
-    // window-addressed request it must come from the exact target window,
-    // never a same-process sibling.
-    let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
+    // An unreadable value is not evidence that the field is empty.
+    let before = read_axvalue_bound(pid, target, window_id);
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -1291,7 +1322,7 @@ fn type_text_blocking(
                 text,
                 delay_ms,
                 before.as_deref(),
-                element_ptr_and_idx,
+                target,
                 foreground_settle_ms,
                 window_id,
             )
@@ -1380,7 +1411,7 @@ fn type_text_blocking(
             text,
             delay_ms,
             before.as_deref(),
-            element_ptr_and_idx,
+            target,
             /*settle_ms=*/ 0,
             window_id,
         )?;
@@ -1393,21 +1424,10 @@ fn type_text_blocking(
     }
 
     // --- Background rung 1: AX SelectedText write (element or focused). ---
-    // Without an explicit element, a window-addressed request may only write
-    // to the focused element when it provably belongs to the exact target
-    // window — a sibling window's focused field is not the requested target.
-    let ax_target: Option<(AXUIElementRef, bool, Option<usize>)> = match element_ptr_and_idx {
-        Some((ptr, idx)) => Some((ptr as AXUIElementRef, /*owns=*/ false, idx)),
-        None => match window_id {
-            Some(wid) => unsafe { crate::ax::exact_target::focused_element_in_window(pid, wid) }
-                .map(|el| (el, /*owns=*/ true, None)),
-            None => {
-                unsafe { focused_element_of_pid(pid) }.map(|el| (el, /*owns=*/ true, None))
-            }
-        },
-    };
+    let ax_target: Option<(AXUIElementRef, Option<usize>)> =
+        target.map(|(ptr, idx)| (ptr as AXUIElementRef, idx));
     let mut ax_attempt = AxAttempt::NotAttempted;
-    if let Some((element, owns, idx_opt)) = ax_target {
+    if let Some((element, idx_opt)) = ax_target {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
@@ -1445,11 +1465,6 @@ fn type_text_blocking(
         // unsafe even though no synthesis has run yet.
         let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged)
             && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
-        if owns {
-            unsafe {
-                CFRelease(element as _);
-            }
-        }
         if ax_progress == Some(TypedProgress::Complete) {
             let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
             return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
@@ -1510,7 +1525,7 @@ fn type_text_blocking(
         text,
         delay_ms,
         before.as_deref(),
-        element_ptr_and_idx,
+        target,
         /*settle_ms=*/ 0,
         window_id,
     )?;

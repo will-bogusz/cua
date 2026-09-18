@@ -134,6 +134,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         super.init()
         buildContent()
         installKeyboardMonitor()
+        installRememberedResponder()
     }
 
     func show() {
@@ -383,6 +384,26 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
                 return nil
             }
             return event
+        }
+    }
+
+    /// With `CUA_APPKIT_REMEMBERED_RESPONDER=1`, the window installs the
+    /// selection table as its first responder every time it becomes key —
+    /// the AppKit shape where a window remembers a responder that is not the
+    /// text field an agent focused. Notes' note list does exactly this, and a
+    /// window-scoped `type_text` that re-queries focus after the activation
+    /// types into the table instead of the field.
+    private func installRememberedResponder() {
+        guard ProcessInfo.processInfo.environment["CUA_APPKIT_REMEMBERED_RESPONDER"] == "1" else {
+            return
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.window.makeFirstResponder(self.selectionTable)
         }
     }
 

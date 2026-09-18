@@ -1313,6 +1313,64 @@ fn harness_appkit_type_text_background() {
     );
 }
 
+/// A window-scoped `type_text` must reach the element the target window's
+/// focus resolves to, even when the activation installs a different first
+/// responder. Measured in Notes: the window remembers its note list, so a
+/// foreground `type_text` re-queried focus after the front, typed into the
+/// list and read the list back — "Sent (unverified)" over an untouched field.
+#[test]
+#[ignore]
+fn harness_appkit_window_scoped_type_reaches_the_focused_field() {
+    run_case_with_env(
+        native_foreground_case(
+            "appkit",
+            "type_text_remembered_responder",
+            Targeting::Ax,
+            DriverRoute::MacosCgEventPid,
+        ),
+        &[("CUA_APPKIT_REMEMBERED_RESPONDER", "1")],
+        |pid, wid, driver| {
+            let first = snapshot_elements(driver, pid, wid);
+            let focus = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&first, "txt-input")
+                }),
+            );
+            assert!(!focus.is_error(), "focusing the field failed: {}", focus.text());
+
+            // No element_index: the window-scoped form, which is what the
+            // remembered responder competes with.
+            let typed = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "text": "responder-cua",
+                    "delivery_mode": "foreground"
+                }),
+            );
+            assert!(!typed.is_error(), "type_text failed: {}", typed.text());
+            assert_eq!(
+                typed.action_effect(),
+                Some("confirmed"),
+                "the window's focused field was not read back: {}",
+                typed.raw
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let post = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                post.contains("responder-cua"),
+                "the keystrokes went to the remembered responder:\n{post}"
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
 /// A field whose `AXValue` catches up with the write over the next second is
 /// not a partially typed field. The AX rung used to read the value back once,
 /// microseconds after the write returned, and published the prefix it caught
