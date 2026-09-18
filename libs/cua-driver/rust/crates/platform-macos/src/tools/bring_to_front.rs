@@ -184,7 +184,8 @@ fn classify_exact_outcome(
 
 fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
     let mut windows = crate::windows::visible_windows();
-    windows.retain(|window| !crate::cursor::overlay::is_overlay_window(window.window_id));
+    let system_overlays = crate::window_kind::system_overlay_window_ids(&windows);
+    windows.retain(|window| super::is_process_owned_window(window, &system_overlays));
     let target_visible_ordinary = windows
         .iter()
         .any(|window| window.pid == pid && window.window_id == window_id && window.layer == 0);

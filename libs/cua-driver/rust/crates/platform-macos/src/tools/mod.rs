@@ -284,12 +284,40 @@ pub(crate) struct ProcessFrontOrder {
 
 /// Resolve [`ProcessFrontOrder`] from one `visible_windows()` enumeration.
 pub(crate) fn process_front_order(pid: i32, window_id: u32) -> ProcessFrontOrder {
-    let front = crate::windows::visible_windows()
-        .into_iter()
+    let windows = crate::windows::visible_windows();
+    let mut order = resolve_process_front_order(
+        &windows,
+        pid,
+        window_id,
+        crate::window_kind::runs_indicator_provider,
+    );
+    if let Some(in_front) = &mut order.in_front {
+        in_front.resolve_ax_identity(pid);
+    }
+    order
+}
+
+/// Which of the process's own windows is drawn in front, over one captured
+/// enumeration and without consulting the accessibility tree.
+///
+/// A row the window roster classifies `system_overlay` is excluded: the
+/// capture-lease indicator carries the captured application's pid on layer 0,
+/// but the system draws it on the process's behalf, so it is never a window
+/// the application put in front of its own.
+fn resolve_process_front_order(
+    windows: &[crate::windows::WindowInfo],
+    pid: i32,
+    window_id: u32,
+    is_indicator_provider_pid: impl Fn(i32) -> bool,
+) -> ProcessFrontOrder {
+    let system_overlays =
+        crate::window_kind::window_sharing_indicator_candidates(windows, is_indicator_provider_pid);
+    let front = windows
+        .iter()
         .filter(|window| {
             window.pid == pid
                 && window.layer == 0
-                && !crate::cursor::overlay::is_overlay_window(window.window_id)
+                && is_process_owned_window(window, &system_overlays)
         })
         .max_by_key(|window| window.z_index);
     let Some(front) = front else {
@@ -304,18 +332,115 @@ pub(crate) fn process_front_order(pid: i32, window_id: u32) -> ProcessFrontOrder
             in_front: None,
         };
     }
-    let mut in_front = ObscuringWindow {
-        window_id: front.window_id,
-        title: front.title,
-        layer: front.layer,
-        ax_backed: None,
-        role: None,
-        subrole: None,
-    };
-    in_front.resolve_ax_identity(pid);
     ProcessFrontOrder {
         target_is_front: false,
-        in_front: Some(in_front),
+        in_front: Some(ObscuringWindow {
+            window_id: front.window_id,
+            title: front.title.clone(),
+            layer: front.layer,
+            ax_backed: None,
+            role: None,
+            subrole: None,
+        }),
+    }
+}
+
+/// Whether a row may be attributed to the process that owns it. The driver's
+/// own cursor overlay and the rows the window roster classifies
+/// `system_overlay` are drawn over an application's windows without being one
+/// of them, so neither can be the panel a reply names as in front.
+pub(crate) fn is_process_owned_window(
+    window: &crate::windows::WindowInfo,
+    system_overlays: &[u32],
+) -> bool {
+    !system_overlays.contains(&window.window_id)
+        && !crate::cursor::overlay::is_overlay_window(window.window_id)
+}
+
+#[cfg(test)]
+mod process_front_order_tests {
+    use super::*;
+    use crate::windows::{WindowBounds, WindowInfo};
+
+    const NOTES_PID: i32 = 84264;
+    const PROVIDER_PID: i32 = 22402;
+
+    fn window(
+        window_id: u32,
+        z_index: usize,
+        title: &str,
+        bounds: (f64, f64, f64, f64),
+    ) -> WindowInfo {
+        let (x, y, width, height) = bounds;
+        WindowInfo {
+            window_id,
+            pid: NOTES_PID,
+            app_name: "Notes".into(),
+            title: title.to_owned(),
+            bounds: WindowBounds {
+                x,
+                y,
+                width,
+                height,
+            },
+            layer: 0,
+            z_index,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    /// The measured layout: the 66x20 capture-lease indicator carries Notes'
+    /// own pid, sits above its document window, and hosts the indicator
+    /// provider's view.
+    fn notes_with_capture_indicator() -> Vec<WindowInfo> {
+        let mut provider_view = window(19099, 6, "", (200.0, 96.0, 14.0, 14.0));
+        provider_view.pid = PROVIDER_PID;
+        provider_view.app_name = "ThemeWidgetControlViewService".into();
+        vec![
+            window(19080, 1, "Notes", (0.0, 34.0, 1696.0, 1083.0)),
+            window(19083, 5, "Window", (191.0, 90.0, 66.0, 20.0)),
+            provider_view,
+        ]
+    }
+
+    #[test]
+    fn a_capture_lease_indicator_is_not_the_window_in_front() {
+        let order =
+            resolve_process_front_order(&notes_with_capture_indicator(), NOTES_PID, 19080, |pid| {
+                pid == PROVIDER_PID
+            });
+        assert!(order.target_is_front, "{:?}", order.in_front);
+        assert_eq!(order.in_front, None);
+    }
+
+    /// The same geometry without a provider view inside it is an ordinary
+    /// window of the process, and is still named as the one in front.
+    #[test]
+    fn an_unclassified_small_window_in_front_is_still_named() {
+        let mut windows = notes_with_capture_indicator();
+        windows.pop();
+        let order =
+            resolve_process_front_order(&windows, NOTES_PID, 19080, |pid| pid == PROVIDER_PID);
+        assert!(!order.target_is_front);
+        assert_eq!(
+            order.in_front.map(|in_front| in_front.window_id),
+            Some(19083)
+        );
+    }
+
+    #[test]
+    fn the_indicator_does_not_hide_a_real_panel_behind_it() {
+        let mut windows = notes_with_capture_indicator();
+        windows.push(window(19091, 3, "Print", (300.0, 200.0, 620.0, 480.0)));
+        let order =
+            resolve_process_front_order(&windows, NOTES_PID, 19080, |pid| pid == PROVIDER_PID);
+        assert!(!order.target_is_front);
+        let in_front = order.in_front.expect("the app's own panel");
+        assert_eq!(in_front.window_id, 19091);
+        assert_eq!(in_front.title, "Print");
     }
 }
 

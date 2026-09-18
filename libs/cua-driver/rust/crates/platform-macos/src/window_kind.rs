@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::windows::{WindowBounds, WindowInfo};
 
@@ -45,10 +45,10 @@ pub fn window_sharing_indicator_candidates(
     candidates
 }
 
-pub fn system_overlay_window_ids(windows: &[WindowInfo]) -> HashSet<u32> {
+/// The windows a roster reports as `system_overlay`. Candidates are rare (a
+/// capture lease draws one indicator), so the ids stay an ordered list.
+pub fn system_overlay_window_ids(windows: &[WindowInfo]) -> Vec<u32> {
     window_sharing_indicator_candidates(windows, runs_indicator_provider)
-        .into_iter()
-        .collect()
 }
 
 fn provider_pid(
@@ -78,7 +78,7 @@ fn encloses(outer: &WindowBounds, inner: &WindowBounds) -> bool {
         && inner.y + inner.height <= outer.y + outer.height
 }
 
-fn runs_indicator_provider(pid: i32) -> bool {
+pub(crate) fn runs_indicator_provider(pid: i32) -> bool {
     executable_path(pid).as_deref() == Some(INDICATOR_PROVIDER_EXECUTABLE)
 }
 
