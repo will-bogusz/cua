@@ -335,10 +335,13 @@ pub(crate) fn background_refusal_result(
         "reason": refusal.reason,
     });
     if let Some(advice) = refusal.advice {
-        structured["escalation"] = serde_json::json!({
-            "recommended": advice,
-            "reason": refusal.reason,
-        });
+        structured["advice"] = serde_json::json!(advice.as_str());
+        if let Some(target) = advice.escalation_target() {
+            structured["escalation"] = serde_json::json!({
+                "target": target,
+                "reason": "route_unavailable",
+            });
+        }
     }
     cua_driver_core::protocol::ToolResult::error(format!(
         "Background input refused ({}): {}",

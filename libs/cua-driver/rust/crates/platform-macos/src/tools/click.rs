@@ -166,8 +166,13 @@ impl AxActionReplyError {
             crate::ax::bindings::kAXErrorFailure => "kAXErrorFailure",
             crate::ax::bindings::kAXErrorAttributeUnsupported => "kAXErrorAttributeUnsupported",
             crate::ax::bindings::kAXErrorActionUnsupported => "kAXErrorActionUnsupported",
+            crate::ax::bindings::kAXErrorInvalidUIElement => "kAXErrorInvalidUIElement",
             _ => "AXError",
         }
+    }
+
+    fn element_is_gone(&self) -> bool {
+        self.code == crate::ax::bindings::kAXErrorInvalidUIElement
     }
 }
 
@@ -359,6 +364,30 @@ fn ax_action_error(error: anyhow::Error) -> ToolResult {
     }
     if let Some(disabled) = error.downcast_ref::<ElementDisabled>() {
         return ToolResult::error(disabled.reason()).with_structured(disabled.payload());
+    }
+    if let Some(reply) = error
+        .downcast_ref::<AxActionReplyError>()
+        .filter(|reply| reply.element_is_gone())
+    {
+        return ToolResult::error(format!(
+            "The addressed element no longer exists (its accessibility reference is invalid): \
+             {}({}) returned {} ({}). Nothing was dispatched. Re-observe the window and \
+             re-address the element.",
+            "AXUIElementPerformAction",
+            reply.action,
+            reply.code,
+            reply.code_name()
+        ))
+        .with_structured(serde_json::json!({
+            "code": "element_no_longer_exists",
+            "effect": "not_dispatched",
+            "route": "ax",
+            "action": reply.action,
+            "ax_error": reply.code,
+            "ax_error_name": reply.code_name(),
+            "dispatch": "not_dispatched",
+            "escalation": { "target": "snapshot", "reason": "route_unavailable" },
+        }));
     }
     if let Some(reply) = error.downcast_ref::<AxActionReplyError>() {
         ToolResult::error(format!(
@@ -2723,15 +2752,15 @@ mod tests {
     }
 
     /// A reply the framework produced rather than an application answering an
-    /// action — a dead element, disabled API, a messaging timeout — keeps the
-    /// error contract and its reconcile-first advice: nothing there says the
-    /// request ever reached the receiver.
+    /// action — disabled API, a messaging timeout — keeps the error contract
+    /// and its reconcile-first advice: nothing there says the request ever
+    /// reached the receiver, and nothing rules out that it did.
     #[test]
     fn framework_reply_errors_stay_failures_that_ask_for_reconciliation() {
         let mut receiver_commits = 0;
         let failure = dispatch_ax_action("AXPress", || {
             receiver_commits += 1;
-            crate::ax::bindings::kAXErrorInvalidUIElement
+            crate::ax::bindings::kAXErrorAPIDisabled
         })
         .unwrap_err();
         assert!(!failure.outcome_unverifiable());
@@ -2743,7 +2772,6 @@ mod tests {
         assert_eq!(data["dispatch"], "attempted");
         assert_eq!(data["effect"], "unverifiable");
         assert_eq!(data["retry"], "reconcile_first");
-        assert_eq!(data["ax_error"], -25202);
 
         let failure = dispatch_ax_action("AXPress", || -25204).unwrap_err();
         assert!(!failure.outcome_unverifiable());
@@ -2759,6 +2787,47 @@ mod tests {
         let result = ax_action_error(anyhow::anyhow!("target no longer exists"));
         assert_eq!(result.is_error, Some(true));
         assert!(result.structured_content.is_none());
+    }
+
+    fn reply_text(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `-25202` is the one reply code that proves the opposite of "attempted
+    /// and may already have taken effect": the reference was already invalid,
+    /// so the framework never reached the application.
+    #[test]
+    fn a_dead_element_reference_reports_that_nothing_was_dispatched() {
+        let reply = dispatch_ax_action("AXPress", || crate::ax::bindings::kAXErrorInvalidUIElement)
+            .unwrap_err();
+        assert!(reply.element_is_gone());
+        assert_eq!(reply.code_name(), "kAXErrorInvalidUIElement");
+
+        let result = ax_action_error(reply.into());
+        let text = reply_text(&result);
+        assert!(
+            text.contains("The addressed element no longer exists"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was dispatched."), "{text}");
+        assert!(
+            !text.contains("may already have taken effect"),
+            "still claimed a possible effect: {text}"
+        );
+        let data = result.structured_content.expect("structured refusal");
+        assert_eq!(data["code"], "element_no_longer_exists");
+        assert_eq!(data["effect"], "not_dispatched");
+        assert_eq!(data["ax_error"], -25202);
+        assert_eq!(data["ax_error_name"], "kAXErrorInvalidUIElement");
+        assert_eq!(data["escalation"]["target"], "snapshot");
+        assert_eq!(data["escalation"]["reason"], "route_unavailable");
     }
 
     fn disabled(role: &str, front_in_process: bool) -> ElementDisabled {

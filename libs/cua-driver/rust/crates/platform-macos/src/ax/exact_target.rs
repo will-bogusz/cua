@@ -16,7 +16,7 @@ use std::ffi::CStr;
 use super::bindings::{
     actual_pid_of_element, ax_get_window_id, copy_ax_window_surfaces, copy_bool_attr,
     copy_children, copy_element_attr, copy_only_child, copy_string_attr, focused_element_of_pid,
-    AXUIElementCreateApplication, AXUIElementRef,
+    try_copy_string_attr, AXUIElementCreateApplication, AXUIElementRef,
 };
 use crate::windows::{all_windows, resolve_window_owner, WindowOwner};
 
@@ -426,6 +426,20 @@ fn count_competing_keyboard_destinations(
         .count()
 }
 
+/// Whether `element`'s accessibility reference is no longer valid: the
+/// application destroyed the object, so every attribute read answers
+/// `kAXErrorInvalidUIElement` and no ancestry fact can exist for it.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn element_reference_invalid(element: AXUIElementRef) -> bool {
+    matches!(
+        try_copy_string_attr(element, "AXRole"),
+        Err(super::bindings::kAXErrorInvalidUIElement)
+    )
+}
+
 /// Gather fresh background-input facts for one `(pid, window_id)` target.
 ///
 /// `element_ptr` is an optional retained `AXUIElementRef` (as `usize`) for an
@@ -464,6 +478,9 @@ pub fn gather_background_facts(
             let app_hidden = copy_bool_attr(app, "AXHidden");
             let element = element_ptr.map(|ptr| {
                 let element = ptr as AXUIElementRef;
+                if element_reference_invalid(element) {
+                    return ElementAncestry::Gone;
+                }
                 let hosted = records
                     .iter()
                     .find(|record| record.window_id == window_id)
