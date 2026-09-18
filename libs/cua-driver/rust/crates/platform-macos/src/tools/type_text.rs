@@ -417,20 +417,13 @@ impl Tool for TypeTextTool {
 
         match result {
             Ok(Ok(outcome)) if outcome.delivered_chars.is_some_and(|n| n < char_count) => {
-                let delivered_chars = outcome.delivered_chars.unwrap_or_default();
-                ToolResult::error(format!(
-                    "type_text incomplete: delivered {delivered_chars} of {char_count} character(s){}; retry only the remaining suffix",
-                    outcome.detail
-                ))
-                .with_structured(serde_json::json!({
-                    "code": "type_text_incomplete",
-                    "path": outcome.path,
-                    "effect": "partial",
-                    "requested_chars": char_count,
-                    "delivered_chars": delivered_chars,
-                    "retryable": true,
-                    "retry_from_character": delivered_chars,
-                }))
+                incomplete_result(
+                    &text,
+                    char_count,
+                    outcome.delivered_chars.unwrap_or_default(),
+                    &outcome.detail,
+                    outcome.path,
+                )
             }
             Ok(Ok(outcome)) => {
                 let TypeTextOutcome {
@@ -827,6 +820,35 @@ fn no_destination_note(pid: i32, window_id: Option<u32>) -> String {
          posted blind and no field can be read back. Address the field itself: pass \
          element_index (or element_token) for it on this call, or use set_value."
     )
+}
+
+/// The reply for an insertion the read-back proved incomplete.
+///
+/// The undelivered remainder is spelled out. A caller that is told only to
+/// "retry the remaining suffix" has to slice the request by codepoint and
+/// guess where the caret stopped; the driver already knows both.
+fn incomplete_result(
+    text: &str,
+    requested_chars: usize,
+    delivered_chars: usize,
+    detail: &str,
+    path: &'static str,
+) -> ToolResult {
+    let remainder: String = text.chars().skip(delivered_chars).collect();
+    ToolResult::error(format!(
+        "type_text incomplete: delivered {delivered_chars} of {requested_chars} \
+         character(s){detail}; retry with text: {remainder:?}"
+    ))
+    .with_structured(serde_json::json!({
+        "code": "type_text_incomplete",
+        "path": path,
+        "effect": "partial",
+        "requested_chars": requested_chars,
+        "delivered_chars": delivered_chars,
+        "retryable": true,
+        "retry_from_character": delivered_chars,
+        "retry_text": remainder,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2010,6 +2032,42 @@ mod tests {
                 delivered: Some(text.chars().count()),
                 normalized: true,
             }
+        );
+    }
+
+    /// A partial insertion has to name the characters that did not arrive.
+    /// "retry only the remaining suffix" left the caller to slice the request
+    /// by codepoint and guess where the caret stopped — measured as declined
+    /// rather than followed.
+    #[test]
+    fn an_incomplete_insertion_spells_the_undelivered_remainder() {
+        let text = "(408) 961-1560";
+        let result = incomplete_result(text, text.chars().count(), 6, " via CGEvent", PATH_AX);
+        let structured = result
+            .structured_content
+            .clone()
+            .expect("incomplete payload");
+        assert_eq!(structured["retry_text"], serde_json::json!("961-1560"));
+        assert_eq!(structured["retry_from_character"], serde_json::json!(6));
+        let message = match &result.content[0] {
+            cua_driver_core::protocol::Content::Text { text, .. } => text.clone(),
+            other => panic!("expected a text reply, got {other:?}"),
+        };
+        assert!(
+            message.contains("961-1560"),
+            "the reply must carry the remainder itself: {message}"
+        );
+    }
+
+    /// Character offsets, not byte offsets: a multi-byte prefix must not slice
+    /// a codepoint in half.
+    #[test]
+    fn the_remainder_is_sliced_by_character() {
+        let text = "Ωcafé-tail";
+        let result = incomplete_result(text, text.chars().count(), 5, "", PATH_KEY_EVENTS);
+        assert_eq!(
+            result.structured_content.expect("payload")["retry_text"],
+            serde_json::json!("-tail")
         );
     }
 
