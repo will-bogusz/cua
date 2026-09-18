@@ -88,6 +88,37 @@ An action that reached an actuator but lacks a trusted readback is
 event receipt, and operator observation may remain useful internal diagnostics,
 but they do not independently justify `confirmed`.
 
+## Structured refusals are a separate channel
+
+A refusal that stops before any actuator runs is an MCP error payload, not an
+`ActionResult`. It carries a machine-readable `code`, a route-free `reason`,
+and the facts the decision actually read. The stable codes are defined once in
+`cua_driver_core::background_input::refusal_codes`:
+
+| Code | Meaning |
+| --- | --- |
+| `window_not_found` | the requested window does not exist |
+| `owner_pid_mismatch` | the window is not owned by the requested process |
+| `off_space_or_ax_unresolved` | the window is off-space or its accessibility peer could not be resolved |
+| `minimized_or_hidden_window` | the window cannot receive input in its current state |
+| `same_pid_keyboard_ambiguity` | the process owns more than one candidate key window |
+| `element_outside_target_window` | the addressed element could not be proven to belong to the requested window |
+| `element_no_longer_exists` | the addressed element's accessibility reference is invalid; the window itself is unchanged |
+| `element_disabled` | the application reports `enabled = false` on the target, so no delivery mode and no activation can act on it |
+
+`element_no_longer_exists` escalates with `target: "snapshot"`: only a fresh
+observation can produce an addressable element. `element_disabled` carries no
+escalation — the application disabled the control, and no rung of the ladder
+changes that. Its payload names the control and the state the decision read:
+`action`, `role`, `label`, `window_id`, `pid`, `foreground`,
+`front_in_process`, and `obscured_by` when another window of the same process
+is in front.
+
+These payloads may also carry `effect: "not_dispatched"`. That value is
+deliberately not a member of the closed `ActionEffect` enum: an `ActionResult`
+is only produced once an actuator ran, so nothing that reaches the typed
+contract can be `not_dispatched`.
+
 ## Verification remains separate
 
 After an action, use `verify_state` for a bounded structured postcondition.
