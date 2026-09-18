@@ -222,6 +222,9 @@ pub struct ActionFallback {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionEscalation {
     pub kind: EscalationKind,
+    /// The platform's own `escalation.reason`. Published verbatim when it
+    /// spells a reason the contract knows; otherwise the escalation target's
+    /// own reason stands, because no observation was reported.
     pub detail: Option<String>,
 }
 
@@ -390,11 +393,11 @@ impl ActionExecutionRecord {
                     ActionEscalation, ActionEscalationReason, ActionEscalationTarget,
                 };
 
-                let (target, reason) = match escalation.kind {
+                let (target, unobserved_reason) = match escalation.kind {
                     EscalationKind::ActivateTarget
                     | EscalationKind::RetryWithForegroundDelivery => (
                         ActionEscalationTarget::Foreground,
-                        ActionEscalationReason::DeliveryFailed,
+                        ActionEscalationReason::EffectUnconfirmed,
                     ),
                     EscalationKind::RetryWithPixelTarget => (
                         ActionEscalationTarget::Pixel,
@@ -429,6 +432,11 @@ impl ActionExecutionRecord {
                         ActionEscalationReason::RouteUnavailable,
                     ),
                 };
+                let reason = escalation
+                    .detail
+                    .as_deref()
+                    .and_then(observed_escalation_reason)
+                    .unwrap_or(unobserved_reason);
                 ActionEscalation {
                     target,
                     reason: if projection.effect == ActionEffect::SuspectedNoop
@@ -714,6 +722,13 @@ fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<&str> 
         .unwrap_or_default()
 }
 
+/// Only a published reason spelling counts as an observation. Prose yields
+/// `None`, so the escalation target's own reason stands instead of the
+/// platform being credited with a delivery failure it never probed for.
+fn observed_escalation_reason(raw: &str) -> Option<cua_driver_contract::ActionEscalationReason> {
+    serde_json::from_value(serde_json::Value::String(raw.to_owned())).ok()
+}
+
 fn transport_from_legacy(
     tool_name: &str,
     args: &serde_json::Value,
@@ -759,7 +774,9 @@ fn transport_from_legacy(
         "cua_compositor_inject" | "wayland_cua_compositor" => {
             ActionTransport::LinuxCuaCompositorInject
         }
-        "hid" | "cgevent_hid" | "cgevent_fg" => ActionTransport::MacosCgEventHid,
+        "hid" | "cgevent_hid" | "cgevent_fg" | "key_events_hid_fg" => {
+            ActionTransport::MacosCgEventHid
+        }
         "cgevent" => {
             if args
                 .get("delivery_mode")
@@ -780,11 +797,7 @@ fn transport_from_legacy(
                     .and_then(serde_json::Value::as_str)
                     == Some("foreground");
             if cfg!(target_os = "macos") {
-                if foreground {
-                    ActionTransport::MacosCgEventHid
-                } else {
-                    ActionTransport::MacosCgEventPid
-                }
+                ActionTransport::MacosCgEventPid
             } else if cfg!(target_os = "windows") {
                 if foreground {
                     ActionTransport::WindowsSendInput
@@ -1436,7 +1449,7 @@ mod tests {
             (
                 EscalationKind::RetryWithForegroundDelivery,
                 ActionEscalationTarget::Foreground,
-                ActionEscalationReason::DeliveryFailed,
+                ActionEscalationReason::EffectUnconfirmed,
             ),
             (
                 EscalationKind::RequestPermission,
@@ -2103,6 +2116,74 @@ mod tests {
         );
     }
 
+    /// A foreground escalation used to mint `delivery_failed` from its own
+    /// target, so an unprobed post reported a delivery failure nobody
+    /// observed. Only a reason the platform actually spelled may be published.
+    #[test]
+    fn an_unprobed_post_does_not_claim_an_observed_delivery_failure() {
+        for (declared, expected) in [
+            (
+                "a background combo didn't land? menu key-equivalents often \
+                 need the window fronted",
+                cua_driver_contract::ActionEscalationReason::EffectUnconfirmed,
+            ),
+            (
+                "delivery_failed",
+                cua_driver_contract::ActionEscalationReason::DeliveryFailed,
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "hotkey",
+                &serde_json::json!({"delivery_mode": "background"}),
+                &serde_json::json!({
+                    "path": "key_events",
+                    "verified": false,
+                    "effect": "unverifiable",
+                    "escalation": {
+                        "recommended": "foreground",
+                        "reason": declared,
+                    },
+                }),
+            )
+            .expect("background hotkey should normalize");
+            let escalation = record
+                .public_result()
+                .expect("public ActionResult")
+                .escalation
+                .expect("the producer named a rung");
+            assert_eq!(
+                escalation.target,
+                cua_driver_contract::ActionEscalationTarget::Foreground
+            );
+            assert_eq!(
+                escalation.reason, expected,
+                "published reason for a producer reason of {declared:?}"
+            );
+        }
+    }
+
+    /// The macOS foreground key rungs post to the pid; only the guarded HID
+    /// branches use the event tap. One label cannot carry both.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_foreground_key_post_is_not_the_global_input_tap() {
+        for (path, route) in [
+            ("key_events_fg", ActionRoute::SyntheticEvents),
+            ("key_events_hid_fg", ActionRoute::GlobalInput),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "hotkey",
+                &serde_json::json!({"delivery_mode": "foreground"}),
+                &serde_json::json!({
+                    "path": path,
+                    "effect": "unverifiable",
+                }),
+            )
+            .expect("foreground hotkey should normalize");
+            assert_eq!(record.transport.route(), route, "route for path {path}");
+        }
+    }
+
     #[test]
     fn legacy_partial_requires_an_explicit_delivered_count() {
         assert!(
@@ -2168,6 +2249,7 @@ mod tests {
             "trusted",
             "key_events",
             "key_events_fg",
+            "key_events_hid_fg",
             "pixel",
         ];
         for path in paths {
