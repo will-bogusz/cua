@@ -25,8 +25,9 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_children, copy_string_attr, element_at_screen_position,
-    element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
+    copy_action_names, copy_children, copy_label_attr, copy_string_attr,
+    element_at_screen_position, element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction,
+    AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::input::ax_actions::{requests_ax_action, resolve_ax_action, UnknownAxAction};
@@ -165,8 +166,13 @@ impl AxActionReplyError {
             crate::ax::bindings::kAXErrorFailure => "kAXErrorFailure",
             crate::ax::bindings::kAXErrorAttributeUnsupported => "kAXErrorAttributeUnsupported",
             crate::ax::bindings::kAXErrorActionUnsupported => "kAXErrorActionUnsupported",
+            crate::ax::bindings::kAXErrorInvalidUIElement => "kAXErrorInvalidUIElement",
             _ => "AXError",
         }
+    }
+
+    fn element_is_gone(&self) -> bool {
+        self.code == crate::ax::bindings::kAXErrorInvalidUIElement
     }
 }
 
@@ -182,6 +188,21 @@ fn dispatch_ax_action(
             action: action.to_owned(),
             code,
         })
+    }
+}
+
+/// The requested AX action and whether the caller named it; an omitted `action` is a plain click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestedAction<'a> {
+    action: &'a str,
+    named_by_caller: bool,
+}
+
+fn press_route_advice(press_is_advertised: bool) -> &'static str {
+    if press_is_advertised {
+        " The row's own press action is available as perform(\"press\")."
+    } else {
+        ""
     }
 }
 
@@ -241,6 +262,95 @@ fn ax_reply_summary(
     }
 }
 
+/// The application itself reports the addressed control disabled, with the
+/// focus and window-order state that decides which routes are real.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ElementDisabled {
+    action: String,
+    role: String,
+    label: String,
+    window_id: u32,
+    pid: i32,
+    foreground: bool,
+    front_in_process: bool,
+    obscuring_window: Option<super::ObscuringWindow>,
+}
+
+impl ElementDisabled {
+    fn reason(&self) -> String {
+        let Self {
+            action,
+            role,
+            label,
+            window_id,
+            pid,
+            ..
+        } = self;
+        if role == "AXMenuItem" {
+            return format!(
+                "{action} was not dispatched: the {role} \"{label}\" of an open menu reports \
+                 AXEnabled=false. A menu item's enabled state tracks the application's own \
+                 applicability, not focus or delivery mode: it is disabled in pid {pid}'s \
+                 current state."
+            );
+        }
+        if let Some(obscuring) = &self.obscuring_window {
+            let blocker = obscuring.window_id;
+            let route = if obscuring.is_focusable() {
+                format!("Dismiss that window, or address window {blocker} and act on it there.")
+            } else {
+                "It publishes no AXWindow, so it cannot become the focused window: dismiss it, \
+                 or act on it by pixel."
+                    .to_owned()
+            };
+            return format!(
+                "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
+                 AXEnabled=false, and window {blocker} — pid {pid}'s own front window, {} — is \
+                 drawn in front of it. {route}",
+                obscuring.describe()
+            );
+        }
+        let order = if self.front_in_process {
+            format!("Window {window_id} is already pid {pid}'s front window")
+        } else {
+            format!("No window of pid {pid} is drawn in front of window {window_id}")
+        };
+        format!(
+            "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
+             AXEnabled=false. {order} — the application disabled this control, and neither \
+             delivery mode nor activation changes that. Satisfy its precondition or choose \
+             another control."
+        )
+    }
+
+    fn payload(&self) -> Value {
+        let mut payload = serde_json::json!({
+            "code": "element_disabled",
+            "effect": "not_dispatched",
+            "route": "ax",
+            "action": self.action,
+            "role": self.role,
+            "label": self.label,
+            "window_id": self.window_id,
+            "pid": self.pid,
+            "foreground": self.foreground,
+            "front_in_process": self.front_in_process,
+        });
+        if let Some(obscuring) = &self.obscuring_window {
+            payload["obscured_by"] = obscuring.payload();
+        }
+        payload
+    }
+}
+
+impl std::fmt::Display for ElementDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason())
+    }
+}
+
+impl std::error::Error for ElementDisabled {}
+
 fn ax_action_error(error: anyhow::Error) -> ToolResult {
     if let Some(unknown) = error.downcast_ref::<UnknownAxAction>() {
         return ToolResult::error(format!("click refused: {error}")).with_structured(
@@ -251,6 +361,33 @@ fn ax_action_error(error: anyhow::Error) -> ToolResult {
                 "advertised_actions": unknown.advertised,
             }),
         );
+    }
+    if let Some(disabled) = error.downcast_ref::<ElementDisabled>() {
+        return ToolResult::error(disabled.reason()).with_structured(disabled.payload());
+    }
+    if let Some(reply) = error
+        .downcast_ref::<AxActionReplyError>()
+        .filter(|reply| reply.element_is_gone())
+    {
+        return ToolResult::error(format!(
+            "The addressed element no longer exists (its accessibility reference is invalid): \
+             {}({}) returned {} ({}). Nothing was dispatched. Re-observe the window and \
+             re-address the element.",
+            "AXUIElementPerformAction",
+            reply.action,
+            reply.code,
+            reply.code_name()
+        ))
+        .with_structured(serde_json::json!({
+            "code": "element_no_longer_exists",
+            "effect": "not_dispatched",
+            "route": "ax",
+            "action": reply.action,
+            "ax_error": reply.code,
+            "ax_error_name": reply.code_name(),
+            "dispatch": "not_dispatched",
+            "escalation": { "target": "snapshot", "reason": "route_unavailable" },
+        }));
     }
     if let Some(reply) = error.downcast_ref::<AxActionReplyError>() {
         ToolResult::error(format!(
@@ -638,6 +775,7 @@ impl Tool for ClickTool {
         let y = args
             .opt_f64("y")
             .or_else(|| args.opt_i64("y").map(|i| i as f64));
+        let action_named_by_caller = args.opt_str("action").is_some();
         let action = args.str_or("action", "press");
         // Surface 5: optional `button` arg, default "left" preserves legacy behaviour.
         // Pixel path: routes to left/right/middle CGEvent primitives.
@@ -1006,7 +1144,10 @@ impl Tool for ClickTool {
                                     idx,
                                     pid,
                                     wid,
-                                    &action_clone,
+                                    RequestedAction {
+                                        action: &action_clone,
+                                        named_by_caller: action_named_by_caller,
+                                    },
                                     &ck,
                                     selection_pixel,
                                     menu_pixel,
@@ -1040,7 +1181,10 @@ impl Tool for ClickTool {
                                 idx,
                                 pid,
                                 wid,
-                                &action_clone,
+                                RequestedAction {
+                                    action: &action_clone,
+                                    named_by_caller: action_named_by_caller,
+                                },
                                 &ck,
                                 selection_pixel,
                                 menu_pixel,
@@ -1835,7 +1979,7 @@ fn perform_ax_click(
     idx: usize,
     pid: i32,
     window_id: u32,
-    action_str: &str,
+    requested: RequestedAction<'_>,
     cursor_key: &str,
     selection_pixel: Option<SelectionPixelTarget>,
     menu_pixel: Option<SelectionPixelTarget>,
@@ -1847,27 +1991,47 @@ fn perform_ax_click(
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
     let advertised = crate::ax::actions::split(unsafe { copy_action_names(element) });
-    let ax_action = resolve_ax_action(action_str, &advertised).ok_or_else(|| {
+    let ax_action = resolve_ax_action(requested.action, &advertised).ok_or_else(|| {
         anyhow::Error::new(UnknownAxAction {
-            requested: action_str.to_owned(),
+            requested: requested.action.to_owned(),
             advertised: advertised.names(),
         })
     })?;
 
-    // Check the live value immediately before dispatch. Foreground assist can
+    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+    let title = unsafe { copy_label_attr(element) }.unwrap_or_default();
+
+    // Read the live value immediately before dispatch. Foreground assist can
     // enable menu items that were disabled in the cached snapshot, while a
     // background transition can disable them after that snapshot. macOS may
     // otherwise return success for a disabled action that did nothing.
-    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, &ax_action)?;
+    if crate::input::ax_actions::ax_element_enabled(element_ptr) == Some(false) {
+        let order = super::process_front_order(pid, window_id);
+        return Err(anyhow::Error::new(ElementDisabled {
+            action: ax_action.clone(),
+            role: role.clone(),
+            label: title.clone(),
+            window_id,
+            pid,
+            foreground,
+            front_in_process: order.target_is_front,
+            obscuring_window: order.in_front,
+        }));
+    }
 
-    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-    let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-
-    // A click on an AppKit collection item is frequently represented by a
-    // label child or row that does not advertise AXPress. Prefer a bounded,
-    // read-back-verified AXSelected write over dispatching a known hollow press
-    // or forcing the caller onto a less stable pixel coordinate.
-    if ax_action == "AXPress" && !advertised.advertises(&ax_action) {
+    // On a collection row the pointer gesture is select, so a plain click takes
+    // the bounded, read-back-verified AXSelected write whether or not the
+    // element advertises AXPress: press is the application's own default
+    // action, reachable only when the caller names it. Elsewhere this is still
+    // the path for an item whose selectable object is an ancestor.
+    let press_is_advertised = advertised.advertises(&ax_action);
+    if ax_action == "AXPress"
+        && (!press_is_advertised
+            || (!requested.named_by_caller
+                && crate::input::ax_actions::click_selects_role(&role)
+                && crate::input::ax_actions::exposes_selected(element_ptr)))
+    {
+        let press_route = press_route_advice(press_is_advertised);
         if modifiers.is_empty() {
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr)
@@ -1875,7 +2039,7 @@ fn perform_ax_click(
                 return Ok(AxClickOutcome {
                     summary: format!(
                         "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\"; \
-                         confirmed AXSelected=true."
+                         confirmed AXSelected=true.{press_route}"
                     ),
                     selection_verified: true,
                     ..AxClickOutcome::default()
@@ -1947,7 +2111,7 @@ fn perform_ax_click(
                                         "✅ Selected nearest {selected_role} for [{idx}] {role} \
                                          \"{title}\"; AX selection write was unavailable, so a \
                                          coordinate click was delivered and confirmed by stable \
-                                         AXSelected read-back."
+                                         AXSelected read-back.{press_route}"
                                     ),
                                     selection_verified: true,
                                     selection_via_pixel: true,
@@ -2588,15 +2752,15 @@ mod tests {
     }
 
     /// A reply the framework produced rather than an application answering an
-    /// action — a dead element, disabled API, a messaging timeout — keeps the
-    /// error contract and its reconcile-first advice: nothing there says the
-    /// request ever reached the receiver.
+    /// action — disabled API, a messaging timeout — keeps the error contract
+    /// and its reconcile-first advice: nothing there says the request ever
+    /// reached the receiver, and nothing rules out that it did.
     #[test]
     fn framework_reply_errors_stay_failures_that_ask_for_reconciliation() {
         let mut receiver_commits = 0;
         let failure = dispatch_ax_action("AXPress", || {
             receiver_commits += 1;
-            crate::ax::bindings::kAXErrorInvalidUIElement
+            crate::ax::bindings::kAXErrorAPIDisabled
         })
         .unwrap_err();
         assert!(!failure.outcome_unverifiable());
@@ -2608,7 +2772,6 @@ mod tests {
         assert_eq!(data["dispatch"], "attempted");
         assert_eq!(data["effect"], "unverifiable");
         assert_eq!(data["retry"], "reconcile_first");
-        assert_eq!(data["ax_error"], -25202);
 
         let failure = dispatch_ax_action("AXPress", || -25204).unwrap_err();
         assert!(!failure.outcome_unverifiable());
@@ -2624,6 +2787,175 @@ mod tests {
         let result = ax_action_error(anyhow::anyhow!("target no longer exists"));
         assert_eq!(result.is_error, Some(true));
         assert!(result.structured_content.is_none());
+    }
+
+    fn reply_text(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `-25202` is the one reply code that proves the opposite of "attempted
+    /// and may already have taken effect": the reference was already invalid,
+    /// so the framework never reached the application.
+    #[test]
+    fn a_dead_element_reference_reports_that_nothing_was_dispatched() {
+        let reply = dispatch_ax_action("AXPress", || crate::ax::bindings::kAXErrorInvalidUIElement)
+            .unwrap_err();
+        assert!(reply.element_is_gone());
+        assert_eq!(reply.code_name(), "kAXErrorInvalidUIElement");
+
+        let result = ax_action_error(reply.into());
+        let text = reply_text(&result);
+        assert!(
+            text.contains("The addressed element no longer exists"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was dispatched."), "{text}");
+        assert!(
+            !text.contains("may already have taken effect"),
+            "still claimed a possible effect: {text}"
+        );
+        let data = result.structured_content.expect("structured refusal");
+        assert_eq!(data["code"], "element_no_longer_exists");
+        assert_eq!(data["effect"], "not_dispatched");
+        assert_eq!(data["ax_error"], -25202);
+        assert_eq!(data["ax_error_name"], "kAXErrorInvalidUIElement");
+        assert_eq!(data["escalation"]["target"], "snapshot");
+        assert_eq!(data["escalation"]["reason"], "route_unavailable");
+    }
+
+    fn disabled(role: &str, front_in_process: bool) -> ElementDisabled {
+        ElementDisabled {
+            action: "AXPress".to_owned(),
+            role: role.to_owned(),
+            label: "Back".to_owned(),
+            window_id: 17002,
+            pid: 47983,
+            foreground: false,
+            front_in_process,
+            obscuring_window: None,
+        }
+    }
+
+    #[test]
+    fn a_disabled_control_already_in_front_names_no_route() {
+        let reason = disabled("AXButton", true).reason();
+        assert!(
+            reason.contains("window 17002 reports AXEnabled=false"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Window 17002 is already pid 47983's front window"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("neither delivery mode nor activation changes that"),
+            "{reason}"
+        );
+        for ruled_out in ["foreground", "bring_to_front"] {
+            assert!(
+                !reason.contains(ruled_out),
+                "named a route the state rules out ({ruled_out}): {reason}"
+            );
+        }
+    }
+
+    fn blocker(window_id: u32, title: &str, ax_backed: bool) -> super::super::ObscuringWindow {
+        super::super::ObscuringWindow {
+            window_id,
+            title: title.to_owned(),
+            layer: 0,
+            ax_backed: Some(ax_backed),
+            role: ax_backed.then(|| "AXWindow".to_owned()),
+            subrole: ax_backed.then(|| "AXUnknown".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_disabled_control_behind_an_ax_backed_panel_offers_that_window() {
+        let mut state = disabled("AXButton", false);
+        state.obscuring_window = Some(blocker(17018, "", true));
+        let reason = state.reason();
+        assert!(
+            reason.contains(
+                "window 17018 — pid 47983's own front window, titleless, AXWindow/AXUnknown — is \
+                 drawn in front of it"
+            ),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Dismiss that window, or address window 17018 and act on it there."),
+            "{reason}"
+        );
+
+        let payload = state.payload();
+        assert_eq!(payload["code"], "element_disabled");
+        assert_eq!(payload["effect"], "not_dispatched");
+        assert_eq!(payload["front_in_process"], false);
+        assert_eq!(payload["obscured_by"]["window_id"], 17018);
+        assert_eq!(payload["obscured_by"]["layer"], 0);
+        assert_eq!(payload["obscured_by"]["ax_backed"], true);
+        assert_eq!(payload["obscured_by"]["subrole"], "AXUnknown");
+    }
+
+    /// A layer-0 panel with no `AXWindow` can never become the focused window,
+    /// so the reply must not offer to address it.
+    #[test]
+    fn a_panel_with_no_ax_surface_is_not_offered_as_a_target() {
+        let mut state = disabled("AXButton", false);
+        state.obscuring_window = Some(blocker(17013, "", false));
+        let reason = state.reason();
+        assert!(
+            reason.contains("own front window, titleless, no AX surface — is drawn in front of it"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(
+                "It publishes no AXWindow, so it cannot become the focused window: dismiss it, \
+                 or act on it by pixel."
+            ),
+            "{reason}"
+        );
+        assert!(!reason.contains("address window"), "{reason}");
+        assert_eq!(state.payload()["obscured_by"]["ax_backed"], false);
+        assert!(
+            state.payload()["obscured_by"]["role"].is_null(),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_menu_item_is_disabled_by_app_state_not_by_focus() {
+        let reason = disabled("AXMenuItem", false).reason();
+        assert!(
+            reason
+                .contains("tracks the application's own applicability, not focus or delivery mode"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("disabled in pid 47983's current state"),
+            "{reason}"
+        );
+        assert!(!reason.contains("foreground"), "{reason}");
+    }
+
+    #[test]
+    fn a_titled_blocker_is_named_by_its_title() {
+        let mut state = disabled("AXButton", false);
+        state.obscuring_window = Some(blocker(17018, "Print", true));
+        assert!(
+            state
+                .reason()
+                .contains("own front window, titled \"Print\", AXWindow/AXUnknown —"),
+            "{}",
+            state.reason()
+        );
     }
 
     /// Surface 5: schema must advertise the new `button` field with the three

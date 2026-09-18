@@ -63,6 +63,11 @@ pub enum ElementAncestry {
     /// Ancestry could not be resolved (dead element, SPI failure). An address
     /// the shell cannot re-prove is not an exact target.
     Unproven,
+    /// The addressed element's accessibility reference is no longer valid: the
+    /// application destroyed the object, so every attribute read answers
+    /// `kAXErrorInvalidUIElement` and no ancestry fact can exist for it. This
+    /// is a fact about the element, not a doubt about the window.
+    Gone,
 }
 
 /// Fresh facts about one exact target, gathered by the platform shell.
@@ -126,6 +131,45 @@ pub mod refusal_codes {
     pub const MINIMIZED_OR_HIDDEN: &str = "minimized_or_hidden_window";
     pub const SAME_PID_KEYBOARD_AMBIGUITY: &str = "same_pid_keyboard_ambiguity";
     pub const ELEMENT_OUTSIDE_TARGET_WINDOW: &str = "element_outside_target_window";
+    pub const ELEMENT_NO_LONGER_EXISTS: &str = "element_no_longer_exists";
+}
+
+/// The safe next route a decision proved available, as a token the consumer
+/// renders into whatever call its own surface exposes.
+///
+/// A driver cannot know whether its consumer offers `get_window_state`,
+/// `observe()`, or neither, so it names the kind of move, never the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundAdvice {
+    /// Re-observe the window, then re-address the element from that snapshot.
+    Snapshot,
+    /// Acquire the window the element actually belongs to and act there.
+    AcquireWindow,
+    /// Retry the same action with foreground delivery.
+    Foreground,
+    /// Address the field itself with an exact element action.
+    Element,
+}
+
+impl BackgroundAdvice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::AcquireWindow => "acquire_window",
+            Self::Foreground => "foreground",
+            Self::Element => "element",
+        }
+    }
+
+    /// The contract `escalation.target` for this advice, when one exists.
+    pub fn escalation_target(self) -> Option<&'static str> {
+        match self {
+            Self::Snapshot => Some("snapshot"),
+            Self::Foreground => Some("foreground"),
+            Self::Element => Some("element"),
+            Self::AcquireWindow => None,
+        }
+    }
 }
 
 /// A typed refusal: no actuator ran and none may run for this decision.
@@ -135,7 +179,7 @@ pub struct BackgroundRefusal {
     pub reason: String,
     /// The safe next route when one actually exists (advice for an explicit
     /// caller decision, never an implicit fallback).
-    pub advice: Option<&'static str>,
+    pub advice: Option<BackgroundAdvice>,
 }
 
 /// Verification binding for an executed route: evidence is acceptable only
@@ -174,7 +218,7 @@ impl BackgroundInputDecision {
 fn refuse(
     code: &'static str,
     reason: String,
-    advice: Option<&'static str>,
+    advice: Option<BackgroundAdvice>,
 ) -> BackgroundInputDecision {
     BackgroundInputDecision::Refuse(BackgroundRefusal {
         code,
@@ -230,6 +274,17 @@ pub fn decide_background_input(
     }
 
     match facts.element {
+        ElementAncestry::Gone => {
+            return refuse(
+                refusal_codes::ELEMENT_NO_LONGER_EXISTS,
+                format!(
+                    "the addressed element no longer exists (its accessibility reference is \
+                     invalid); window {} is unchanged",
+                    target.window_id
+                ),
+                Some(BackgroundAdvice::Snapshot),
+            );
+        }
         ElementAncestry::NotAddressed | ElementAncestry::ProvenDescendant => {}
         // An application menu is owned by the process, not by a window, and a
         // sheet is the requested window's own modal state, so a semantic AX
@@ -244,10 +299,11 @@ pub fn decide_background_input(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
                 format!(
                     "this element belongs to attached sheet {window_id} (pid {pid}) of \
-                     window {} — acquire that window id and act there",
+                     window {}, which is a separate window; address that sheet and act \
+                     there",
                     target.window_id
                 ),
-                Some("get_window_state"),
+                Some(BackgroundAdvice::AcquireWindow),
             );
         }
         ElementAncestry::OutsideTargetWindow { pid, window_id } => {
@@ -259,21 +315,36 @@ pub fn decide_background_input(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
                 format!(
                     "this element belongs to window {window_id} ({owner}), not to the \
-                     requested window {} — acquire that window id and act there",
+                     requested window {}; address that window and act there",
                     target.window_id
                 ),
-                Some("get_window_state"),
+                Some(BackgroundAdvice::AcquireWindow),
             );
         }
-        ElementAncestry::Unproven | ElementAncestry::ProvenAppMenu => {
+        ElementAncestry::ProvenAppMenu => {
+            return refuse(
+                refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
+                format!(
+                    "this element belongs to pid {}'s own menu bar, which is \
+                     process-scoped and has no window ancestry by construction; a \
+                     window-stamped pointer event or a process-scoped keystroke would \
+                     land somewhere other than the menu row that was addressed. A \
+                     semantic action on the row itself is exactly addressed",
+                    target.pid
+                ),
+                Some(BackgroundAdvice::Element),
+            );
+        }
+        ElementAncestry::Unproven => {
             return refuse(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
                 format!(
                     "the addressed element could not be proven to belong to window {}; \
-                     take a fresh get_window_state snapshot and re-address it",
+                     re-observe the window and re-address the element from that \
+                     observation",
                     target.window_id
                 ),
-                Some("get_window_state"),
+                Some(BackgroundAdvice::Snapshot),
             );
         }
     }
@@ -288,7 +359,7 @@ pub fn decide_background_input(
                  remains available",
                 target.window_id
             ),
-            Some("foreground"),
+            Some(BackgroundAdvice::Foreground),
         );
     }
 
@@ -314,7 +385,7 @@ pub fn decide_background_input(
                          instead",
                         target.window_id
                     ),
-                    Some("accessibility"),
+                    Some(BackgroundAdvice::Element),
                 );
             }
             BackgroundInputDecision::Execute {
@@ -334,7 +405,7 @@ pub fn decide_background_input(
                          action:\"confirm\"/\"press\") instead",
                         target.window_id
                     ),
-                    Some("accessibility"),
+                    Some(BackgroundAdvice::Element),
                 );
             }
             debug_assert!(action.is_pid_keyboard());
@@ -344,11 +415,11 @@ pub fn decide_background_input(
                     format!(
                         "pid {} owns {} other eligible top-level window(s); process-scoped \
                          key events cannot be proven to reach window {} and could mutate a \
-                         sibling window. Use an exact element action, the page tool for \
-                         browser content, or delivery_mode:\"foreground\"",
+                         sibling window. Address the field itself with an exact element \
+                         action, or request foreground delivery",
                         target.pid, facts.competing_keyboard_destinations, target.window_id
                     ),
-                    Some("accessibility"),
+                    Some(BackgroundAdvice::Element),
                 );
             }
             BackgroundInputDecision::Execute {
@@ -453,6 +524,32 @@ mod tests {
         match decision {
             BackgroundInputDecision::Refuse(refusal) => refusal.reason,
             BackgroundInputDecision::Execute { .. } => panic!("expected a refusal"),
+        }
+    }
+
+    /// A destroyed element is a fact about the element. Reporting it as an
+    /// ancestry doubt sent callers to re-check a window that never changed.
+    #[test]
+    fn a_destroyed_element_is_refused_as_gone_not_as_an_ancestry_doubt() {
+        let mut facts = matched_facts();
+        facts.element = ElementAncestry::Gone;
+        for action in ALL_ACTIONS {
+            let BackgroundInputDecision::Refuse(refusal) =
+                decide_background_input(TARGET, &facts, action)
+            else {
+                panic!("a gone element must refuse every route: {action:?}");
+            };
+            assert_eq!(refusal.code, refusal_codes::ELEMENT_NO_LONGER_EXISTS);
+            assert_eq!(
+                refusal.reason,
+                "the addressed element no longer exists (its accessibility reference is \
+                 invalid); window 700 is unchanged"
+            );
+            assert_eq!(refusal.advice, Some(BackgroundAdvice::Snapshot));
+            assert_eq!(
+                refusal.advice.and_then(|advice| advice.escalation_target()),
+                Some("snapshot")
+            );
         }
     }
 
@@ -721,7 +818,43 @@ mod tests {
             let reason = reason_of(decision);
             assert!(reason.contains("attached sheet 705"), "{reason}");
             assert!(reason.contains("pid 42"), "{reason}");
-            assert!(reason.contains("acquire that window id"), "{reason}");
+            assert!(
+                reason.contains("address that sheet and act there"),
+                "{reason}"
+            );
+        }
+    }
+
+    /// A menu row whose owning application WAS proven is not an unproven
+    /// address. Merging it into the `Unproven` arm told a caller its own
+    /// proven target "could not be proven", and pointed it at a re-observation
+    /// that cannot change the answer.
+    #[test]
+    fn a_proven_app_menu_row_is_not_told_it_could_not_be_proven() {
+        let mut facts = matched_facts();
+        facts.element = ElementAncestry::ProvenAppMenu;
+        assert!(decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute());
+        for action in [
+            BackgroundAction::WindowPointer,
+            BackgroundAction::InsertText,
+            BackgroundAction::GenericKey,
+        ] {
+            let BackgroundInputDecision::Refuse(refusal) =
+                decide_background_input(TARGET, &facts, action)
+            else {
+                panic!("a window-aimed route on a menu row must refuse: {action:?}");
+            };
+            assert!(
+                refusal.reason.contains("pid 42's own menu bar"),
+                "{}",
+                refusal.reason
+            );
+            assert!(
+                !refusal.reason.contains("could not be proven"),
+                "a proven menu row was told it was unproven: {}",
+                refusal.reason
+            );
+            assert_eq!(refusal.advice, Some(BackgroundAdvice::Element));
         }
     }
 

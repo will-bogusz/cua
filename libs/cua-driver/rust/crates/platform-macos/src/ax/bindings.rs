@@ -268,19 +268,54 @@ pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) ->
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Option<String> {
+    try_copy_string_attr(element, attr_name).unwrap_or_default()
+}
+
+/// Copy a string attribute, reporting the AX error instead of collapsing it.
+///
+/// `Err` carries the code the framework returned, which is the only way to
+/// tell a dead element (`kAXErrorInvalidUIElement`) from an attribute this
+/// element simply does not publish. `Ok(None)` means the read succeeded and
+/// the value was not a `CFString`.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+pub unsafe fn try_copy_string_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<String>, AXError> {
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return None;
+    if err != kAXErrorSuccess {
+        return Err(err);
+    }
+    if value.is_null() {
+        return Ok(None);
     }
     let cf_string_type_id = CFStr::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_string_type_id {
         CFRelease(value);
-        return None;
+        return Ok(None);
     }
     let s = CFStr::wrap_under_create_rule(value as _);
-    Some(s.to_string())
+    Ok(Some(s.to_string()))
+}
+
+/// The element's display label under the tree's rule: `AXTitle`, else `AXDescription`, else `AXValue`.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn copy_label_attr(element: AXUIElementRef) -> Option<String> {
+    ["AXTitle", "AXDescription", "AXValue"]
+        .into_iter()
+        .find_map(|attr_name| {
+            copy_string_attr(element, attr_name)
+                .map(|label| label.trim().to_owned())
+                .filter(|label| !label.is_empty())
+        })
 }
 
 /// Copy a numeric attribute from an AX element as an `f64`. Returns `None` on

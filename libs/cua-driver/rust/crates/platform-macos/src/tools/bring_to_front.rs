@@ -3,11 +3,12 @@
 //! This is the explicit persistent-foreground escape hatch for focus-proxy
 //! applications.  A successful native request is only a request receipt: when
 //! an exact `window_id` is supplied, the tool independently verifies that the
-//! process is frontmost, that the requested window is its focused window, and
-//! that the window is the front one among its application's visible layer-0
-//! windows before it says `activated: true`. Whether some other application
-//! holds first place in the global layer-0 order is reported, not required —
-//! it is not the requesting application's to win.
+//! process is frontmost and that the requested window is its focused window
+//! before it says `activated: true`. Whether some other application holds
+//! first place in the global layer-0 order is reported, not required — it is
+//! not the requesting application's to win. The application's own panel over
+//! the focused window is also a verified reveal, with the panel named: the
+//! request left nothing undone, and only that panel's dismissal remains.
 
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,18 @@ impl ExactWindowObservation {
         self.target_visible_ordinary && self.frontmost_ordinary_window_id == Some(window_id)
     }
 
+    /// The process is up front with the requested window focused, and the only
+    /// thing over it is another window the same process owns — a panel the
+    /// application itself opened, not a rival application's window.
+    fn exact_window_behind_owned_window(self, pid: i32, window_id: u32) -> bool {
+        self.process_activated(pid)
+            && self.exact_window_focused(window_id)
+            && self.target_visible_ordinary
+            && self
+                .process_frontmost_ordinary_window_id
+                .is_some_and(|front| front != window_id)
+    }
+
     fn exact_postcondition(self, pid: i32, window_id: u32) -> bool {
         self.process_activated(pid)
             && self.exact_window_focused(window_id)
@@ -118,8 +131,34 @@ impl ExactWindowObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExactOutcome {
     Activated,
+    ActivatedBehindOwnedPanel,
     Partial,
     Failed,
+}
+
+impl ExactOutcome {
+    fn activated(self) -> bool {
+        matches!(self, Self::Activated | Self::ActivatedBehindOwnedPanel)
+    }
+
+    fn status(self) -> &'static str {
+        match self {
+            Self::Activated => "activated",
+            Self::ActivatedBehindOwnedPanel => "activated_behind_owned_panel",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Activated => "bring_to_front_exact_window_verified",
+            Self::ActivatedBehindOwnedPanel => {
+                "bring_to_front_exact_window_verified_behind_owned_panel"
+            }
+            Self::Partial | Self::Failed => "bring_to_front_exact_window_unverified",
+        }
+    }
 }
 
 fn classify_exact_outcome(
@@ -130,6 +169,8 @@ fn classify_exact_outcome(
 ) -> ExactOutcome {
     if observation.exact_postcondition(pid, window_id) {
         ExactOutcome::Activated
+    } else if observation.exact_window_behind_owned_window(pid, window_id) {
+        ExactOutcome::ActivatedBehindOwnedPanel
     } else if request_accepted
         || observation.process_activated(pid)
         || observation.exact_window_focused(window_id)
@@ -224,20 +265,39 @@ fn exact_result(
     observation: ExactWindowObservation,
 ) -> ToolResult {
     let outcome = classify_exact_outcome(request_accepted, pid, window_id, observation);
-    let activated = outcome == ExactOutcome::Activated;
+    let obscured_by = (outcome == ExactOutcome::ActivatedBehindOwnedPanel)
+        .then_some(observation.process_frontmost_ordinary_window_id)
+        .flatten()
+        .and_then(|blocker| super::ObscuringWindow::resolve(pid, blocker));
+    exact_result_with_blocker(
+        pid,
+        window_id,
+        path,
+        request_accepted,
+        observation,
+        outcome,
+        obscured_by,
+    )
+}
+
+fn exact_result_with_blocker(
+    pid: i32,
+    window_id: u32,
+    path: &'static str,
+    request_accepted: bool,
+    observation: ExactWindowObservation,
+    outcome: ExactOutcome,
+    obscured_by: Option<super::ObscuringWindow>,
+) -> ToolResult {
+    let activated = outcome.activated();
     let process_activated = observation.process_activated(pid);
     let frontmost_pid = observation.frontmost_pid(pid);
     let exact_window_focused = observation.exact_window_focused(window_id);
     let exact_window_front_in_process = observation.exact_window_front_in_process(window_id);
     let exact_window_frontmost_ordinary = observation.exact_window_frontmost_ordinary(window_id);
-    let status = match outcome {
-        ExactOutcome::Activated => "activated",
-        ExactOutcome::Partial => "partial",
-        ExactOutcome::Failed => "failed",
-    };
-    let structured = json!({
-        "status": status,
-        "code": if activated { "bring_to_front_exact_window_verified" } else { "bring_to_front_exact_window_unverified" },
+    let mut structured = json!({
+        "status": outcome.status(),
+        "code": outcome.code(),
         "pid": pid,
         "window_id": window_id,
         "activated": activated,
@@ -260,20 +320,40 @@ fn exact_result(
             "process_frontmost_ordinary_window_id": observation.process_frontmost_ordinary_window_id,
         }
     });
-    if activated {
-        ToolResult::text(format!(
+    if let Some(obscuring) = &obscured_by {
+        structured["obscured_by"] = obscuring.payload();
+    }
+    match (outcome, &obscured_by) {
+        (ExactOutcome::ActivatedBehindOwnedPanel, Some(obscuring)) => {
+            let blocker = obscuring.window_id;
+            let route = if obscuring.is_focusable() {
+                format!("Act on window {blocker}, or dismiss it")
+            } else {
+                format!(
+                    "Window {blocker} publishes no AXWindow, so dismiss it rather than trying to \
+                     focus it"
+                )
+            };
+            ToolResult::text(format!(
+                "Brought exact window {window_id} for pid {pid} to the foreground; pid {pid}'s \
+                 own window {blocker} ({}) is drawn in front of it. {route} — pixel targets on \
+                 window {window_id} are covered until then.",
+                obscuring.describe()
+            ))
+            .with_structured(structured)
+        }
+        _ if activated => ToolResult::text(format!(
             "Brought exact window {window_id} for pid {pid} to the foreground."
         ))
-        .with_structured(structured)
-    } else {
-        ToolResult::error(format!(
+        .with_structured(structured),
+        _ => ToolResult::error(format!(
             "bring_to_front: exact window {window_id} for pid {pid} was not verified \
              as the frontmost process's focused, front window (request_accepted=\
              {request_accepted}, process_activated={process_activated}, \
              focused={exact_window_focused}, \
              front_in_process={exact_window_front_in_process})."
         ))
-        .with_structured(structured)
+        .with_structured(structured),
     }
 }
 
@@ -457,6 +537,17 @@ impl Tool for BringToFrontTool {
 mod tests {
     use super::*;
 
+    fn reply_text(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The common shape: nothing else is competing, so the window in front of
     /// the target's own application is also first in the global layer-0 order.
     fn observation(
@@ -521,18 +612,83 @@ mod tests {
         assert_eq!(structured["observed"]["frontmost_ordinary_window_id"], 900);
     }
 
-    /// The exact-window guarantee that does still bind: a sibling window of the
-    /// same application in front of the requested one is not a reveal.
+    /// The app's own panel over its focused window leaves nothing undone by
+    /// the request: the reveal is verified, and the panel is named so a caller
+    /// that must act on it is handed its id instead of diffing rosters.
     #[test]
-    fn a_sibling_window_of_the_same_application_in_front_is_only_partial() {
+    fn an_owned_panel_over_the_focused_window_is_a_verified_reveal_that_names_it() {
+        let behind = contested_observation(Some(7), Some(8), Some(8));
         assert_eq!(
-            classify_exact_outcome(
-                true,
-                42,
-                7,
-                contested_observation(Some(7), Some(8), Some(8))
+            classify_exact_outcome(true, 42, 7, behind),
+            ExactOutcome::ActivatedBehindOwnedPanel
+        );
+        let result = exact_result_with_blocker(
+            42,
+            7,
+            "skylight_process_exact_cocoa_ax",
+            true,
+            behind,
+            ExactOutcome::ActivatedBehindOwnedPanel,
+            Some(super::super::ObscuringWindow {
+                window_id: 8,
+                title: String::new(),
+                layer: 0,
+                ax_backed: Some(true),
+                role: Some("AXWindow".to_owned()),
+                subrole: Some("AXUnknown".to_owned()),
+            }),
+        );
+        assert_eq!(result.is_error, None);
+        assert!(
+            reply_text(&result).contains(
+                "pid 42's own window 8 (titleless, AXWindow/AXUnknown) is drawn in front of it. \
+                 Act on window 8, or dismiss it — pixel targets on window 7 are covered until \
+                 then."
             ),
-            ExactOutcome::Partial
+            "{:?}",
+            reply_text(&result)
+        );
+        let structured = result.structured_content.expect("structured result");
+        assert_eq!(structured["activated"], true);
+        assert_eq!(structured["status"], "activated_behind_owned_panel");
+        assert_eq!(
+            structured["code"],
+            "bring_to_front_exact_window_verified_behind_owned_panel"
+        );
+        assert_eq!(structured["exact_window_effect"]["verified"], true);
+        assert_eq!(structured["exact_window_effect"]["front_in_process"], false);
+        assert_eq!(structured["obscured_by"]["window_id"], 8);
+        assert_eq!(structured["obscured_by"]["ax_backed"], true);
+        assert_eq!(structured["obscured_by"]["subrole"], "AXUnknown");
+    }
+
+    /// A panel with no `AXWindow` cannot be focused, so the reply must not
+    /// offer to act on it — it can only be dismissed.
+    #[test]
+    fn an_owned_panel_with_no_ax_surface_is_only_offered_for_dismissal() {
+        let result = exact_result_with_blocker(
+            42,
+            7,
+            "skylight_process_exact_cocoa_ax",
+            true,
+            contested_observation(Some(7), Some(8), Some(8)),
+            ExactOutcome::ActivatedBehindOwnedPanel,
+            Some(super::super::ObscuringWindow {
+                window_id: 8,
+                title: String::new(),
+                layer: 0,
+                ax_backed: Some(false),
+                role: None,
+                subrole: None,
+            }),
+        );
+        assert!(
+            reply_text(&result).contains(
+                "own window 8 (titleless, no AX surface) is drawn in front of it. Window 8 \
+                 publishes no AXWindow, so dismiss it rather than trying to focus it"
+            ),
+            "{:?}",
+            reply_text(&result)
         );
     }
 
@@ -550,7 +706,6 @@ mod tests {
         for incomplete in [
             observation(Some(42), Some(false), Some(7), Some(7), true),
             observation(Some(42), Some(true), Some(8), Some(7), true),
-            observation(Some(42), Some(true), Some(7), Some(8), true),
             observation(Some(42), Some(true), Some(7), Some(7), false),
         ] {
             assert_eq!(
@@ -673,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_result_is_the_only_non_error_exact_mapping() {
+    fn a_verified_reveal_is_a_non_error_result() {
         let result = exact_result(
             42,
             7,

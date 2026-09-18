@@ -182,6 +182,143 @@ impl DeliveryMode {
     }
 }
 
+/// A window one process has drawn in front of another of its own windows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObscuringWindow {
+    pub window_id: u32,
+    pub title: String,
+    pub layer: i32,
+    pub ax_backed: Option<bool>,
+    pub role: Option<String>,
+    pub subrole: Option<String>,
+}
+
+impl ObscuringWindow {
+    /// Resolve one window's identity: WindowServer's title and layer, plus the
+    /// AX window the owning process publishes for it, if any.
+    pub(crate) fn resolve(pid: i32, window_id: u32) -> Option<Self> {
+        let info = crate::windows::window_info_by_id(window_id)?;
+        let mut resolved = Self {
+            window_id,
+            title: info.title,
+            layer: info.layer,
+            ax_backed: None,
+            role: None,
+            subrole: None,
+        };
+        resolved.resolve_ax_identity(pid);
+        Some(resolved)
+    }
+
+    /// Attribute the CGWindowID to one of the process's own `AXWindow`
+    /// elements. A layer-0 panel that publishes none can never become the AX
+    /// focused window, which is what separates "acquire it" from "dismiss it".
+    pub(crate) fn resolve_ax_identity(&mut self, pid: i32) {
+        // SAFETY: the application element and every window it hands back are
+        // created and released inside this block.
+        unsafe {
+            let app = crate::ax::bindings::AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                return;
+            }
+            self.ax_backed = Some(false);
+            for window in crate::ax::bindings::copy_ax_windows(app) {
+                if self.ax_backed != Some(true)
+                    && crate::ax::bindings::ax_get_window_id(window) == Some(self.window_id)
+                {
+                    self.ax_backed = Some(true);
+                    self.role = crate::ax::bindings::copy_string_attr(window, "AXRole");
+                    self.subrole = crate::ax::bindings::copy_string_attr(window, "AXSubrole");
+                }
+                core_foundation::base::CFRelease(window as core_foundation::base::CFTypeRef);
+            }
+            core_foundation::base::CFRelease(app as core_foundation::base::CFTypeRef);
+        }
+    }
+
+    /// The `obscured_by` payload a refusal or a verified-behind reply carries.
+    pub(crate) fn payload(&self) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "window_id": self.window_id,
+            "title": self.title,
+            "layer": self.layer,
+        });
+        if let Some(ax_backed) = self.ax_backed {
+            payload["ax_backed"] = serde_json::json!(ax_backed);
+        }
+        if let Some(role) = &self.role {
+            payload["role"] = serde_json::json!(role);
+        }
+        if let Some(subrole) = &self.subrole {
+            payload["subrole"] = serde_json::json!(subrole);
+        }
+        payload
+    }
+
+    /// Whether the window publishes an `AXWindow` the caller could focus.
+    pub(crate) fn is_focusable(&self) -> bool {
+        self.ax_backed != Some(false)
+    }
+
+    /// How prose names the window: its title, then its AX identity.
+    pub(crate) fn describe(&self) -> String {
+        let title = if self.title.trim().is_empty() {
+            "titleless".to_owned()
+        } else {
+            format!("titled {:?}", self.title)
+        };
+        match (&self.role, &self.subrole) {
+            (Some(role), Some(subrole)) => format!("{title}, {role}/{subrole}"),
+            (Some(role), None) => format!("{title}, {role}"),
+            (None, _) if self.ax_backed == Some(false) => format!("{title}, no AX surface"),
+            (None, _) => title,
+        }
+    }
+}
+
+/// Where an exact target sits in its own process's front-to-back order.
+pub(crate) struct ProcessFrontOrder {
+    pub target_is_front: bool,
+    pub in_front: Option<ObscuringWindow>,
+}
+
+/// Resolve [`ProcessFrontOrder`] from one `visible_windows()` enumeration.
+pub(crate) fn process_front_order(pid: i32, window_id: u32) -> ProcessFrontOrder {
+    let front = crate::windows::visible_windows()
+        .into_iter()
+        .filter(|window| {
+            window.pid == pid
+                && window.layer == 0
+                && !crate::cursor::overlay::is_overlay_window(window.window_id)
+        })
+        .max_by_key(|window| window.z_index);
+    let Some(front) = front else {
+        return ProcessFrontOrder {
+            target_is_front: false,
+            in_front: None,
+        };
+    };
+    if front.window_id == window_id {
+        return ProcessFrontOrder {
+            target_is_front: true,
+            in_front: None,
+        };
+    }
+    let mut in_front = ObscuringWindow {
+        window_id: front.window_id,
+        title: front.title,
+        layer: front.layer,
+        ax_backed: None,
+        role: None,
+        subrole: None,
+    };
+    in_front.resolve_ax_identity(pid);
+    ProcessFrontOrder {
+        target_is_front: false,
+        in_front: Some(in_front),
+    }
+}
+
 /// Convert a pure background-input refusal into the structured refusal result
 /// shape shared by exact-target tools: `code`, `effect: "refused"`, the
 /// requested target, and the safe next route when one exists. No actuator ran.
@@ -198,10 +335,13 @@ pub(crate) fn background_refusal_result(
         "reason": refusal.reason,
     });
     if let Some(advice) = refusal.advice {
-        structured["escalation"] = serde_json::json!({
-            "recommended": advice,
-            "reason": refusal.reason,
-        });
+        structured["advice"] = serde_json::json!(advice.as_str());
+        if let Some(target) = advice.escalation_target() {
+            structured["escalation"] = serde_json::json!({
+                "target": target,
+                "reason": "route_unavailable",
+            });
+        }
     }
     cua_driver_core::protocol::ToolResult::error(format!(
         "Background input refused ({}): {}",

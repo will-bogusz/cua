@@ -42,6 +42,9 @@ let kSliderValueAID = "lbl-slider-value"
 let kCheckboxAID = "chk-agree"
 let kCheckStateAID = "lbl-chk-state"
 let kSelectionStateAID = "lbl-selection-state"
+let kPressableRowAID = "row-pressable"
+let kPressableRowStateAID = "lbl-pressable-row-state"
+let kRowHelpGroupAID = "grp-row-help"
 let kContextButtonAID = "btn-context"
 let kMenuActionAID = "lbl-menu-action"
 let kScrollerAID = "scroll-tall"
@@ -84,6 +87,70 @@ final class LaggingTextField: NSTextField {
     }
 }
 
+/// The Reminders reminder-row shape: a row that advertises `AXPress` (the app's
+/// own default action, `row_pressed=`) and exposes a settable `AXSelected`
+/// (what a pointer click does, `row_selected=`), so the two are separable.
+final class PressableRowView: NSView {
+    var onPress: () -> Void = {}
+    var onSelect: () -> Void = {}
+    private var selected = false
+
+    override func draw(_ dirtyRect: NSRect) {
+        let fill = selected ? NSColor.selectedContentBackgroundColor : NSColor.controlBackgroundColor
+        fill.setFill()
+        dirtyRect.fill()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        setAccessibilitySelected(true)
+    }
+
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .row }
+
+    override func accessibilityLabel() -> String? { "pressable row" }
+
+    override func accessibilityActionNames() -> [NSAccessibility.Action] { [.press] }
+
+    override func isAccessibilitySelected() -> Bool { selected }
+
+    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
+        guard selected != accessibilitySelected else { return }
+        selected = accessibilitySelected
+        needsDisplay = true
+        onSelect()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        onPress()
+        return true
+    }
+}
+
+/// The Reminders row-group shape: an `AXGroup` that carries the application's
+/// own `AXHelp` explaining what its press does, and advertises that press.
+final class HelpfulGroupView: NSView {
+    var onPress: () -> Void = {}
+
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .group }
+
+    override func accessibilityLabel() -> String? { "row detail" }
+
+    override func accessibilityHelp() -> String? {
+        "To mark the row as done, press Control-Option-Space."
+    }
+
+    override func accessibilityActionNames() -> [NSAccessibility.Action] { [.press] }
+
+    override func accessibilityPerformPress() -> Bool {
+        onPress()
+        return true
+    }
+}
+
 // MARK: - Controller
 
 final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
@@ -101,6 +168,12 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let selectionItems = ["alpha", "beta", "gamma"]
     let selectionTable = NSTableView()
     let selectionStateLabel = NSTextField(labelWithString: "selection=none")
+    let pressableRow = PressableRowView()
+    let pressableRowStateLabel = NSTextField(
+        labelWithString: "row_pressed=0 row_selected=false group_pressed=0")
+    var pressableRowPresses = 0
+    let rowHelpGroup = HelpfulGroupView()
+    var rowHelpGroupPresses = 0
     let menuActionLabel = NSTextField(labelWithString: "menu_action=none")
     let scrollOffsetLabel = NSTextField(labelWithString: "scroll_offset=0")
     let accelCountLabel = NSTextField(labelWithString: "accel_fired=0")
@@ -343,6 +416,31 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         exit.setAccessibilityIdentifier(kExitButtonAID)
         content.addArrangedSubview(exit)
 
+        // selectable_row — appended last so no section above it shifts.
+        content.addArrangedSubview(sectionLabel("selectable_row"))
+        pressableRow.setAccessibilityIdentifier(kPressableRowAID)
+        pressableRow.translatesAutoresizingMaskIntoConstraints = false
+        pressableRow.onPress = { [weak self] in self?.onPressableRowPress() }
+        pressableRow.onSelect = { [weak self] in self?.publishPressableRowState() }
+        rowHelpGroup.setAccessibilityIdentifier(kRowHelpGroupAID)
+        rowHelpGroup.translatesAutoresizingMaskIntoConstraints = false
+        rowHelpGroup.onPress = { [weak self] in self?.onRowHelpGroupPress() }
+        pressableRowStateLabel.setAccessibilityIdentifier(kPressableRowStateAID)
+        pressableRowStateLabel.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        let pressableRowStack = NSStackView()
+        pressableRowStack.orientation = .horizontal
+        pressableRowStack.spacing = 12
+        pressableRowStack.addArrangedSubview(pressableRow)
+        pressableRowStack.addArrangedSubview(rowHelpGroup)
+        pressableRowStack.addArrangedSubview(pressableRowStateLabel)
+        NSLayoutConstraint.activate([
+            pressableRow.widthAnchor.constraint(equalToConstant: 160),
+            pressableRow.heightAnchor.constraint(equalToConstant: 28),
+            rowHelpGroup.widthAnchor.constraint(equalToConstant: 60),
+            rowHelpGroup.heightAnchor.constraint(equalToConstant: 28),
+        ])
+        content.addArrangedSubview(pressableRowStack)
+
         // No outer scroll-view wrap: the content is sized to fit the window
         // so the only scrollable surface is the inner scroll_target NSScrollView.
         // Otherwise scroll events delivered at window-local coords get
@@ -460,6 +558,23 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
 
     @objc private func onCheckbox(_ sender: NSButton) {
         checkStateLabel.stringValue = "agreed=\(sender.state == .on)"
+    }
+
+    private func onPressableRowPress() {
+        pressableRowPresses += 1
+        publishPressableRowState()
+    }
+
+    private func onRowHelpGroupPress() {
+        rowHelpGroupPresses += 1
+        publishPressableRowState()
+    }
+
+    private func publishPressableRowState() {
+        pressableRowStateLabel.stringValue =
+            "row_pressed=\(pressableRowPresses) "
+            + "row_selected=\(pressableRow.isAccessibilitySelected()) "
+            + "group_pressed=\(rowHelpGroupPresses)"
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {

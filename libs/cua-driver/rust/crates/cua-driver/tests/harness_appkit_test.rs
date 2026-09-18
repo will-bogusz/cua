@@ -968,6 +968,131 @@ fn harness_appkit_click_on_a_text_role_focuses_it() {
     );
 }
 
+/// A collection row that advertises `AXPress` used to have that press
+/// dispatched by a plain `click`, so Reminders completed a reminder where
+/// every other app selected a row. A click on a row means select; the row's
+/// own default action stays reachable through a named `action:"press"`.
+#[test]
+#[ignore]
+fn harness_appkit_click_on_a_selectable_row_selects_without_pressing() {
+    run_background_case(
+        "click_selectable_row",
+        DriverRoute::MacosAxValue,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before
+                    .tree_text()
+                    .contains("row_pressed=0 row_selected=false"),
+                "pressable row did not start unselected and unpressed:\n{}",
+                before.tree_text()
+            );
+            let clicked = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "row-pressable")
+                }),
+            );
+            assert!(!clicked.is_error(), "click failed: {}", clicked.text());
+            assert!(
+                clicked.text().contains("Selected nearest AXRow"),
+                "a plain click on a selectable row did not take the select route: {}",
+                clicked.text()
+            );
+            assert!(
+                clicked.text().contains("AXRow \"pressable row\""),
+                "the reply did not name the row it acted on: {}",
+                clicked.text()
+            );
+            assert!(
+                clicked.text().contains("perform(\"press\")"),
+                "the reply did not name the row's own press action: {}",
+                clicked.text()
+            );
+            assert_eq!(
+                clicked.action_effect(),
+                Some("confirmed"),
+                "selecting a row is read-back verifiable: {}",
+                clicked.raw
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after
+                    .tree_text()
+                    .contains("row_pressed=0 row_selected=true"),
+                "the click pressed the row instead of selecting it:\n{}",
+                after.tree_text()
+            );
+
+            let pressed = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&after, "row-pressable"),
+                    "action": "press"
+                }),
+            );
+            assert!(!pressed.is_error(), "press failed: {}", pressed.text());
+            std::thread::sleep(Duration::from_millis(300));
+            let post = snapshot_elements(driver, pid, wid);
+            assert!(
+                post.tree_text().contains("row_pressed=1"),
+                "a named press did not reach the row's own action:\n{}",
+                post.tree_text()
+            );
+        },
+    );
+}
+
+/// `AXScrollArea`/`AXGroup` collapsed before the walk read the node's
+/// title, description, help or actions, so a group carrying the app's own
+/// explanation of a row — Reminders' `help="To mark as completed, press
+/// Control-Option-Space."` — never reached a caller and could not be
+/// addressed. The collapse now waits until the node is known to hold nothing.
+#[test]
+#[ignore]
+fn harness_appkit_a_content_bearing_group_stays_addressable() {
+    run_background_case(
+        "group_with_help",
+        DriverRoute::MacosAxAction,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before
+                    .tree_text()
+                    .contains("help=\"To mark the row as done, press Control-Option-Space.\""),
+                "the group's own help never reached the tree:\n{}",
+                before.tree_text()
+            );
+            let pressed = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "grp-row-help"),
+                    "action": "press"
+                }),
+            );
+            assert!(
+                !pressed.is_error(),
+                "group press failed: {}",
+                pressed.text()
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after.tree_text().contains("group_pressed=1"),
+                "the collapsed group was not addressable:\n{}",
+                after.tree_text()
+            );
+        },
+    );
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_element_foreground_press_key_commits_edit() {
