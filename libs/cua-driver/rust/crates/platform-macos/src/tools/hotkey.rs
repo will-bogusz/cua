@@ -37,9 +37,24 @@ fn chord_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
 #[derive(Default)]
 struct ChordDispatch {
     probe: Option<delivery_probe::DeliveryProbe>,
+    /// The chord went out on the global HID tap rather than as a PID-routed
+    /// post. Two different transports shared one `key_events_fg` label.
+    hid_tap: bool,
     /// The application's key window when the chord was posted. `None` when the
     /// app reported no key window, or when no window was targeted at all.
     focused_window_id: Option<u32>,
+}
+
+/// The transport label for a chord. A foreground chord travels one of two
+/// routes: `with_foreground_hid_activation` posts on the global HID tap, while
+/// the menu key-equivalent branch posts to the pid. One label for both misnames
+/// whichever branch did not run.
+fn chord_path(foreground: bool, hid_tap: bool) -> &'static str {
+    match (foreground, hid_tap) {
+        (true, true) => "key_events_hid_fg",
+        (true, false) => "key_events_fg",
+        (false, _) => "key_events",
+    }
 }
 
 /// What the key-window fact means for a chord that was already posted.
@@ -479,6 +494,7 @@ impl Tool for HotkeyTool {
                             // target frontmost until both key events are consumed;
                             // otherwise Cmd+A/Cmd+V can be silently ignored.
                             (true, true, Some(wid), _) => {
+                                dispatch.hid_tap = true;
                                 crate::input::skylight::with_foreground_hid_activation(
                                     pid as libc::pid_t,
                                     wid,
@@ -497,6 +513,7 @@ impl Tool for HotkeyTool {
                             // establish and confirm the requested child focus after
                             // activation, then use the guarded global HID queue.
                             (true, false, Some(wid), Some(ptr)) => {
+                                dispatch.hid_tap = true;
                                 crate::input::skylight::with_foreground_hid_activation(
                                     pid as libc::pid_t,
                                     wid,
@@ -514,6 +531,7 @@ impl Tool for HotkeyTool {
                             (true, false, Some(wid), None)
                                 if crate::input::keyboard::is_screen_sharing_pid(pid) =>
                             {
+                                dispatch.hid_tap = true;
                                 crate::input::skylight::with_foreground_hid_activation(
                                     pid as libc::pid_t,
                                     wid,
@@ -565,6 +583,7 @@ impl Tool for HotkeyTool {
             Ok(Ok(dispatch)) => {
                 let ChordDispatch {
                     probe,
+                    hid_tap,
                     focused_window_id,
                 } = dispatch;
                 let label = if fg {
@@ -607,7 +626,7 @@ impl Tool for HotkeyTool {
                 // claims the intended effect; the probe answers only whether
                 // the target reacted at all.
                 let mut structured = serde_json::json!({
-                    "path": if fg { "key_events_fg" } else { "key_events" },
+                    "path": chord_path(fg, hid_tap),
                     "verified": false,
                     "effect": "unverifiable",
                 });
@@ -693,5 +712,16 @@ mod tests {
         let none = key_window_note(91895, 16933, None);
         assert!(none.contains("no key window"), "{none}");
         assert!(!none.contains("held keyboard focus"), "{none}");
+    }
+
+    /// `key_events_fg` covered two transports. The contract maps it to a
+    /// PID-routed post, which is right for the menu key-equivalent branch and
+    /// wrong for the three `with_foreground_hid_activation` branches.
+    #[test]
+    fn the_hid_tap_and_the_pid_post_do_not_share_a_path_token() {
+        assert_eq!(chord_path(true, true), "key_events_hid_fg");
+        assert_eq!(chord_path(true, false), "key_events_fg");
+        assert_eq!(chord_path(false, false), "key_events");
+        assert_eq!(chord_path(false, true), "key_events");
     }
 }

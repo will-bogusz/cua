@@ -60,6 +60,17 @@ fn map_delivery_outcome(
     }
 }
 
+/// The transport label for a key press. `press_key`'s foreground rung posts on
+/// the global HID tap, which is what its own `ActionExecutionRecord` already
+/// reports; the px-focus path falls through to a PID-routed post.
+fn key_path(foreground: bool, hid_tap: bool) -> &'static str {
+    match (foreground, hid_tap) {
+        (true, true) => "key_events_hid_fg",
+        (true, false) => "key_events_fg",
+        (false, _) => "key_events",
+    }
+}
+
 /// What the probe watched, for a key press whose control did not move.
 ///
 /// A single key has no general postcondition either, so the probe reports only
@@ -585,7 +596,7 @@ impl Tool for PressKeyTool {
             changes.result_suffix()
         );
         let mut structured = serde_json::json!({
-            "path": if fg { "key_events_fg" } else { "key_events" },
+            "path": key_path(fg, fg && !px_focus),
             "verified": confirmed,
             "effect": if confirmed { "confirmed" } else { "unverifiable" },
         });
