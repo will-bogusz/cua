@@ -1140,6 +1140,10 @@ class ActionEscalationTarget(enum.Enum):
 
     SESSION = 3
 
+    ELEMENT = 4
+
+    SNAPSHOT = 5
+
 
 
 class _UniffiFfiConverterTypeActionEscalationTarget(_UniffiConverterRustBuffer):
@@ -1154,6 +1158,10 @@ class _UniffiFfiConverterTypeActionEscalationTarget(_UniffiConverterRustBuffer):
             return ActionEscalationTarget.PAGE
         if variant == 4:
             return ActionEscalationTarget.SESSION
+        if variant == 5:
+            return ActionEscalationTarget.ELEMENT
+        if variant == 6:
+            return ActionEscalationTarget.SNAPSHOT
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -1165,6 +1173,10 @@ class _UniffiFfiConverterTypeActionEscalationTarget(_UniffiConverterRustBuffer):
         if value == ActionEscalationTarget.PAGE:
             return
         if value == ActionEscalationTarget.SESSION:
+            return
+        if value == ActionEscalationTarget.ELEMENT:
+            return
+        if value == ActionEscalationTarget.SNAPSHOT:
             return
         raise ValueError(value)
 
@@ -1178,6 +1190,10 @@ class _UniffiFfiConverterTypeActionEscalationTarget(_UniffiConverterRustBuffer):
             buf.write_i32(3)
         if value == ActionEscalationTarget.SESSION:
             buf.write_i32(4)
+        if value == ActionEscalationTarget.ELEMENT:
+            buf.write_i32(5)
+        if value == ActionEscalationTarget.SNAPSHOT:
+            buf.write_i32(6)
 
 
 
@@ -1290,7 +1306,7 @@ class ActionEvidenceKind(enum.Enum):
 
     VALUE_READBACK = 0
 
-    WINDOW_CHANGE = 1
+    OBSERVED_CHANGE = 1
 
 
 
@@ -1301,14 +1317,14 @@ class _UniffiFfiConverterTypeActionEvidenceKind(_UniffiConverterRustBuffer):
         if variant == 1:
             return ActionEvidenceKind.VALUE_READBACK
         if variant == 2:
-            return ActionEvidenceKind.WINDOW_CHANGE
+            return ActionEvidenceKind.OBSERVED_CHANGE
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
     def check_lower(value):
         if value == ActionEvidenceKind.VALUE_READBACK:
             return
-        if value == ActionEvidenceKind.WINDOW_CHANGE:
+        if value == ActionEvidenceKind.OBSERVED_CHANGE:
             return
         raise ValueError(value)
 
@@ -1316,23 +1332,112 @@ class _UniffiFfiConverterTypeActionEvidenceKind(_UniffiConverterRustBuffer):
     def write(value, buf):
         if value == ActionEvidenceKind.VALUE_READBACK:
             buf.write_i32(1)
-        if value == ActionEvidenceKind.WINDOW_CHANGE:
+        if value == ActionEvidenceKind.OBSERVED_CHANGE:
             buf.write_i32(2)
 
 
 
+
+
+
+
+
+class ActionEvidenceSignal(enum.Enum):
+    """
+    Which post-dispatch observation a platform probe named. The coarse
+    [`ActionEvidenceKind::ObservedChange`] says the target reacted; this says
+    what was watched when it did.
+"""
+
+    ELEMENT_STATE = 0
+
+    APP_FOCUS = 1
+
+    WINDOW_TREE = 2
+
+    WINDOW_CHANGE = 3
+
+
+
+class _UniffiFfiConverterTypeActionEvidenceSignal(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return ActionEvidenceSignal.ELEMENT_STATE
+        if variant == 2:
+            return ActionEvidenceSignal.APP_FOCUS
+        if variant == 3:
+            return ActionEvidenceSignal.WINDOW_TREE
+        if variant == 4:
+            return ActionEvidenceSignal.WINDOW_CHANGE
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == ActionEvidenceSignal.ELEMENT_STATE:
+            return
+        if value == ActionEvidenceSignal.APP_FOCUS:
+            return
+        if value == ActionEvidenceSignal.WINDOW_TREE:
+            return
+        if value == ActionEvidenceSignal.WINDOW_CHANGE:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == ActionEvidenceSignal.ELEMENT_STATE:
+            buf.write_i32(1)
+        if value == ActionEvidenceSignal.APP_FOCUS:
+            buf.write_i32(2)
+        if value == ActionEvidenceSignal.WINDOW_TREE:
+            buf.write_i32(3)
+        if value == ActionEvidenceSignal.WINDOW_CHANGE:
+            buf.write_i32(4)
+
+
+
+class _UniffiFfiConverterOptionalTypeActionEvidenceSignal(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeActionEvidenceSignal.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeActionEvidenceSignal.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeActionEvidenceSignal.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class ActionEvidence:
-    def __init__(self, *, kind:ActionEvidenceKind):
+    def __init__(self, *, kind:ActionEvidenceKind, signal:typing.Optional[ActionEvidenceSignal]):
         self.kind = kind
+        self.signal = signal
 
 
 
 
     def __str__(self):
-        return "ActionEvidence(kind={})".format(self.kind)
+        return "ActionEvidence(kind={}, signal={})".format(self.kind, self.signal)
     def __eq__(self, other):
         if self.kind != other.kind:
+            return False
+        if self.signal != other.signal:
             return False
         return True
 
@@ -1341,15 +1446,18 @@ class _UniffiFfiConverterTypeActionEvidence(_UniffiConverterRustBuffer):
     def read(buf):
         return ActionEvidence(
             kind=_UniffiFfiConverterTypeActionEvidenceKind.read(buf),
+            signal=_UniffiFfiConverterOptionalTypeActionEvidenceSignal.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterTypeActionEvidenceKind.check_lower(value.kind)
+        _UniffiFfiConverterOptionalTypeActionEvidenceSignal.check_lower(value.signal)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterTypeActionEvidenceKind.write(value.kind, buf)
+        _UniffiFfiConverterOptionalTypeActionEvidenceSignal.write(value.signal, buf)
 
 
 
@@ -6955,6 +7063,7 @@ __all__ = [
     "ActionEscalationTarget",
     "ActionEscalationReason",
     "ActionEvidenceKind",
+    "ActionEvidenceSignal",
     "ActionEffect",
     "ActionRoute",
     "ActionCommit",

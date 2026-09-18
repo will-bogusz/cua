@@ -105,11 +105,18 @@ manifest.
 See [Action results and postcondition verification](../docs/action-result-contract.md)
 for the wire shape and 0.14 migration guidance.
 
+`escalation.target` is the driver's whole vocabulary for "where to go next":
+`pixel`, `foreground`, `page`, `session`, `element` (re-address the exact
+control), and `snapshot` (re-observe first). A driver never names a
+consumer's own tool in prose — it emits one of these and the consumer
+renders the route it actually exposes, because only the consumer knows
+which routes it has.
+
 Compatibility is tracked separately at each boundary:
 
 | Field | Current | Meaning |
 | --- | --- | --- |
-| `contract_version` | `0.8.0` | Generated manifest and typed SDK shape |
+| `contract_version` | `0.9.0` | Generated manifest and typed SDK shape |
 | `tools_list_schema_version` | `1` | cua-driver `tools/list` extension shape |
 | `capability_version` | `1` | Additive capability-token vocabulary |
 | `mcp_protocol_version` | `2025-06-18` | Legacy `initialize.params.protocolVersion` and loopback HTTP compatibility version; modern stdio negotiation is endpoint-owned |
@@ -118,6 +125,44 @@ This implementation does not use WASM. UniFFI distributes the shared Rust
 implementation to Python and Node. Permission identity follows the selected
 runtime host. The language packages do not
 generate or maintain separate MCP transports.
+
+## Vocabulary the manifest does not describe
+
+Only the twenty action tools share a generated schema. Everything below is
+contract vocabulary that travels as MCP structured content, so no generated
+type or manifest entry describes it and a consumer must parse it
+defensively. It is recorded here because two implementations have to agree
+on the spelling.
+
+`bring_to_front` is not an action-result tool. When the exact window is the
+process's focused window but one of the process's own panels is in front of
+it, the call succeeds with `code:
+"bring_to_front_exact_window_verified_behind_owned_panel"`,
+`activated: true`, `exact_window_effect.front_in_process: false` retained,
+and a top-level `obscured_by` naming the panel:
+
+```json
+{
+  "obscured_by": {
+    "window_id": 17013,
+    "title": "",
+    "layer": 183,
+    "ax_backed": true,
+    "role": "AXWindow",
+    "subrole": "AXSystemDialog"
+  }
+}
+```
+
+`window_id` and `layer` are numbers, and any member the driver could not
+resolve is omitted rather than guessed. The same key and the same shape
+carry the obscuring window in the `element_disabled` refusal payload, so a
+consumer parses one shape in both places.
+
+Platform producers also emit `escalation.recommended` rung tokens that are
+not escalation targets: `chunk`, `verify_state`, `select_then_commit`. The
+legacy normalizer drops those rather than guess at a target. `px` is the
+one alias it does accept, for `pixel`.
 
 ## Generate and verify
 

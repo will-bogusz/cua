@@ -228,7 +228,9 @@ export enum ActionEscalationTarget {
     Pixel,
     Foreground,
     Page,
-    Session
+    Session,
+    Element,
+    Snapshot
 }
 
 const FfiConverterTypeActionEscalationTarget = (() => {
@@ -241,6 +243,8 @@ const FfiConverterTypeActionEscalationTarget = (() => {
                 case 2: return ActionEscalationTarget.Foreground;
                 case 3: return ActionEscalationTarget.Page;
                 case 4: return ActionEscalationTarget.Session;
+                case 5: return ActionEscalationTarget.Element;
+                case 6: return ActionEscalationTarget.Snapshot;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -250,6 +254,8 @@ const FfiConverterTypeActionEscalationTarget = (() => {
                 case ActionEscalationTarget.Foreground: return ordinalConverter.write(2, into);
                 case ActionEscalationTarget.Page: return ordinalConverter.write(3, into);
                 case ActionEscalationTarget.Session: return ordinalConverter.write(4, into);
+                case ActionEscalationTarget.Element: return ordinalConverter.write(5, into);
+                case ActionEscalationTarget.Snapshot: return ordinalConverter.write(6, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -342,7 +348,7 @@ const FfiConverterTypeActionEscalation = (() => {
 
 export enum ActionEvidenceKind {
     ValueReadback,
-    WindowChange
+    ObservedChange
 }
 
 const FfiConverterTypeActionEvidenceKind = (() => {
@@ -352,14 +358,54 @@ const FfiConverterTypeActionEvidenceKind = (() => {
         read(from: RustBuffer): TypeName {
             switch (ordinalConverter.read(from)) {
                 case 1: return ActionEvidenceKind.ValueReadback;
-                case 2: return ActionEvidenceKind.WindowChange;
+                case 2: return ActionEvidenceKind.ObservedChange;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
         write(value: TypeName, into: RustBuffer): void {
             switch (value) {
                 case ActionEvidenceKind.ValueReadback: return ordinalConverter.write(1, into);
-                case ActionEvidenceKind.WindowChange: return ordinalConverter.write(2, into);
+                case ActionEvidenceKind.ObservedChange: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * Which post-dispatch observation a platform probe named. The coarse
+ * [`ActionEvidenceKind::ObservedChange`] says the target reacted; this says
+ * what was watched when it did.
+ */
+export enum ActionEvidenceSignal {
+    ElementState,
+    AppFocus,
+    WindowTree,
+    WindowChange
+}
+
+const FfiConverterTypeActionEvidenceSignal = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ActionEvidenceSignal;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ActionEvidenceSignal.ElementState;
+                case 2: return ActionEvidenceSignal.AppFocus;
+                case 3: return ActionEvidenceSignal.WindowTree;
+                case 4: return ActionEvidenceSignal.WindowChange;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ActionEvidenceSignal.ElementState: return ordinalConverter.write(1, into);
+                case ActionEvidenceSignal.AppFocus: return ordinalConverter.write(2, into);
+                case ActionEvidenceSignal.WindowTree: return ordinalConverter.write(3, into);
+                case ActionEvidenceSignal.WindowChange: return ordinalConverter.write(4, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -370,7 +416,12 @@ const FfiConverterTypeActionEvidenceKind = (() => {
 })();
 
 export type ActionEvidence = {
-    kind: ActionEvidenceKind
+    kind: ActionEvidenceKind,
+    /**
+     * Which signal the platform watched. Absent when the producer declared
+     * none, or named one this contract version does not publish.
+     */
+    signal?: ActionEvidenceSignal
 }
 
 /**
@@ -394,14 +445,17 @@ const FfiConverterTypeActionEvidence = (() => {
     class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
         read(from: RustBuffer): TypeName {
             return {
-                kind: FfiConverterTypeActionEvidenceKind.read(from)
+                kind: FfiConverterTypeActionEvidenceKind.read(from),
+                signal: FfiConverterOptionalTypeActionEvidenceSignal.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterTypeActionEvidenceKind.write(value.kind, into);
+            FfiConverterOptionalTypeActionEvidenceSignal.write(value.signal, into);
         }
         allocationSize(value: TypeName): number {
-            return FfiConverterTypeActionEvidenceKind.allocationSize(value.kind);
+            return FfiConverterTypeActionEvidenceKind.allocationSize(value.kind) +
+             FfiConverterOptionalTypeActionEvidenceSignal.allocationSize(value.signal);
 
         }
     };
@@ -4967,6 +5021,9 @@ const FfiConverterSequenceTypeAccessibilityWindow = new FfiConverterArray(FfiCon
 // FfiConverter for number | undefined
 const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
 
+// FfiConverter for ActionEvidenceSignal | undefined
+const FfiConverterOptionalTypeActionEvidenceSignal = new FfiConverterOptional(FfiConverterTypeActionEvidenceSignal);
+
 // FfiConverter for ActionDelivery | undefined
 const FfiConverterOptionalTypeActionDelivery = new FfiConverterOptional(FfiConverterTypeActionDelivery);
 
@@ -5117,6 +5174,7 @@ export default Object.freeze({
     FfiConverterTypeActionEscalationTarget,
     FfiConverterTypeActionEvidence,
     FfiConverterTypeActionEvidenceKind,
+    FfiConverterTypeActionEvidenceSignal,
     FfiConverterTypeActionResult,
     FfiConverterTypeActionRoute,
     FfiConverterTypeActionTarget,

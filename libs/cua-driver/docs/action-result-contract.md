@@ -23,6 +23,18 @@ Every successful action returns a closed `structuredContent` object:
 }
 ```
 
+An action that only proved the target reacted publishes the coarse kind plus
+the signal the platform watched:
+
+```json
+{
+  "effect": "unverifiable",
+  "route": "synthetic_events",
+  "delivery": {"mode": "background"},
+  "evidence": [{"kind": "observed_change", "signal": "app_focus"}]
+}
+```
+
 `effect` and `route` are required.
 
 | Field | Values |
@@ -30,8 +42,9 @@ Every successful action returns a closed `structuredContent` object:
 | `effect` | `confirmed`, `partial`, `unverifiable`, `suspected_noop`, `refused` |
 | `route` | `accessibility`, `synthetic_events`, `global_input`, `dom`, `trusted_input` |
 | `delivery.mode` | `background`, `foreground`, `not_applicable`, `unknown` |
-| `evidence[].kind` | `value_readback`, `window_change` |
-| `escalation.target` | `pixel`, `foreground`, `page`, `session` |
+| `evidence[].kind` | `value_readback`, `observed_change` |
+| `evidence[].signal` | `element_state`, `app_focus`, `window_tree`, `window_change` — optional; absent when the producer named no signal, or named one this version does not publish |
+| `escalation.target` | `pixel`, `foreground`, `page`, `session`, `element`, `snapshot` |
 | `escalation.reason` | `route_unavailable`, `delivery_failed`, `effect_unconfirmed`, `suspected_noop`, `permission_required` |
 
 The action-result tools are:
@@ -51,7 +64,7 @@ scope, targets, platform transport names, diagnostic pointers, or the old
 
 The invariants are:
 
-- `confirmed` has publishable readback or window-change evidence;
+- `confirmed` has publishable readback or observed-change evidence;
 - `partial` has `delivery.delivered_count`;
 - `refused` has neither delivery nor evidence.
 
@@ -74,6 +87,37 @@ An action that reached an actuator but lacks a trusted readback is
 `unverifiable`, not `confirmed`. Screenshot change, native API acceptance,
 event receipt, and operator observation may remain useful internal diagnostics,
 but they do not independently justify `confirmed`.
+
+## Structured refusals are a separate channel
+
+A refusal that stops before any actuator runs is an MCP error payload, not an
+`ActionResult`. It carries a machine-readable `code`, a route-free `reason`,
+and the facts the decision actually read. The stable codes are defined once in
+`cua_driver_core::background_input::refusal_codes`:
+
+| Code | Meaning |
+| --- | --- |
+| `window_not_found` | the requested window does not exist |
+| `owner_pid_mismatch` | the window is not owned by the requested process |
+| `off_space_or_ax_unresolved` | the window is off-space or its accessibility peer could not be resolved |
+| `minimized_or_hidden_window` | the window cannot receive input in its current state |
+| `same_pid_keyboard_ambiguity` | the process owns more than one candidate key window |
+| `element_outside_target_window` | the addressed element could not be proven to belong to the requested window |
+| `element_no_longer_exists` | the addressed element's accessibility reference is invalid; the window itself is unchanged |
+| `element_disabled` | the application reports `enabled = false` on the target, so no delivery mode and no activation can act on it |
+
+`element_no_longer_exists` escalates with `target: "snapshot"`: only a fresh
+observation can produce an addressable element. `element_disabled` carries no
+escalation — the application disabled the control, and no rung of the ladder
+changes that. Its payload names the control and the state the decision read:
+`action`, `role`, `label`, `window_id`, `pid`, `foreground`,
+`front_in_process`, and `obscured_by` when another window of the same process
+is in front.
+
+These payloads may also carry `effect: "not_dispatched"`. That value is
+deliberately not a member of the closed `ActionEffect` enum: an `ActionResult`
+is only produced once an actuator ran, so nothing that reaches the typed
+contract can be `not_dispatched`.
 
 ## Verification remains separate
 
@@ -123,10 +167,16 @@ An optional escalation is advice, not an automatic retry:
 | `foreground` | explicitly select foreground delivery when session policy permits |
 | `page` | bind the native window to a supported browser page route |
 | `session` | prepare or explicitly widen the session only when policy permits |
+| `element` | re-address the exact control: set its value, or act on the element instead of typing at whatever holds focus |
+| `snapshot` | re-observe before acting again; the addressed state is no longer trustworthy |
 
 SDK integrators, OpenClaw, Hermes, and other agent hosts can implement different
 policies above this same narrow fact contract without duplicating platform
 actuator details.
+
+A driver never names the harness's own observation or activation tool in
+prose. It emits one of these targets and the harness renders the route it
+actually exposes.
 
 ## Migration from 0.14
 
