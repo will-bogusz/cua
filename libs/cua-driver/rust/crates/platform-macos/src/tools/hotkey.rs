@@ -33,6 +33,36 @@ fn chord_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
     }
 }
 
+/// What the dispatch observed at the moment the key events went out.
+#[derive(Default)]
+struct ChordDispatch {
+    probe: Option<delivery_probe::DeliveryProbe>,
+    /// The application's key window when the chord was posted. `None` when the
+    /// app reported no key window, or when no window was targeted at all.
+    focused_window_id: Option<u32>,
+}
+
+/// What the key-window fact means for a chord that was already posted.
+///
+/// A menu key equivalent is validated against the application's key window, so
+/// a chord posted while another window held focus provably could not dispatch
+/// one. The reason is composed from the observation rather than looked up from
+/// the escalation target: only this decision knows whether the window was key.
+fn key_window_note(pid: i32, target_window_id: u32, focused_window_id: Option<u32>) -> String {
+    match focused_window_id {
+        Some(focused) if focused == target_window_id => String::new(),
+        Some(focused) => format!(
+            " Window {target_window_id} was not pid {pid}'s key window when the chord was \
+             posted — window {focused} held keyboard focus — and a menu key equivalent is \
+             validated against the key window."
+        ),
+        None => format!(
+            " Pid {pid} reported no key window when the chord was posted, and a menu key \
+             equivalent is validated against the key window."
+        ),
+    }
+}
+
 pub struct HotkeyTool {
     state: Arc<ToolState>,
 }
@@ -425,14 +455,19 @@ impl Tool for HotkeyTool {
             "hotkey.CGEvent",
             || async move {
                 cua_driver_core::operation::spawn_blocking(
-                    move || -> anyhow::Result<Option<delivery_probe::DeliveryProbe>> {
+                    move || -> anyhow::Result<ChordDispatch> {
                         let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                         // Capture immediately before the key events, inside any
                         // activation: fronting the window moves the app's focused
                         // element itself, and that move is not the chord's effect.
-                        let mut probe = None;
+                        // The same moment is the only one at which the key-window
+                        // fact is true — the foreground rung restores the prior
+                        // frontmost before the reply is composed.
+                        let mut dispatch = ChordDispatch::default();
                         let mut capture = |wid: u32| {
-                            probe = Some(delivery_probe::DeliveryProbe::capture(
+                            dispatch.focused_window_id =
+                                crate::ax::bindings::focused_window_id_of_pid(pid);
+                            dispatch.probe = Some(delivery_probe::DeliveryProbe::capture(
                                 pid,
                                 wid,
                                 element_ptr,
@@ -516,7 +551,7 @@ impl Tool for HotkeyTool {
                                 crate::input::keyboard::hotkey(pid, &key, &m)?;
                             }
                         }
-                        Ok(probe)
+                        Ok(dispatch)
                     },
                 )
                 .await
@@ -527,7 +562,11 @@ impl Tool for HotkeyTool {
         let changes = super::finish_window_observation(snapshot, &args).await;
 
         match result {
-            Ok(Ok(probe)) => {
+            Ok(Ok(dispatch)) => {
+                let ChordDispatch {
+                    probe,
+                    focused_window_id,
+                } = dispatch;
                 let label = if fg {
                     " (delivery_mode:foreground)"
                 } else {
@@ -556,8 +595,12 @@ impl Tool for HotkeyTool {
                 } else {
                     None
                 };
+                let not_key = window_id
+                    .map(|target| key_window_note(pid, target, focused_window_id))
+                    .filter(|note| !note.is_empty());
                 let mut msg = format!(
-                    "Pressed {key_display} on pid {pid}{label}.{}",
+                    "Pressed {key_display} on pid {pid}{label}.{}{}",
+                    not_key.clone().unwrap_or_default(),
                     changes.result_suffix()
                 );
                 // A combo has no general postcondition, so the reply never
@@ -568,13 +611,20 @@ impl Tool for HotkeyTool {
                     "verified": false,
                     "effect": "unverifiable",
                 });
-                if !fg && window_id.is_some() {
+                if let Some(target) = window_id {
+                    structured["key_window"] = serde_json::json!({
+                        "target_window_id": target,
+                        "focused_window_id": focused_window_id,
+                        "is_key": focused_window_id == Some(target),
+                    });
+                }
+                // The background rung cannot make a window key, so a chord
+                // posted at a window that was not key has one route left. A
+                // window that WAS key has no key-window problem to escalate.
+                if not_key.is_some() && !fg {
                     structured["escalation"] = serde_json::json!({
                         "recommended": "foreground",
-                        "reason": "a background combo didn't land? menu key-equivalents \
-                                   often need the window fronted — re-call with \
-                                   delivery_mode:\"foreground\". (To type into a field, \
-                                   pixel-click to focus then type_text instead.)"
+                        "reason": "route_unavailable",
                     });
                 }
                 if let Some(outcome) = evidence {
@@ -623,5 +673,25 @@ mod tests {
         assert!(screen_sharing_modifier_delivery_error(true, true, true, Some(7)).is_none());
         assert!(screen_sharing_modifier_delivery_error(true, false, false, None).is_none());
         assert!(screen_sharing_modifier_delivery_error(false, true, false, None).is_none());
+    }
+
+    /// The chord advice used to be a static string keyed on the escalation
+    /// target ("menu key-equivalents often need the window fronted"), emitted
+    /// on every background chord that named a window whether or not the window
+    /// was key. The reason is now the observation.
+    #[test]
+    fn the_chord_reason_is_the_observed_key_window() {
+        // Key: nothing to say, and nothing to escalate.
+        assert!(key_window_note(91895, 16933, Some(16933)).is_empty());
+
+        // Another window held focus: name it.
+        let other = key_window_note(91895, 16933, Some(4242));
+        assert!(other.contains("16933"), "{other}");
+        assert!(other.contains("4242"), "{other}");
+
+        // No key window at all is a different fact and must not name a holder.
+        let none = key_window_note(91895, 16933, None);
+        assert!(none.contains("no key window"), "{none}");
+        assert!(!none.contains("held keyboard focus"), "{none}");
     }
 }
