@@ -439,6 +439,7 @@ impl Tool for TypeTextTool {
                     verified,
                     delivered_chars,
                     destination_resolved,
+                    normalized,
                 } = outcome;
                 // SURFACE-AWARE VERIFICATION. On any web-content surface —
                 // Chromium/WebKit/Electron — AXValue is not independent renderer
@@ -467,7 +468,15 @@ impl Tool for TypeTextTool {
                 let unconfirmed =
                     Unconfirmed::of(destination_resolved, untrusted_web_readback, path);
                 let (mark, note) = if verified {
-                    ("✅ Inserted", String::new())
+                    let note = if normalized {
+                        format!(
+                            " The app normalised the text: all {char_count} character(s) landed \
+                             and the field's value is not byte-identical to the request."
+                        )
+                    } else {
+                        String::new()
+                    };
+                    ("✅ Inserted", note)
                 } else {
                     let note = match unconfirmed {
                         Unconfirmed::NoDestination => no_destination_note(pid, window_id),
@@ -937,11 +946,17 @@ struct TypeTextOutcome {
     /// Whether a text destination resolved at all. `false` means the
     /// keystrokes were posted with nothing to focus and no value to read.
     destination_resolved: bool,
+    /// Every requested character arrived but the field holds something else:
+    /// the application normalised the input.
+    normalized: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TypedProgress {
     Complete,
+    /// Every requested character arrived, and the field's value is not the
+    /// requested text: the application normalised the input.
+    Normalized(usize),
     Partial(usize),
     Unchanged,
     Unverifiable,
@@ -973,8 +988,10 @@ fn verify_typed(before: Option<&str>, after: Option<&str>, text: &str) -> bool {
 }
 
 /// Classify an observable insertion without mistaking a prefix for complete
-/// delivery. A positive length delta is an exact delivered-character count for
-/// insert-at-cursor typing; it is capped at the request size defensively.
+/// delivery, and without mistaking a value the field already held for one this
+/// call delivered. A positive length delta is an exact delivered-character
+/// count for insert-at-cursor typing; it is capped at the request size
+/// defensively.
 fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> TypedProgress {
     if text.is_empty() {
         return TypedProgress::Complete;
@@ -982,21 +999,26 @@ fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> Type
     let Some(after) = after else {
         return TypedProgress::Unverifiable;
     };
-    if after.contains(text) {
+    // A field that already held the request cannot prove delivery by still
+    // holding it — only the length delta separates an insertion from an echo.
+    let already_held = before.is_some_and(|before| before.contains(text));
+    if after.contains(text) && !already_held {
         return TypedProgress::Complete;
     }
     let Some(before) = before else {
         return TypedProgress::Unverifiable;
     };
+    let requested = text.chars().count();
     let delivered = after
         .chars()
         .count()
         .saturating_sub(before.chars().count())
-        .min(text.chars().count());
-    if delivered == 0 {
-        TypedProgress::Unchanged
-    } else {
-        TypedProgress::Partial(delivered)
+        .min(requested);
+    match delivered {
+        0 => TypedProgress::Unchanged,
+        n if n < requested => TypedProgress::Partial(n),
+        _ if after.contains(text) => TypedProgress::Complete,
+        n => TypedProgress::Normalized(n),
     }
 }
 
@@ -1096,7 +1118,8 @@ fn progress_rank(progress: &TypedProgress) -> (u8, usize) {
         TypedProgress::Unverifiable => (0, 0),
         TypedProgress::Unchanged => (1, 0),
         TypedProgress::Partial(delivered) => (2, *delivered),
-        TypedProgress::Complete => (3, 0),
+        TypedProgress::Normalized(delivered) => (3, *delivered),
+        TypedProgress::Complete => (4, 0),
     }
 }
 
@@ -1183,7 +1206,7 @@ fn cgevent_type_verified(
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
     window_id: Option<u32>,
-) -> anyhow::Result<(bool, Option<usize>)> {
+) -> anyhow::Result<TypedDelivery> {
     // Focus the target element so the keystrokes land in IT. Critical in
     // foreground mode: a freshly-fronted window's keyboard focus may be on the
     // search box or nowhere, so without this the text goes into the void (or the
@@ -1223,7 +1246,7 @@ pub(super) fn type_and_drain(
     before: Option<&str>,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
-) -> anyhow::Result<(bool, Option<usize>)> {
+) -> anyhow::Result<TypedDelivery> {
     crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
 
     // CGEvent posting is asynchronous with respect to the renderer. In
@@ -1237,17 +1260,46 @@ pub(super) fn type_and_drain(
     }))
 }
 
+/// What a keystroke rung's read-back proved about the requested text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TypedDelivery {
+    /// A read-back accounted for every requested character.
+    pub verified: bool,
+    /// Characters the read-back proved delivered, when it could count them.
+    pub delivered: Option<usize>,
+    /// Every character arrived and the field's value is not the requested
+    /// text: the application normalised the input.
+    pub normalized: bool,
+}
+
 fn await_typed_delivery(
     before: Option<&str>,
     text: &str,
     deadline: std::time::Instant,
     read_value: impl FnMut() -> Option<String>,
-) -> (bool, Option<usize>) {
+) -> TypedDelivery {
     match await_typed_progress(before, text, deadline, read_value) {
-        TypedProgress::Complete => (true, Some(text.chars().count())),
-        TypedProgress::Partial(delivered) => (false, Some(delivered)),
-        TypedProgress::Unchanged => (false, Some(0)),
-        TypedProgress::Unverifiable => (false, None),
+        TypedProgress::Complete => TypedDelivery {
+            verified: true,
+            delivered: Some(text.chars().count()),
+            normalized: false,
+        },
+        TypedProgress::Normalized(delivered) => TypedDelivery {
+            verified: true,
+            delivered: Some(delivered),
+            normalized: true,
+        },
+        TypedProgress::Partial(delivered) => TypedDelivery {
+            verified: false,
+            delivered: Some(delivered),
+            normalized: false,
+        },
+        TypedProgress::Unchanged => TypedDelivery {
+            verified: false,
+            delivered: Some(0),
+            normalized: false,
+        },
+        TypedProgress::Unverifiable => TypedDelivery::default(),
     }
 }
 
@@ -1262,7 +1314,9 @@ fn await_typed_progress(
     loop {
         let after = read_value();
         match typed_progress(before, after.as_deref(), text) {
-            TypedProgress::Complete => return TypedProgress::Complete,
+            // A value already the requested length has nothing left to
+            // arrive; both states are terminal.
+            terminal @ (TypedProgress::Complete | TypedProgress::Normalized(_)) => return terminal,
             TypedProgress::Partial(delivered) => {
                 best_partial =
                     Some(best_partial.map_or(delivered, |best: usize| best.max(delivered)));
@@ -1409,7 +1463,7 @@ fn type_text_blocking(
                 window_id,
             )
         };
-        let ((verified, delivered_chars), fronted) = match window_id {
+        let (delivery, fronted) = match window_id {
             Some(wid) if screen_sharing_target => {
                 // Screen Sharing forwards physical HID transitions to the
                 // guest. PID-routed Unicode events all carry keycode 0 (the A
@@ -1429,14 +1483,14 @@ fn type_text_blocking(
                         crate::input::keyboard::type_text_physical_global(text, delay_ms)
                     },
                 )?;
-                ((false, None), true)
+                (TypedDelivery::default(), true)
             }
             Some(wid) => {
                 // Front → type → restore. The closure returns the read-back
                 // result; with_foreground_assist returns whether it actually
                 // fronted (Ok(false) when the fronting SPIs are unavailable —
                 // the keystrokes still ran, just as background input).
-                let mut typed_delivery = (false, None);
+                let mut typed_delivery = TypedDelivery::default();
                 let fronted = crate::input::skylight::with_foreground_assist(
                     pid as libc::pid_t,
                     wid,
@@ -1460,8 +1514,9 @@ fn type_text_blocking(
             } else {
                 PATH_KEY_EVENTS
             },
-            delivered_chars,
-            verified,
+            delivered_chars: delivery.delivered,
+            verified: delivery.verified,
+            normalized: delivery.normalized,
             destination_resolved: destination.is_some(),
         }));
     }
@@ -1489,7 +1544,7 @@ fn type_text_blocking(
             "type_text: pid {pid} is a terminal emulator; skipping AX value-set, \
              using CGEvent key-event synthesis"
         );
-        let (verified, delivered_chars) = cgevent_type_verified(
+        let delivery = cgevent_type_verified(
             pid,
             text,
             delay_ms,
@@ -1501,8 +1556,9 @@ fn type_text_blocking(
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
             path: PATH_KEY_EVENTS,
-            verified,
-            delivered_chars,
+            verified: delivery.verified,
+            delivered_chars: delivery.delivered,
+            normalized: delivery.normalized,
             destination_resolved,
         }));
     }
@@ -1549,24 +1605,35 @@ fn type_text_blocking(
         // unsafe even though no synthesis has run yet.
         let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged)
             && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
         if ax_progress == Some(TypedProgress::Complete) {
-            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
             return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
                 detail: format!(" into{idx_str} {role} \"{title}\""),
                 path: PATH_AX,
                 verified: true,
                 delivered_chars: Some(text.chars().count()),
                 destination_resolved: true,
+                normalized: false,
+            }));
+        }
+        if let Some(TypedProgress::Normalized(delivered_chars)) = ax_progress {
+            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                detail: format!(" into{idx_str} {role} \"{title}\""),
+                path: PATH_AX,
+                verified: true,
+                delivered_chars: Some(delivered_chars),
+                destination_resolved: true,
+                normalized: true,
             }));
         }
         if let Some(TypedProgress::Partial(delivered_chars)) = ax_progress {
-            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
             return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
                 detail: format!(" via partial AX write into{idx_str} {role} \"{title}\""),
                 path: PATH_AX,
                 verified: false,
                 delivered_chars: Some(delivered_chars),
                 destination_resolved: true,
+                normalized: false,
             }));
         }
         ax_attempt = match ax_progress {
@@ -1574,7 +1641,9 @@ fn type_text_blocking(
             Some(TypedProgress::Unchanged) => AxAttempt::Unchanged,
             Some(TypedProgress::Unverifiable) => AxAttempt::Unverifiable,
             None => AxAttempt::Rejected,
-            Some(TypedProgress::Complete | TypedProgress::Partial(_)) => unreachable!(),
+            Some(
+                TypedProgress::Complete | TypedProgress::Normalized(_) | TypedProgress::Partial(_),
+            ) => unreachable!(),
         };
         tracing::debug!(
             "AX write did not land for {role} \"{title}\" (err={err}); \
@@ -1606,7 +1675,7 @@ fn type_text_blocking(
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
-    let (verified, delivered_chars) = cgevent_type_verified(
+    let delivery = cgevent_type_verified(
         pid,
         text,
         delay_ms,
@@ -1618,8 +1687,9 @@ fn type_text_blocking(
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
         path: PATH_KEY_EVENTS,
-        verified,
-        delivered_chars,
+        verified: delivery.verified,
+        delivered_chars: delivery.delivered,
+        normalized: delivery.normalized,
         destination_resolved,
     }))
 }
@@ -1845,7 +1915,14 @@ mod tests {
                 values.pop_front().flatten()
             },
         );
-        assert_eq!(delivery, (true, Some(text.chars().count())));
+        assert_eq!(
+            delivery,
+            TypedDelivery {
+                verified: true,
+                delivered: Some(text.chars().count()),
+                normalized: false,
+            }
+        );
         assert_eq!(reads, 2, "completion must wait past the prefix readback");
     }
 
@@ -1857,7 +1934,83 @@ mod tests {
             std::time::Instant::now(),
             || Some("BEGIN".to_owned()),
         );
-        assert_eq!(delivery, (false, Some(5)));
+        assert_eq!(
+            delivery,
+            TypedDelivery {
+                verified: false,
+                delivered: Some(5),
+                normalized: false,
+            }
+        );
+    }
+
+    /// A field that already held the request cannot prove delivery by still
+    /// holding it. Measured in Notes: a prior clear was refused, so the search
+    /// field already read "warehouse pallet audit" and an insertion that
+    /// landed nothing was reported "✅ Inserted 22 char(s) … verified".
+    #[test]
+    fn a_value_the_field_already_held_is_not_a_confirmed_insertion() {
+        let text = "warehouse pallet audit";
+        assert_eq!(
+            typed_progress(Some(text), Some(text), text),
+            TypedProgress::Unchanged
+        );
+        // A real insertion on top of the same value still counts: the length
+        // moved by the full request.
+        assert_eq!(
+            typed_progress(Some(text), Some(&format!("{text}{text}")), text),
+            TypedProgress::Complete
+        );
+        // Half of it arriving is a partial, not a confirm.
+        assert_eq!(
+            typed_progress(Some(text), Some(&format!("wareh{text}")), text),
+            TypedProgress::Partial(5)
+        );
+    }
+
+    /// An unreadable prior value leaves the substring test as the only
+    /// evidence there is, so it stays authoritative there.
+    #[test]
+    fn an_unreadable_prior_value_still_confirms_on_the_substring() {
+        assert_eq!(
+            typed_progress(None, Some("hello world"), "hello"),
+            TypedProgress::Complete
+        );
+    }
+
+    /// Replacing a selection shortens the field, so the length delta is zero
+    /// or negative while every character in fact landed. AppKit selects a text
+    /// field's whole contents when it takes focus, which makes this the common
+    /// case rather than an edge one.
+    #[test]
+    fn a_replacing_insertion_is_complete_even_though_the_field_shrank() {
+        assert_eq!(
+            typed_progress(Some("a much longer old value"), Some("new"), "new"),
+            TypedProgress::Complete
+        );
+    }
+
+    /// The full character count arrived and the value is not what was asked
+    /// for: TextEdit autocapitalised "warehouse" to "Warehouse". Reporting
+    /// that as unverifiable threw away a count the driver already had.
+    #[test]
+    fn a_normalised_value_reports_the_whole_count_it_observed() {
+        let text = "warehouse pallet audit";
+        assert_eq!(
+            typed_progress(Some(""), Some("Warehouse pallet audit"), text),
+            TypedProgress::Normalized(text.chars().count())
+        );
+        let delivery = await_typed_delivery(Some(""), text, std::time::Instant::now(), || {
+            Some("Warehouse pallet audit".to_owned())
+        });
+        assert_eq!(
+            delivery,
+            TypedDelivery {
+                verified: true,
+                delivered: Some(text.chars().count()),
+                normalized: true,
+            }
+        );
     }
 
     /// The drain summarises a whole polling window, and the AX rung reads that

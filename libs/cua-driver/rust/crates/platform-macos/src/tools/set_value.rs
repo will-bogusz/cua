@@ -750,11 +750,15 @@ fn retype_blocking(
 
     // A keystroke has to make the change for the editor to notice it, so an
     // empty value is delivered as a deletion of the selection.
-    let (delivered_all, delivered) = if value.is_empty() {
+    let delivery = if value.is_empty() {
         crate::input::keyboard::press_key(pid, "delete", &[])?;
         std::thread::sleep(COMMIT_SETTLE);
         let after = unsafe { copy_string_attr(element, "AXValue") };
-        (after.as_deref() == Some(""), Some(0))
+        super::type_text::TypedDelivery {
+            verified: after.as_deref() == Some(""),
+            delivered: Some(0),
+            normalized: false,
+        }
     } else {
         super::type_text::type_and_drain(
             pid,
@@ -765,6 +769,7 @@ fn retype_blocking(
             Some(window_id),
         )?
     };
+    let (delivered_all, delivered) = (delivery.verified, delivery.delivered);
 
     let dispatched = crate::input::keyboard::press_key(pid, end, &[]).is_ok();
     let (survived, edit_ended) = if dispatched {
