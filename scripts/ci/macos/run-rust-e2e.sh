@@ -349,9 +349,20 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
     snapshot_publication::harness_appkit_pending_snapshot_cannot_retarget_token \
     harness_appkit_invoke_menu_live_path \
     harness_appkit_text_input \
+    harness_appkit_set_value_commits_the_edit \
+    harness_appkit_foreground_press_key_chord_carries_its_modifiers \
+    harness_appkit_click_on_a_text_role_focuses_it \
+    harness_appkit_click_on_a_selectable_row_selects_without_pressing \
+    harness_appkit_a_content_bearing_group_stays_addressable \
     harness_appkit_element_foreground_press_key_commits_edit \
+    harness_appkit_px_background_press_key_reports_honest_delivery_truth \
     harness_appkit_modified_click_preserves_selection \
     harness_appkit_type_text_background \
+    harness_appkit_window_scoped_type_reaches_the_focused_field \
+    harness_appkit_menu_key_equivalent_through_hotkey \
+    harness_appkit_disabled_until_key_chord_lands_as_its_menu_command \
+    harness_appkit_type_text_waits_for_a_lagging_value_readback \
+    harness_appkit_press_effect_after_the_first_sample_is_not_a_noop \
     harness_appkit_scroll_foreground \
     harness_appkit_scroll_background \
     harness_appkit_counter \
