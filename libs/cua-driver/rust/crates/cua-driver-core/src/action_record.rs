@@ -60,6 +60,10 @@ pub enum ActualDelivery {
 pub enum ActionTransport {
     AgentCursorOverlay,
     MacosAxAction,
+    /// A menu item pressed through accessibility after the target window was
+    /// made key: the application's own menu command, never a background
+    /// delivery.
+    MacosMenuCommand,
     MacosAxValue,
     MacosAxWindowFrame,
     MacosCgEventPid,
@@ -98,6 +102,7 @@ impl ActionTransport {
     pub const ALL: &'static [Self] = &[
         Self::AgentCursorOverlay,
         Self::MacosAxAction,
+        Self::MacosMenuCommand,
         Self::MacosAxValue,
         Self::MacosAxWindowFrame,
         Self::MacosCgEventPid,
@@ -166,6 +171,7 @@ impl ActionTransport {
             Self::WindowsSetWindowPos | Self::LinuxX11ConfigureWindow => ActionRoute::SystemApi,
             Self::BrowserCdpRuntimeFunction => ActionRoute::Dom,
             Self::BrowserCdpInputMouse | Self::BrowserCdpInputKey => ActionRoute::TrustedInput,
+            Self::MacosMenuCommand => ActionRoute::MenuCommand,
         }
     }
 }
@@ -179,6 +185,7 @@ pub enum ActionRoute {
     SystemApi,
     Dom,
     TrustedInput,
+    MenuCommand,
 }
 
 /// Evidence supporting an action effect, intentionally without request data.
@@ -259,6 +266,9 @@ pub struct ActionExecutionRecord {
     /// Value-setting actions only: what was observed of the app's own
     /// end-of-edit for the written value.
     pub committed: Option<cua_driver_contract::ActionCommit>,
+    /// Menu-command dispatches only: the menu titles the driver pressed, top
+    /// level first.
+    pub menu_path: Option<Vec<String>>,
 }
 
 impl ActionExecutionRecord {
@@ -279,6 +289,7 @@ impl ActionExecutionRecord {
             delivered_count: None,
             detail: None,
             committed: None,
+            menu_path: None,
         }
     }
 
@@ -349,6 +360,7 @@ impl ActionExecutionRecord {
                 ActionRoute::SystemApi => cua_driver_contract::ActionRoute::SystemApi,
                 ActionRoute::Dom => cua_driver_contract::ActionRoute::Dom,
                 ActionRoute::TrustedInput => cua_driver_contract::ActionRoute::TrustedInput,
+                ActionRoute::MenuCommand => cua_driver_contract::ActionRoute::MenuCommand,
             },
             delivery: projection
                 .delivery
@@ -449,6 +461,7 @@ impl ActionExecutionRecord {
                 }
             }),
             committed: self.committed,
+            menu_path: self.menu_path.clone(),
         })
     }
 
@@ -488,6 +501,16 @@ impl ActionExecutionRecord {
             .get("committed")
             .and_then(serde_json::Value::as_str)
             .and_then(cua_driver_contract::ActionCommit::from_wire);
+        record.menu_path = structured
+            .get("menu_path")
+            .and_then(serde_json::Value::as_array)
+            .map(|titles| {
+                titles
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            });
 
         if legacy_has_publishable_readback(tool_name, structured) {
             record.evidence.push(ActionEvidence {
@@ -777,6 +800,7 @@ fn transport_from_legacy(
         "hid" | "cgevent_hid" | "cgevent_fg" | "key_events_hid_fg" => {
             ActionTransport::MacosCgEventHid
         }
+        "menu_command" => ActionTransport::MacosMenuCommand,
         "cgevent" => {
             if args
                 .get("delivery_mode")
@@ -1038,6 +1062,7 @@ fn route_name(route: ActionRoute) -> &'static str {
         ActionRoute::SystemApi => "system_api",
         ActionRoute::Dom => "dom",
         ActionRoute::TrustedInput => "trusted_input",
+        ActionRoute::MenuCommand => "menu_command",
     }
 }
 
@@ -1091,6 +1116,7 @@ fn transport_name(transport: ActionTransport) -> &'static str {
     match transport {
         ActionTransport::AgentCursorOverlay => "agent_cursor_overlay",
         ActionTransport::MacosAxAction => "macos_ax_action",
+        ActionTransport::MacosMenuCommand => "macos_menu_command",
         ActionTransport::MacosAxValue => "macos_ax_value",
         ActionTransport::MacosAxWindowFrame => "macos_ax_window_frame",
         ActionTransport::MacosCgEventPid => "macos_cg_event_pid",
@@ -1175,6 +1201,11 @@ impl ActionExecutionRecordBuilder {
 
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
         self.0.detail = Some(detail.into());
+        self
+    }
+
+    pub fn menu_path(mut self, path: Vec<String>) -> Self {
+        self.0.menu_path = Some(path);
         self
     }
 

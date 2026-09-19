@@ -494,6 +494,11 @@ pub enum ActionEffect {
     Refused,
 }
 
+/// The class of route the driver used. `MenuCommand` is the application's own
+/// menu command: a chord that is the key equivalent of a menu item the
+/// application keeps disabled until the target window is key is dispatched
+/// as that item, which needs the window made key first, so it is never a
+/// background delivery.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionRoute {
@@ -503,6 +508,7 @@ pub enum ActionRoute {
     SystemApi,
     Dom,
     TrustedInput,
+    MenuCommand,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
@@ -659,6 +665,10 @@ pub struct ActionResult {
     /// step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub committed: Option<ActionCommit>,
+    /// `menu_command` routes only: the application's own menu titles the
+    /// driver dispatched, top level first. Absent on every other route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_path: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -820,6 +830,7 @@ mod tests {
             }]),
             escalation: None,
             committed: None,
+            menu_path: None,
         }
     }
 
@@ -862,6 +873,7 @@ mod tests {
                 "effect",
                 "escalation",
                 "evidence",
+                "menu_path",
                 "route"
             ]
         );
@@ -883,7 +895,8 @@ mod tests {
                 "global_input",
                 "system_api",
                 "dom",
-                "trusted_input"
+                "trusted_input",
+                "menu_command"
             ])
         );
 
@@ -1018,6 +1031,27 @@ mod tests {
             }
         });
         assert!(serde_json::from_value::<ActionResult>(escalation_extension).is_err());
+    }
+
+    /// A menu-command reply carries the path it dispatched as a machine field;
+    /// every other route leaves the key out rather than publishing an empty
+    /// list.
+    #[test]
+    fn a_menu_command_route_publishes_the_path_it_dispatched() {
+        let mut result = confirmed_result();
+        result.route = ActionRoute::MenuCommand;
+        result.menu_path = Some(vec!["Edit".into(), "Find".into(), "Find…".into()]);
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["route"], json!("menu_command"));
+        assert_eq!(value["menu_path"], json!(["Edit", "Find", "Find…"]));
+        assert_eq!(
+            serde_json::from_value::<ActionResult>(value).expect("deserialize"),
+            result
+        );
+        assert!(serde_json::to_value(confirmed_result())
+            .unwrap()
+            .get("menu_path")
+            .is_none());
     }
 
     /// A consumer reads the signal from a machine field instead of prose, so

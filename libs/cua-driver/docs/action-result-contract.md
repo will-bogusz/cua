@@ -40,12 +40,13 @@ the signal the platform watched:
 | Field | Values |
 | --- | --- |
 | `effect` | `confirmed`, `partial`, `unverifiable`, `suspected_noop`, `refused` |
-| `route` | `accessibility`, `synthetic_events`, `global_input`, `dom`, `trusted_input` |
+| `route` | `accessibility`, `synthetic_events`, `global_input`, `system_api`, `dom`, `trusted_input`, `menu_command` |
 | `delivery.mode` | `background`, `foreground`, `not_applicable`, `unknown` |
 | `evidence[].kind` | `value_readback`, `observed_change` |
 | `evidence[].signal` | `element_state`, `app_focus`, `window_tree`, `window_change` — optional; absent when the producer named no signal, or named one this version does not publish |
 | `escalation.target` | `pixel`, `foreground`, `page`, `session`, `element`, `snapshot` |
 | `escalation.reason` | `route_unavailable`, `delivery_failed`, `effect_unconfirmed`, `suspected_noop`, `permission_required` |
+| `menu_path` | `menu_command` routes only: the application's own menu titles the driver dispatched, top level first (`["Edit", "Find", "Find…"]`); absent on every other route |
 
 The action-result tools are:
 
@@ -66,7 +67,13 @@ The invariants are:
 
 - `confirmed` has publishable readback or observed-change evidence;
 - `partial` has `delivery.delivered_count`;
-- `refused` has neither delivery nor evidence.
+- `refused` has neither delivery nor evidence;
+- `menu_command` is never a background delivery: the driver made the target
+  window key (and fronted its application when it was not frontmost) before
+  pressing the item, then restored the prior frontmost. `invoke_menu` reports
+  it always; `hotkey` reports it when a chord posted at a window that is not
+  key names the key equivalent of a menu item the application keeps disabled
+  until that window is key, and the chord was dispatched as that item instead.
 
 ## Window target resolution
 
