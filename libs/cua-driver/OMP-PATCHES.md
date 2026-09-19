@@ -99,3 +99,9 @@ illegal argument, `-25202` dead element, `-25204` messaging timeout, `-25211`
 API disabled): none of those is an application answering an action it
 received, and `-25204` in particular is the AX messaging deadline the walk
 budget also raises, where nothing having happened is the common case.
+
+## Wave 6
+
+| Patch (commit title) | What the runs showed | Upstream PR? |
+|---|---|---|
+| `feat(macos): dispatch a not-key window's disabled key equivalent as its menu command` | Notes keeps `Edit > Find > Note List Search…` (⌥⌘F) disabled until its window is key; a background chord there landed 0/12 and the model never took the foreground rung it was offered (0/7, T11 on 0919b). Measured live: `invoke_menu` fronts Notes, makes the window key, presses and restores ~350 ms later — before Notes runs the command, so the search field never held focus through it either (0/2); with the window kept key it does (3/3) and it releases the moment the prior app is re-fronted (3/3). The chord now resolves to the item by `AXMenuItemCmdChar`/`CmdVirtualKey`/`CmdModifiers`, is dispatched as that item with the window key, the app's reaction is waited for before the restore, and the reply says what moved: `route: menu_command`, `delivery: foreground`, `menu_path`, and whether the reaction survived the restore (`escalation.target: element` when it did not). Contract 0.10.0: `ActionRoute::MenuCommand` and the optional `ActionResult.menu_path`. | pending |

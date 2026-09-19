@@ -72,7 +72,7 @@ fn normalized_path(path: Vec<String>) -> Result<Vec<String>, String> {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-struct MenuItem {
+pub(super) struct MenuItem {
     title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
@@ -82,10 +82,14 @@ struct MenuItem {
 }
 
 #[derive(Debug)]
-struct MenuRefusal {
-    message: String,
+pub(super) struct MenuRefusal {
+    pub(super) message: String,
     failed_segment: Option<usize>,
     items: Vec<MenuItem>,
+    /// The segment resolved and read `AXEnabled=false` once its menu was
+    /// open — the application's own verdict on the command, not a walk
+    /// failure.
+    disabled: bool,
 }
 
 impl MenuRefusal {
@@ -94,6 +98,7 @@ impl MenuRefusal {
             message: message.into(),
             failed_segment: None,
             items: Vec::new(),
+            disabled: false,
         }
     }
 
@@ -102,6 +107,17 @@ impl MenuRefusal {
             message: message.into(),
             failed_segment: Some(depth),
             items: Vec::new(),
+            disabled: false,
+        }
+    }
+
+    fn disabled_at(depth: usize) -> Self {
+        Self {
+            disabled: true,
+            ..Self::at_segment(
+                depth,
+                format!("invoke_menu: path segment {depth} is disabled"),
+            )
         }
     }
 
@@ -109,10 +125,16 @@ impl MenuRefusal {
         self.items = items;
         self
     }
+
+    /// Whether the final segment of a `path_len`-long path was the one the
+    /// application kept disabled with its menu open.
+    pub(super) fn is_final_segment_disabled(&self, path_len: usize) -> bool {
+        self.disabled && self.failed_segment == Some(path_len.saturating_sub(1))
+    }
 }
 
 #[derive(Debug)]
-enum MenuOutcome {
+pub(super) enum MenuOutcome {
     Invoked,
     Listed(Vec<MenuItem>),
 }
@@ -127,6 +149,136 @@ const MENU_MODIFIER_SHIFT: i64 = 1;
 const MENU_MODIFIER_OPTION: i64 = 1 << 1;
 const MENU_MODIFIER_CONTROL: i64 = 1 << 2;
 const MENU_MODIFIER_NO_COMMAND: i64 = 1 << 3;
+/// Measured on Notes: `View > Enter Full Screen` (fn F) publishes `24`,
+/// `Window > Move & Resize > Return to Previous Size` (fn ⌃ R) `28`.
+const MENU_MODIFIER_FN: i64 = 1 << 4;
+
+/// How many menu levels the key-equivalent walk descends below the menu bar.
+/// Every measured key equivalent sits at depth 2 or 3 (`Edit > Find > Find…`);
+/// the cap bounds a pathological menu, not a real one.
+const KEY_EQUIVALENT_MAX_DEPTH: usize = 4;
+
+/// The `AXMenuItemCmdModifiers` mask a chord would carry as a menu key
+/// equivalent. `None` for a modifier set no menu item can publish.
+pub(super) fn chord_modifier_mask(modifiers: &[&str]) -> Option<i64> {
+    let mut mask = MENU_MODIFIER_NO_COMMAND;
+    for modifier in modifiers {
+        match modifier.to_lowercase().as_str() {
+            "cmd" | "command" => mask &= !MENU_MODIFIER_NO_COMMAND,
+            "shift" => mask |= MENU_MODIFIER_SHIFT,
+            "option" | "alt" => mask |= MENU_MODIFIER_OPTION,
+            "ctrl" | "control" => mask |= MENU_MODIFIER_CONTROL,
+            "fn" => mask |= MENU_MODIFIER_FN,
+            _ => return None,
+        }
+    }
+    Some(mask)
+}
+
+/// The key-equivalent attributes one menu item publishes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct KeyEquivalent {
+    pub cmd_char: Option<String>,
+    pub virtual_key: Option<i64>,
+    pub modifiers: Option<i64>,
+}
+
+impl KeyEquivalent {
+    /// Whether `key` under `mask` is this item's key equivalent.
+    ///
+    /// Measured on Notes' menu bar: a printing equivalent is published as its
+    /// uppercase character with no virtual key (`Find…` → `"F"`, `Zoom In` →
+    /// `"."`); a non-printing one carries the virtual key beside a glyph
+    /// character (`Delete Note` → `"\u{8}"`, key 51; `Force Quit…` →
+    /// `"⎋"`, key 53), so the key code is the comparable half there.
+    pub fn matches(&self, key: &str, mask: i64) -> bool {
+        if self.modifiers.unwrap_or(0) != mask {
+            return false;
+        }
+        if let Some(virtual_key) = self.virtual_key {
+            return crate::input::keyboard::key_name_to_code(key)
+                .ok()
+                .is_some_and(|code| i64::from(code) == virtual_key);
+        }
+        let Some(cmd_char) = self.cmd_char.as_deref() else {
+            return false;
+        };
+        let mut chars = key.chars();
+        matches!((chars.next(), chars.next()), (Some(_), None))
+            && !cmd_char.is_empty()
+            && key.to_uppercase() == cmd_char.to_uppercase()
+    }
+}
+
+/// A menu item found by its key equivalent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeyEquivalentItem {
+    /// Titles from the menu bar down, the path `invoke_path` takes.
+    pub path: Vec<String>,
+    pub enabled: Option<bool>,
+}
+
+unsafe fn key_equivalent_of(item: AXUIElementRef) -> KeyEquivalent {
+    KeyEquivalent {
+        cmd_char: copy_string_attr(item, "AXMenuItemCmdChar"),
+        virtual_key: copy_number_attr(item, "AXMenuItemCmdVirtualKey").map(|key| key as i64),
+        modifiers: copy_number_attr(item, "AXMenuItemCmdModifiers").map(|mask| mask as i64),
+    }
+}
+
+unsafe fn find_key_equivalent_under(
+    parent: AXUIElementRef,
+    path: &mut Vec<String>,
+    key: &str,
+    mask: i64,
+) -> Option<KeyEquivalentItem> {
+    let children = semantic_children(parent);
+    let mut found = None;
+    for child in children {
+        if found.is_none() {
+            if let Some(title) = listable_title(copy_string_attr(child, "AXTitle")) {
+                path.push(title);
+                if key_equivalent_of(child).matches(key, mask) {
+                    found = Some(KeyEquivalentItem {
+                        path: path.clone(),
+                        enabled: copy_bool_attr(child, "AXEnabled"),
+                    });
+                } else if path.len() < KEY_EQUIVALENT_MAX_DEPTH {
+                    found = find_key_equivalent_under(child, path, key, mask);
+                }
+                path.pop();
+            }
+        }
+        CFRelease(child as CFTypeRef);
+    }
+    found
+}
+
+/// The menu item of `pid`'s menu bar whose key equivalent is `key` under the
+/// chord's modifiers, or `None` when the chord is bound to no menu item. The
+/// walk reads closed menus the way `invoke_menu`'s listing does; nothing is
+/// opened or pressed.
+pub(super) fn find_key_equivalent(
+    pid: i32,
+    key: &str,
+    modifiers: &[&str],
+) -> Option<KeyEquivalentItem> {
+    let mask = chord_modifier_mask(modifiers)?;
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        set_messaging_timeout(app);
+        let found = menu_bar_of(app).and_then(|menu_bar| {
+            let found = find_key_equivalent_under(menu_bar, &mut Vec::new(), key, mask);
+            CFRelease(menu_bar as CFTypeRef);
+            found
+        });
+        CFRelease(app as CFTypeRef);
+        found
+    }
+}
 
 fn menu_shortcut(cmd_char: Option<&str>, modifiers: Option<f64>) -> Option<String> {
     let key = cmd_char?.trim();
@@ -354,10 +506,7 @@ unsafe fn press_each_segment(
 
         if copy_bool_attr(target, "AXEnabled") == Some(false) {
             CFRelease(target as CFTypeRef);
-            return Err(MenuRefusal::at_segment(
-                depth,
-                format!("invoke_menu: path segment {depth} is disabled"),
-            ));
+            return Err(MenuRefusal::disabled_at(depth));
         }
 
         let actions = copy_action_names(target);
@@ -406,7 +555,10 @@ unsafe fn press_each_segment(
     Ok(MenuOutcome::Invoked)
 }
 
-unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<MenuOutcome, MenuRefusal> {
+/// Resolve and press `path` on `pid`'s live menu bar; a final segment that
+/// opens a submenu is listed instead. The caller owns activation: the window
+/// the command validates against must already be key.
+pub(super) unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<MenuOutcome, MenuRefusal> {
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         return Err(MenuRefusal::plain(
@@ -661,23 +813,101 @@ fn listed(resolved_path: Vec<String>, items: Vec<MenuItem>) -> ToolResult {
     }))
 }
 
-fn invoked() -> ToolResult {
+fn invoked(path: Vec<String>, reaction: Option<super::delivery_probe::Evidence>) -> ToolResult {
+    let mut record = ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable,
+        ActionTransport::MacosMenuCommand,
+        RequestedDelivery::Foreground,
+    )
+    .actual_delivery(ActualDelivery::Foreground)
+    .menu_path(path)
+    .evidence(ActionEvidence {
+        kind: EvidenceKind::NativeApiResult,
+        detail: "Every menu hop resolved uniquely and AX accepted the final action".into(),
+    });
+    if let Some(reaction) = reaction.filter(|reaction| reaction.is_reaction()) {
+        record = record.evidence(ActionEvidence {
+            kind: EvidenceKind::ObservedChange,
+            detail: reaction.signal().to_owned(),
+        });
+    }
     ToolResult::text(
         "Resolved the live native menu path and dispatched its final accessibility action; verify the command's semantic effect from fresh state.",
     )
-    .with_action_record(
-        ActionExecutionRecord::builder(
-            ActionEffect::Unverifiable,
-            ActionTransport::MacosAxAction,
-            RequestedDelivery::Foreground,
-        )
-        .actual_delivery(ActualDelivery::Foreground)
-        .evidence(ActionEvidence {
-            kind: EvidenceKind::NativeApiResult,
-            detail: "Every menu hop resolved uniquely and AX accepted the final action".into(),
-        })
-        .build()
-        .expect("invoke_menu record is valid"),
+    .with_action_record(record.build().expect("invoke_menu record is valid"))
+}
+
+/// What making the window key did to the desktop, for a reply that has to
+/// say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MenuActivation {
+    /// The target application was not frontmost, so it was activated.
+    pub fronted: bool,
+    /// The target window was not its application's key window, so it was
+    /// made key.
+    pub made_key: bool,
+    /// Whether the prior frontmost window (or application) was put back;
+    /// `None` when nothing had to change.
+    pub restored: Option<bool>,
+}
+
+/// Whether `window_id` is the key window of the front process right now —
+/// the window NSMenu validates a key equivalent against. An inactive
+/// application still reports an `AXFocusedWindow`; it has no key window.
+pub(super) fn window_is_key(pid: i32, window_id: u32) -> bool {
+    exact_window_is_ready(
+        live_frontmost_pid(pid, window_id),
+        pid,
+        crate::ax::bindings::focused_window_id_of_pid(pid),
+        window_id,
+    )
+}
+
+/// Run `body` with the exact window key and frontmost, then put the prior
+/// frontmost back. Blocking; call from a blocking thread.
+///
+/// `body` runs on the key window and should wait for whatever reaction it
+/// needs before returning: an application answers a menu action on its own
+/// main loop, so a command that validates against the key window (Notes'
+/// `Note List Search…`, measured) does nothing if the window has already
+/// lost key by the time the action runs. The restore comes after.
+///
+/// The exact prior key window is restored when one was observable,
+/// including across applications; app activation is the fallback for a
+/// prior app without an AX window.
+pub(super) fn with_window_key<T>(
+    pid: i32,
+    window_id: u32,
+    body: impl FnOnce() -> T,
+) -> (Result<T, String>, MenuActivation) {
+    let prior_frontmost = live_frontmost_app().or_else(crate::apps::frontmost_pid);
+    let prior_frontmost_window =
+        prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
+    let needs_activation = prior_frontmost != Some(pid);
+    let made_key =
+        needs_activation || crate::ax::bindings::focused_window_id_of_pid(pid) != Some(window_id);
+
+    let result = focus_exact_window(pid, window_id).map(|()| body());
+
+    let already_restored = prior_frontmost
+        .is_some_and(|prior_pid| prior_pid == pid && prior_frontmost_window == Some(window_id));
+    let restored = if already_restored {
+        None
+    } else {
+        Some(prior_frontmost.is_some_and(|prior_pid| {
+            let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
+                focus_exact_window(prior_pid, prior_window_id).is_ok()
+            });
+            restored_exact || (needs_activation && crate::apps::activate_pid(prior_pid))
+        }))
+    };
+    (
+        result,
+        MenuActivation {
+            fronted: needs_activation,
+            made_key,
+            restored,
+        },
     )
 }
 
@@ -716,38 +946,24 @@ impl Tool for InvokeMenuTool {
         let resolved_path = path.clone();
 
         let outcome = tokio::task::spawn_blocking(move || {
-            let prior_frontmost = live_frontmost_app().or_else(crate::apps::frontmost_pid);
-            let prior_frontmost_window =
-                prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
-            let needs_activation = prior_frontmost != Some(pid);
-
-            let result = match focus_exact_window(pid, window_id) {
-                Ok(()) => unsafe { invoke_path(pid, &path) },
+            let (result, _activation) = with_window_key(pid, window_id, || {
+                let probe =
+                    super::delivery_probe::DeliveryProbe::capture_after_activation(pid, window_id);
+                let outcome = unsafe { invoke_path(pid, &path) };
+                let reaction =
+                    matches!(outcome, Ok(MenuOutcome::Invoked)).then(|| probe.compare().evidence);
+                (outcome, reaction)
+            });
+            match result {
+                Ok((outcome, reaction)) => outcome.map(|outcome| (outcome, reaction)),
                 Err(error) => Err(MenuRefusal::plain(error)),
-            };
-
-            // Restore the exact prior key window when one was observable,
-            // including across applications. Falling back to app activation
-            // preserves the previous behavior for apps without an AX window.
-            if let Some(prior_pid) = prior_frontmost {
-                let already_restored =
-                    prior_pid == pid && prior_frontmost_window == Some(window_id);
-                if !already_restored {
-                    let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
-                        focus_exact_window(prior_pid, prior_window_id).is_ok()
-                    });
-                    if needs_activation && !restored_exact {
-                        let _ = crate::apps::activate_pid(prior_pid);
-                    }
-                }
             }
-            result
         })
         .await;
 
         match outcome {
-            Ok(Ok(MenuOutcome::Invoked)) => invoked(),
-            Ok(Ok(MenuOutcome::Listed(items))) => listed(resolved_path, items),
+            Ok(Ok((MenuOutcome::Invoked, reaction))) => invoked(resolved_path, reaction),
+            Ok(Ok((MenuOutcome::Listed(items), _))) => listed(resolved_path, items),
             Ok(Err(refused)) => refusal(refused),
             Err(error) => refusal(MenuRefusal::plain(format!(
                 "invoke_menu: blocking task failed: {error}"
@@ -878,9 +1094,13 @@ mod tests {
         );
     }
 
+    /// The dispatch is the application's own menu command on a window made
+    /// key, so it publishes as such; a reaction the settle wait saw rides
+    /// along as observed-change evidence, and a menu that never reacted adds
+    /// nothing.
     #[test]
     fn a_pressed_menu_item_still_carries_its_execution_record() {
-        let pressed = invoked();
+        let pressed = invoked(vec!["File".into(), "New Note".into()], None);
         assert_eq!(pressed.is_error, None);
         assert!(pressed.structured_content.is_none());
         let public = serde_json::to_value(
@@ -892,8 +1112,88 @@ mod tests {
         )
         .expect("projection serializes");
         assert_eq!(public["effect"], "unverifiable");
-        assert_eq!(public["route"], "accessibility");
+        assert_eq!(public["route"], "menu_command");
         assert_eq!(public["delivery"]["mode"], "foreground");
+        assert!(public.get("evidence").is_none(), "{public}");
+        assert_eq!(public["menu_path"], serde_json::json!(["File", "New Note"]));
+
+        let reacted = serde_json::to_value(
+            invoked(
+                vec!["File".into(), "New Note".into()],
+                Some(super::super::delivery_probe::Evidence::Changed("app_focus")),
+            )
+            .action_record
+            .expect("execution record")
+            .public_result()
+            .expect("public projection"),
+        )
+        .expect("projection serializes");
+        assert_eq!(
+            reacted["evidence"],
+            serde_json::json!([{ "kind": "observed_change", "signal": "app_focus" }])
+        );
+    }
+
+    /// The mask is what `AXMenuItemCmdModifiers` publishes: command is the
+    /// default and its absence is a bit, the others are bits, and a modifier
+    /// no menu item can carry is no mask at all.
+    #[test]
+    fn a_chord_maps_onto_the_menu_modifier_mask() {
+        assert_eq!(chord_modifier_mask(&["cmd"]), Some(0));
+        assert_eq!(chord_modifier_mask(&["cmd", "option"]), Some(2));
+        assert_eq!(chord_modifier_mask(&["shift", "cmd"]), Some(1));
+        assert_eq!(
+            chord_modifier_mask(&["command", "control", "shift"]),
+            Some(5)
+        );
+        assert_eq!(chord_modifier_mask(&["fn"]), Some(24));
+        assert_eq!(chord_modifier_mask(&["ctrl"]), Some(12));
+        assert_eq!(chord_modifier_mask(&[]), Some(8));
+        assert_eq!(chord_modifier_mask(&["hyper"]), None);
+    }
+
+    /// Measured attribute shapes from Notes' menu bar: a printing key
+    /// equivalent is its uppercase character with no virtual key, a
+    /// non-printing one carries the virtual key beside a glyph character.
+    #[test]
+    fn a_key_equivalent_matches_the_chord_it_publishes() {
+        let printing = |cmd_char: &str, modifiers: i64| KeyEquivalent {
+            cmd_char: Some(cmd_char.into()),
+            virtual_key: None,
+            modifiers: Some(modifiers),
+        };
+        // Edit > Find > Note List Search… (⌥⌘F), Find… (⌘F), Find and Replace… (⇧⌘F).
+        assert!(printing("F", 2).matches("f", 2));
+        assert!(printing("F", 0).matches("f", 0));
+        assert!(printing("F", 1).matches("F", 1));
+        assert!(!printing("F", 2).matches("f", 0));
+        assert!(!printing("F", 0).matches("g", 0));
+        // View > Zoom In (⇧⌘.) and Format > Font > Bigger (⌘+): punctuation as is.
+        assert!(printing(".", 1).matches(".", 1));
+        assert!(printing("+", 0).matches("+", 0));
+        // A named key never matches a printing equivalent by spelling.
+        assert!(!printing("F", 0).matches("f1", 0));
+        assert!(!printing("", 0).matches("", 0));
+
+        // Edit > Delete Note (⌫, no command) and Apple > Force Quit… (⌥⌘⎋).
+        let delete = KeyEquivalent {
+            cmd_char: Some("\u{8}".into()),
+            virtual_key: Some(51),
+            modifiers: Some(8),
+        };
+        assert!(delete.matches("delete", 8));
+        assert!(delete.matches("backspace", 8));
+        assert!(!delete.matches("delete", 0));
+        let force_quit = KeyEquivalent {
+            cmd_char: Some("\u{238B}".into()),
+            virtual_key: Some(53),
+            modifiers: Some(2),
+        };
+        assert!(force_quit.matches("escape", 2));
+        assert!(!force_quit.matches("\u{238B}", 2));
+
+        // An item with no key equivalent at all matches nothing.
+        assert!(!KeyEquivalent::default().matches("f", 8));
     }
 
     #[test]

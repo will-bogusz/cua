@@ -571,7 +571,7 @@ fn modifier_flags(modifiers: &[&str]) -> CGEventFlags {
     flags
 }
 
-pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
+pub(crate) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
     let code = match key.to_lowercase().as_str() {
         "return" | "enter" => 36,
         "tab" => 48,

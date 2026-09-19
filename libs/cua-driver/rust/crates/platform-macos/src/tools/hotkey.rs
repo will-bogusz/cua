@@ -207,6 +207,235 @@ fn screen_sharing_modifier_delivery_error(
     )
 }
 
+/// The menu item a background chord at a not-key window is dispatched as:
+/// the key equivalent the chord names, while the application keeps it
+/// disabled. `None` keeps the chord on the post — the window is key, the
+/// item is enabled, the chord is bound to no item, or the window is not the
+/// pid's (the gate refuses that one with its own code).
+fn menu_command_for_not_key_window(
+    pid: i32,
+    window_id: u32,
+    key: &str,
+    modifiers: &[String],
+) -> Option<super::invoke_menu::KeyEquivalentItem> {
+    if !crate::windows::all_windows()
+        .iter()
+        .any(|window| window.pid == pid && window.window_id == window_id)
+        || super::invoke_menu::window_is_key(pid, window_id)
+    {
+        return None;
+    }
+    let modifiers: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+    super::invoke_menu::find_key_equivalent(pid, key, &modifiers)
+        .filter(|item| item.enabled == Some(false))
+}
+
+/// What the menu-command dispatch observed while the window was key.
+enum MenuCommandOutcome {
+    /// The application kept the item disabled with the window key and
+    /// frontmost: the menu cannot fix it, and neither can a delivery mode.
+    StillDisabled,
+    /// The item was pressed; the probe's verdict on the application's reaction.
+    Pressed(delivery_probe::ProbeOutcome),
+    /// The menu walk or the press itself was refused.
+    Refused(String),
+}
+
+/// What `with_window_key` did, read as the reply says it.
+fn activation_phrase(
+    pid: i32,
+    window_id: u32,
+    activation: super::invoke_menu::MenuActivation,
+) -> String {
+    let mut phrase = match (activation.fronted, activation.made_key) {
+        (true, _) => format!("pid {pid} was not the frontmost application, so it was fronted and window {window_id} made key for the dispatch"),
+        (false, true) => format!("window {window_id} was not pid {pid}'s key window, so it was made key for the dispatch"),
+        (false, false) => format!("window {window_id} was already key"),
+    };
+    match activation.restored {
+        Some(true) => phrase.push_str(", then the prior frontmost was restored"),
+        Some(false) => {
+            phrase.push_str(", and the prior frontmost could not be restored afterwards")
+        }
+        None => {}
+    }
+    phrase
+}
+
+/// Dispatch a chord as the menu item it is the key equivalent of, with the
+/// exact window made key, and report exactly what that did.
+async fn dispatch_as_menu_command(
+    pid: i32,
+    window_id: u32,
+    key_display: &str,
+    item: super::invoke_menu::KeyEquivalentItem,
+    args: &Value,
+) -> ToolResult {
+    let path = item.path;
+    let prior_front = apps::frontmost_pid();
+    let snapshot = WindowChangeDetector::snapshot(prior_front);
+    let dispatch_path = path.clone();
+    let dispatched = cua_driver_core::operation::spawn_blocking(move || {
+        let (result, activation) = super::invoke_menu::with_window_key(pid, window_id, || {
+            let probe = delivery_probe::DeliveryProbe::capture_after_activation(pid, window_id);
+            // The item's closed-menu `AXEnabled` is whatever the application
+            // last validated, which for a window that has just become key is
+            // the stale disabled value (measured on Notes: the read said
+            // disabled ~170 ms after the window was key while the item
+            // pressed fine). `invoke_path` opens each menu on the way, which
+            // makes AppKit validate the item, and reads it then.
+            //
+            // SAFETY: `invoke_path` creates and releases its own AX
+            // references for `pid`; nothing borrowed outlives the call.
+            match unsafe { super::invoke_menu::invoke_path(pid, &dispatch_path) } {
+                Ok(super::invoke_menu::MenuOutcome::Invoked) => {
+                    let (reaction, reacted) = probe.compare_keeping_sample();
+                    (
+                        MenuCommandOutcome::Pressed(reaction),
+                        Some((probe, reacted)),
+                    )
+                }
+                Ok(super::invoke_menu::MenuOutcome::Listed(_)) => (
+                    MenuCommandOutcome::Refused(
+                        "the item opens a submenu instead of running a command".into(),
+                    ),
+                    None,
+                ),
+                Err(refusal) if refusal.is_final_segment_disabled(dispatch_path.len()) => {
+                    (MenuCommandOutcome::StillDisabled, None)
+                }
+                Err(refusal) => (MenuCommandOutcome::Refused(refusal.message), None),
+            }
+        });
+        // The prior frontmost is back; ask whether what moved is still there.
+        let (outcome, persisted) = match result {
+            Ok((MenuCommandOutcome::Pressed(reaction), Some((probe, reacted)))) => {
+                let persisted = probe.reaction_persists(reaction.evidence, &reacted);
+                (Ok(MenuCommandOutcome::Pressed(reaction)), persisted)
+            }
+            Ok((outcome, _)) => (Ok(outcome), None),
+            Err(error) => (Err(error), None),
+        };
+        (outcome, activation, persisted)
+    })
+    .await;
+    let changes = super::finish_window_observation(snapshot, args).await;
+
+    let (outcome, activation, persisted) = match dispatched {
+        Ok(dispatched) => dispatched,
+        Err(error) => return ToolResult::error(format!("Task error: {error}")),
+    };
+    let menu_path = path.join(" > ");
+    let activation_phrase = activation_phrase(pid, window_id, activation);
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return ToolResult::error(format!(
+                "hotkey: {key_display} is the key equivalent of {menu_path}, which pid {pid} keeps \
+                 disabled until window {window_id} is key, and the window could not be made key: \
+                 {error}"
+            ))
+            .with_structured(serde_json::json!({
+                "code": "foreground_unavailable",
+                "effect": "not_dispatched",
+                "menu_path": path,
+            }));
+        }
+    };
+    match outcome {
+        MenuCommandOutcome::StillDisabled => ToolResult::error(format!(
+            "hotkey was not dispatched: {key_display} is the key equivalent of {menu_path}, and \
+             pid {pid} kept it disabled with window {window_id} key and frontmost ({activation_phrase}). \
+             The application disabled this command in the window's current state; neither \
+             delivery mode nor activation changes that. Satisfy its precondition or choose \
+             another command."
+        ))
+        .with_structured(serde_json::json!({
+            "code": "element_disabled",
+            "effect": "not_dispatched",
+            "route": "menu_command",
+            "action": "AXPress",
+            "role": "AXMenuItem",
+            "label": menu_path,
+            "menu_path": path,
+            "window_id": window_id,
+            "pid": pid,
+            "foreground": true,
+            "front_in_process": true,
+        })),
+        MenuCommandOutcome::Refused(reason) => ToolResult::error(format!(
+            "hotkey was not dispatched: {key_display} is the key equivalent of {menu_path}, which \
+             pid {pid} keeps disabled until window {window_id} is key; the item was made key \
+             ({activation_phrase}) but its menu command could not be pressed: {reason}"
+        ))
+        .with_structured(serde_json::json!({
+            "code": "menu_path_unavailable",
+            "effect": "not_dispatched",
+            "route": "menu_command",
+            "menu_path": path,
+        })),
+        MenuCommandOutcome::Pressed(reaction) => {
+            let mut msg = format!(
+                "Dispatched {key_display} to pid {pid} as its menu command {menu_path}: the \
+                 application keeps that item disabled until window {window_id} is key, so the \
+                 chord itself could not land there. {activation_phrase}.{}",
+                changes.result_suffix()
+            );
+            let mut structured = serde_json::json!({
+                "path": "menu_command",
+                "delivery_mode": "foreground",
+                "menu_path": path,
+                "verified": false,
+                "effect": "unverifiable",
+                "key_window": {
+                    "target_window_id": window_id,
+                    "made_key": activation.made_key,
+                    "app_fronted": activation.fronted,
+                    "restored": activation.restored,
+                },
+            });
+            let window_change = if changes.needs_restore() {
+                let appeared = changes.new_windows.clone();
+                cua_driver_core::operation::spawn_blocking(move || {
+                    delivery_probe::WindowChangeEvidence::observe(pid, Some(window_id), &appeared)
+                })
+                .await
+                .ok()
+            } else {
+                None
+            };
+            delivery_probe::apply_evidence(
+                &mut msg,
+                &mut structured,
+                reaction,
+                chord_noop_report(changes.polled),
+                window_change.as_ref(),
+            );
+            // A reaction seen while the window was key and gone once the
+            // prior frontmost was back is the one fact the model cannot
+            // read afterwards: the command ran, and its effect needs the
+            // window to stay key. Re-sending the chord on any rung lands
+            // nothing new; the control itself is still addressable.
+            if persisted == Some(false) {
+                structured["escalation"] = serde_json::json!({
+                    "target": "element",
+                    "reason": "route_unavailable",
+                });
+                msg.push_str(&format!(
+                    " ⚠️ That change ({}) did not survive restoring the prior frontmost: the \
+                     command's effect holds only while window {window_id} is key. Re-sending \
+                     the chord on any delivery mode lands nothing new — address the control \
+                     the command targets directly, or raise the window first and keep it key.",
+                    reaction.evidence.signal()
+                ));
+            } else if persisted == Some(true) {
+                msg.push_str(" That change is still in place after the restore.");
+            }
+            ToolResult::text(msg).with_structured(structured)
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for HotkeyTool {
     fn def(&self) -> &ToolDef {
@@ -335,6 +564,34 @@ impl Tool for HotkeyTool {
             window_id,
         ) {
             return error;
+        }
+
+        // ── Menu key equivalent of a window that is not key ──
+        // NSMenu validates a key equivalent against the front process's key
+        // window, and an application that keeps the item disabled until the
+        // target window is key drops a chord posted at that window on the
+        // floor: Notes' Edit > Find items, measured 0/12 on a not-key window
+        // and 6/6 once key. When the chord is such an item's key equivalent,
+        // dispatch the item itself the way invoke_menu does — make the exact
+        // window key, press it, wait for the application to answer, put the
+        // prior frontmost back — and say so: that is the app's own menu
+        // command with the app fronted, never a background delivery. A key
+        // window, an enabled item (the post lands) and a chord bound to no
+        // menu item stay on the chord post, as does anything that addresses
+        // an element or a pixel: those chords are for the focused field.
+        if !fg && element_index.is_none() && px.is_none() && py.is_none() {
+            if let Some(wid) = window_id {
+                let (key, modifiers) = (key.clone(), modifiers.clone());
+                let item = cua_driver_core::operation::spawn_blocking(move || {
+                    menu_command_for_not_key_window(pid, wid, &key, &modifiers)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(item) = item {
+                    return dispatch_as_menu_command(pid, wid, &key_display, item, &args).await;
+                }
+            }
         }
 
         // ── Exact-target background gate (macOS background input v1) ──
@@ -711,5 +968,96 @@ mod tests {
         assert_eq!(chord_path(true, false), "key_events_fg");
         assert_eq!(chord_path(false, false), "key_events");
         assert_eq!(chord_path(false, true), "key_events");
+    }
+
+    /// The reply names exactly the activation that happened. Fronting an
+    /// application is a user-visible focus change; making one of its own
+    /// windows key is not, and the two must not read the same. Measured on
+    /// Notes: the prior frontmost is restored in ~350 ms, so "restored" is a
+    /// separate fact with its own failure spelling.
+    #[test]
+    fn the_activation_phrase_says_what_moved() {
+        use super::super::invoke_menu::MenuActivation;
+        let fronted = activation_phrase(
+            13899,
+            19787,
+            MenuActivation {
+                fronted: true,
+                made_key: true,
+                restored: Some(true),
+            },
+        );
+        assert!(
+            fronted.contains("was not the frontmost application"),
+            "{fronted}"
+        );
+        assert!(
+            fronted.contains("prior frontmost was restored"),
+            "{fronted}"
+        );
+
+        let key_only = activation_phrase(
+            13899,
+            19787,
+            MenuActivation {
+                fronted: false,
+                made_key: true,
+                restored: Some(false),
+            },
+        );
+        assert!(!key_only.contains("frontmost application"), "{key_only}");
+        assert!(
+            key_only.contains("was not pid 13899's key window"),
+            "{key_only}"
+        );
+        assert!(key_only.contains("could not be restored"), "{key_only}");
+
+        let nothing = activation_phrase(
+            13899,
+            19787,
+            MenuActivation {
+                fronted: false,
+                made_key: false,
+                restored: None,
+            },
+        );
+        assert_eq!(nothing, "window 19787 was already key");
+    }
+
+    /// The menu route's legacy payload projects to the closed contract as the
+    /// menu-command route with foreground delivery and the path it pressed —
+    /// a model reading `route`/`delivery` must never take it for a background
+    /// chord.
+    #[test]
+    fn the_menu_route_projects_as_a_fronted_menu_command() {
+        let structured = serde_json::json!({
+            "path": "menu_command",
+            "delivery_mode": "foreground",
+            "menu_path": ["Edit", "Find", "Note List Search…"],
+            "verified": false,
+            "effect": "unverifiable",
+            "evidence": [{ "kind": "app_focus" }],
+            "escalation": { "target": "element", "reason": "route_unavailable" },
+        });
+        let record = cua_driver_core::action_record::ActionExecutionRecord::from_legacy(
+            "hotkey",
+            &serde_json::json!({ "delivery_mode": "background" }),
+            &structured,
+        )
+        .expect("menu route normalizes");
+        let public = serde_json::to_value(record.public_result().expect("projects")).unwrap();
+        assert_eq!(public["route"], "menu_command");
+        assert_eq!(public["delivery"]["mode"], "foreground");
+        assert_eq!(public["effect"], "unverifiable");
+        assert_eq!(
+            public["menu_path"],
+            serde_json::json!(["Edit", "Find", "Note List Search…"])
+        );
+        assert_eq!(
+            public["evidence"],
+            serde_json::json!([{ "kind": "observed_change", "signal": "app_focus" }])
+        );
+        assert_eq!(public["escalation"]["target"], "element");
+        assert_eq!(public["escalation"]["reason"], "route_unavailable");
     }
 }

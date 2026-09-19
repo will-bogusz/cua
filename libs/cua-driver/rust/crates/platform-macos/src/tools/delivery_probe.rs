@@ -72,6 +72,11 @@ const BLIND_SETTLE_BUDGET: Duration = Duration::from_millis(500);
 /// Gap between post-dispatch samples. Each sample already costs one or more
 /// native AX reads, so this only keeps a cheap sample set from spinning.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
+/// How many extra pre-dispatch captures a window the driver just activated
+/// gets before its digest is treated as self-updating, and the gap between
+/// them.
+const ACTIVATION_SETTLE_ATTEMPTS: usize = 3;
+const ACTIVATION_SETTLE_GAP: Duration = Duration::from_millis(100);
 
 /// What one read of the watched element answered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -134,6 +139,10 @@ pub const WINDOW_SIGNAL: &str = "window_change";
 /// it — an unpublished spelling is dropped from the action record, so the
 /// probe only ever names signals the contract knows.
 pub const ELEMENT_SIGNAL: &str = "element_state";
+/// The application's focused element moved.
+pub const FOCUS_SIGNAL: &str = "app_focus";
+/// The target window's capped subtree digest differed.
+pub const TREE_SIGNAL: &str = "window_tree";
 
 impl Evidence {
     pub fn signal(self) -> &'static str {
@@ -281,6 +290,28 @@ impl DeliveryProbe {
         }
     }
 
+    /// `capture` for a window this driver has just made key itself. The
+    /// activation moves focus and redraws the window over the next few
+    /// hundred milliseconds, so a first pair of samples that disagree is the
+    /// driver's own change still settling, not a self-updating window; the
+    /// digest is re-sampled a bounded number of times before the window is
+    /// written off as unquiescent. Measured on the AppKit harness: the
+    /// label a menu command sets was missed 2/3 when the capture followed
+    /// the activation immediately, and seen 3/3 once it was left to settle.
+    pub fn capture_after_activation(pid: i32, window_id: u32) -> Self {
+        let start = Instant::now();
+        let mut probe = Self::capture(pid, window_id, None);
+        for _ in 0..ACTIVATION_SETTLE_ATTEMPTS {
+            if probe.quiescent || cua_driver_core::operation::sleep(ACTIVATION_SETTLE_GAP).is_err()
+            {
+                break;
+            }
+            probe = Self::capture(pid, window_id, None);
+        }
+        probe.elapsed = start.elapsed();
+        probe
+    }
+
     /// Sample the target until something differs or the settle budget runs
     /// out. Blocking AX work — call from a blocking thread.
     ///
@@ -289,10 +320,35 @@ impl DeliveryProbe {
     /// reacts pays the whole budget.
     pub fn compare(self) -> ProbeOutcome {
         let budget = settle_budget(&self.before);
+        self.compare_within(budget).0
+    }
+
+    /// `compare`, keeping the post-dispatch sample the verdict was reached
+    /// on, for a caller that changes the desktop afterwards — a restore of
+    /// the prior frontmost — and has to say whether the reaction survived it
+    /// (`reaction_persists`).
+    pub fn compare_keeping_sample(&self) -> (ProbeOutcome, Signals) {
+        let budget = settle_budget(&self.before);
         self.compare_within(budget)
     }
 
-    fn compare_within(self, budget: Duration) -> ProbeOutcome {
+    /// Whether the reaction `evidence` named is still in place: the signal
+    /// that moved reads now as it did in `reacted`. `None` when the signal
+    /// cannot be re-read, or when the verdict was not a reaction.
+    pub fn reaction_persists(&self, evidence: Evidence, reacted: &Signals) -> Option<bool> {
+        let now = self.sample();
+        match evidence {
+            Evidence::Changed(FOCUS_SIGNAL) => Some(now.focus.as_ref()? == reacted.focus.as_ref()?),
+            Evidence::Changed(TREE_SIGNAL) => Some(now.tree? == reacted.tree?),
+            Evidence::Changed(ELEMENT_SIGNAL) => {
+                Some(now.element.state()? == reacted.element.state()?)
+            }
+            Evidence::ElementGone => Some(now.element == ElementRead::Gone),
+            _ => None,
+        }
+    }
+
+    fn compare_within(&self, budget: Duration) -> (ProbeOutcome, Signals) {
         let start = Instant::now();
         let deadline = start + budget;
         loop {
@@ -300,12 +356,12 @@ impl DeliveryProbe {
             let evidence = classify(&self.before, &after, self.quiescent);
             let expired = Instant::now() >= deadline;
             if evidence.is_reaction() || expired {
-                return self.outcome(evidence, start.elapsed());
+                return (self.outcome(evidence, start.elapsed()), after);
             }
             // A cancelled caller stops waiting on a target it no longer wants
             // and keeps the verdict observed so far.
             if cua_driver_core::operation::sleep(SETTLE_POLL).is_err() {
-                return self.outcome(evidence, start.elapsed());
+                return (self.outcome(evidence, start.elapsed()), after);
             }
         }
     }
@@ -371,14 +427,14 @@ pub fn classify(before: &Signals, after: &Signals, quiescent: bool) -> Evidence 
     if let (Some(b), Some(a)) = (before.focus.as_ref(), after.focus.as_ref()) {
         usable = true;
         if b != a {
-            return Evidence::Changed("app_focus");
+            return Evidence::Changed(FOCUS_SIGNAL);
         }
     }
     if quiescent {
         if let (Some(b), Some(a)) = (before.tree, after.tree) {
             usable = true;
             if b != a {
-                return Evidence::Changed("window_tree");
+                return Evidence::Changed(TREE_SIGNAL);
             }
         }
     }
