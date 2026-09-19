@@ -181,7 +181,10 @@ func imageObjectNames(namespace, digest string) (key, reference string) {
 
 func imageDigestChecksum(digest string) (string, error) {
 	raw, err := hex.DecodeString(strings.TrimPrefix(digest, "sha256:"))
-	if err != nil || len(raw) != sha256.Size {
+	if err != nil {
+		return "", fmt.Errorf("invalid sha256 digest: %w", err)
+	}
+	if len(raw) != sha256.Size {
 		return "", fmt.Errorf("invalid sha256 digest")
 	}
 	return base64.StdEncoding.EncodeToString(raw), nil
@@ -233,6 +236,24 @@ func (s *s3ImageObjectStore) Exists(ctx context.Context, key string, size int64,
 	checksum, err := imageDigestChecksum(digest)
 	if err != nil {
 		return false, err
+	}
+	objects, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(s.bucket),
+		Prefix:  aws.String(key),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return false, err
+	}
+	found := false
+	for _, candidate := range objects.Contents {
+		if aws.ToString(candidate.Key) == key {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, nil
 	}
 	object, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket:       aws.String(s.bucket),

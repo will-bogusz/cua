@@ -4,6 +4,10 @@ on:
   pull_request:
     paths:
       - ".github/scripts/**"
+      - "TESTING.md"
+      - "libs/cua-driver/rust/README.md"
+      - "libs/cua-driver/rust/**/Cargo.toml"
+      - "libs/cua-driver/rust/crates/*/tests/**"
       - ".github/release-attribution-config.json"
       - ".github/release-manifest.schema.json"
       - ".github/release-backfill/**"
@@ -42,6 +46,19 @@ on:
       - "scripts/ci/macos/**"
 
 jobs:
+  windows-uninstall:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test Windows release uninstall reporting
+        shell: powershell
+        run: '& ./libs/cua-driver/scripts/tests/uninstall-windows-regression.ps1'
+
   test:
     runs-on: ubuntu-latest
 

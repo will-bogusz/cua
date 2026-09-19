@@ -867,7 +867,7 @@ pub fn screenshot_display_bytes() -> anyhow::Result<Vec<u8>> {
     let capture = SecureCapturePath::new("display.png")?;
     let tmp_path = capture.file.to_string_lossy().into_owned();
 
-    let output = Command::new("screencapture")
+    let output = Command::new("/usr/sbin/screencapture")
         .args(["-x", "-m", &tmp_path])
         .output()?;
 

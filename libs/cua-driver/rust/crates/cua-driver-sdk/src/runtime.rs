@@ -684,7 +684,7 @@ fn cleanup_runtime_resources(registry: &ToolRegistry, runtime_scope: &str) -> Re
     registry.drain_runtime_resources()?;
     cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
     cua_driver_core::session::forget_suspended_runtime_scope(runtime_scope);
-    cua_driver_core::element_token::global().clear_runtime_scope(runtime_scope);
+    cua_driver_core::element_cache::retire_runtime_scope(runtime_scope);
     let _ = registry.recording.stop_owner(None);
     Ok(())
 }

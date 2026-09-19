@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+* **cua-driver:** deliver X11 key-down before the tap delay and finish background keyboard delivery before closing the input connection.
+
+## [0.28.2](https://github.com/trycua/cua/compare/cua-driver-rs-v0.28.1...cua-driver-rs-v0.28.2) (2026-09-15)
+
+
+### Bug Fixes
+
+* **cua-driver:** capture macOS desktops without relying on PATH ([#3755](https://github.com/trycua/cua/issues/3755)) ([f67be12](https://github.com/trycua/cua/commit/f67be123e198f322ba22ead5aff54f2ed119b366))
+* **cua-driver:** preserve semantic Hyprland AX scrolling ([#3820](https://github.com/trycua/cua/issues/3820)) ([72b8707](https://github.com/trycua/cua/commit/72b8707cfbdfa3cec5b3f563acdd62ac42aee266)), closes [#3819](https://github.com/trycua/cua/issues/3819)
+* **cua-driver:** route background text through Hyprland input ([#3877](https://github.com/trycua/cua/issues/3877)) ([42d764b](https://github.com/trycua/cua/commit/42d764bb19e9873b581d7147453942484dc4839b))
+* **cua-driver:** unify desktop snapshot identity and payload ownership ([#3616](https://github.com/trycua/cua/issues/3616)) ([a8a7b1e](https://github.com/trycua/cua/commit/a8a7b1e5e53fe8284de04dcac4f04c14b53fd0a1))
+
+## [0.28.1](https://github.com/trycua/cua/compare/cua-driver-rs-v0.28.0...cua-driver-rs-v0.28.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* **cua-driver:** exclude cursor overlay from foreground verification ([#3704](https://github.com/trycua/cua/issues/3704)) ([44c9d1f](https://github.com/trycua/cua/commit/44c9d1f6d5c9c41c04ab833f022a26d7a97b5ad0))
+* **cua-driver:** link skills for fresh Codex and Claude installs ([#3742](https://github.com/trycua/cua/issues/3742)) ([95a361c](https://github.com/trycua/cua/commit/95a361cef318658a94280db7448b03d1933d2987))
+* **cua-driver:** preserve X11 keyboard delivery and timing ([#3761](https://github.com/trycua/cua/issues/3761)) ([ce99b96](https://github.com/trycua/cua/commit/ce99b969f2af23c313f9e38aed980779debfe848))
+* **cua-driver:** report encoder exit and shutdown timeout errors ([#3714](https://github.com/trycua/cua/issues/3714)) ([eca08d3](https://github.com/trycua/cua/commit/eca08d3144c663edba6cdd395bf9957b2b5a5209))
+* **cua-driver:** restore embedded-host builds on macOS and Linux ([#3687](https://github.com/trycua/cua/issues/3687)) ([2dbc1c2](https://github.com/trycua/cua/commit/2dbc1c2cfbee5d25c9cea2dc37db80b98d4f9b00))
+
 ## [0.28.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.27.0...cua-driver-rs-v0.28.0) (2026-09-11)
 
 

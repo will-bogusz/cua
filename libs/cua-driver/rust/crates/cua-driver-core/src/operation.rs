@@ -109,6 +109,12 @@ pub async fn scope<T>(operation: Arc<Cancellation>, future: impl Future<Output =
 pub fn check() -> Result<(), Cancelled> {
     current().map_or(Ok(()), |operation| operation.check())
 }
+/// Whether the current operation's caller asked for cancellation, as opposed
+/// to runtime shutdown interrupting it. Work whose only consumer has vanished
+/// can stop publishing; work interrupted by shutdown still answers its caller.
+pub fn cancelled_by_caller() -> bool {
+    current().is_some_and(|operation| operation.is_cancelled_by_caller())
+}
 /// Interrupt a pacing delay. Call only between complete input pairs, or while
 /// an enclosing guard guarantees release on every early return.
 pub fn sleep(duration: Duration) -> Result<(), Cancelled> {
