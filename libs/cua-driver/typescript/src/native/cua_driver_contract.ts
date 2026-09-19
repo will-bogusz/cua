@@ -500,13 +500,21 @@ const FfiConverterTypeActionEffect = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * The class of route the driver used. `MenuCommand` is the application's own
+ * menu command: a chord that is the key equivalent of a menu item the
+ * application keeps disabled until the target window is key is dispatched
+ * as that item, which needs the window made key first, so it is never a
+ * background delivery.
+ */
 export enum ActionRoute {
     Accessibility,
     SyntheticEvents,
     GlobalInput,
     SystemApi,
     Dom,
-    TrustedInput
+    TrustedInput,
+    MenuCommand
 }
 
 const FfiConverterTypeActionRoute = (() => {
@@ -521,6 +529,7 @@ const FfiConverterTypeActionRoute = (() => {
                 case 4: return ActionRoute.SystemApi;
                 case 5: return ActionRoute.Dom;
                 case 6: return ActionRoute.TrustedInput;
+                case 7: return ActionRoute.MenuCommand;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -532,6 +541,7 @@ const FfiConverterTypeActionRoute = (() => {
                 case ActionRoute.SystemApi: return ordinalConverter.write(4, into);
                 case ActionRoute.Dom: return ordinalConverter.write(5, into);
                 case ActionRoute.TrustedInput: return ordinalConverter.write(6, into);
+                case ActionRoute.MenuCommand: return ordinalConverter.write(7, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -600,7 +610,12 @@ export type ActionResult = {
      * application's own end-of-edit. Absent when the action has no commit
      * step.
      */
-    committed?: ActionCommit
+    committed?: ActionCommit,
+    /**
+     * `menu_command` routes only: the application's own menu titles the
+     * driver dispatched, top level first. Absent on every other route.
+     */
+    menuPath?: Array<string>
 }
 
 /**
@@ -629,7 +644,8 @@ const FfiConverterTypeActionResult = (() => {
                 delivery: FfiConverterOptionalTypeActionDelivery.read(from),
                 evidence: FfiConverterOptionalSequenceTypeActionEvidence.read(from),
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from),
-                committed: FfiConverterOptionalTypeActionCommit.read(from)
+                committed: FfiConverterOptionalTypeActionCommit.read(from),
+                menuPath: FfiConverterOptionalSequenceString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -639,6 +655,7 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, into);
             FfiConverterOptionalTypeActionEscalation.write(value.escalation, into);
             FfiConverterOptionalTypeActionCommit.write(value.committed, into);
+            FfiConverterOptionalSequenceString.write(value.menuPath, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
@@ -646,7 +663,8 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalTypeActionDelivery.allocationSize(value.delivery) +
              FfiConverterOptionalSequenceTypeActionEvidence.allocationSize(value.evidence) +
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation) +
-             FfiConverterOptionalTypeActionCommit.allocationSize(value.committed);
+             FfiConverterOptionalTypeActionCommit.allocationSize(value.committed) +
+             FfiConverterOptionalSequenceString.allocationSize(value.menuPath);
 
         }
     };
@@ -5039,14 +5057,17 @@ const FfiConverterOptionalTypeActionEscalation = new FfiConverterOptional(FfiCon
 // FfiConverter for ActionCommit | undefined
 const FfiConverterOptionalTypeActionCommit = new FfiConverterOptional(FfiConverterTypeActionCommit);
 
+// FfiConverter for Array<string>
+const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
+
+// FfiConverter for Array<string> | undefined
+const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
+
 // FfiConverter for number | undefined
 const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
 
 // FfiConverter for ClickButton | undefined
 const FfiConverterOptionalTypeClickButton = new FfiConverterOptional(FfiConverterTypeClickButton);
-
-// FfiConverter for Array<string>
-const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 
 // FfiConverter for ActionTarget | undefined
 const FfiConverterOptionalTypeActionTarget = new FfiConverterOptional(FfiConverterTypeActionTarget);
@@ -5056,9 +5077,6 @@ const FfiConverterOptionalTypeDesktopScope = new FfiConverterOptional(FfiConvert
 
 // FfiConverter for bigint | undefined
 const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
-
-// FfiConverter for Array<string> | undefined
-const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
 
 // FfiConverter for CursorPointOutput | undefined
 const FfiConverterOptionalTypeCursorPointOutput = new FfiConverterOptional(FfiConverterTypeCursorPointOutput);

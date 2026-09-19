@@ -1529,6 +1529,13 @@ class _UniffiFfiConverterTypeActionEffect(_UniffiConverterRustBuffer):
 
 
 class ActionRoute(enum.Enum):
+    """
+    The class of route the driver used. `MenuCommand` is the application's own
+    menu command: a chord that is the key equivalent of a menu item the
+    application keeps disabled until the target window is key is dispatched
+    as that item, which needs the window made key first, so it is never a
+    background delivery.
+"""
 
     ACCESSIBILITY = 0
 
@@ -1541,6 +1548,8 @@ class ActionRoute(enum.Enum):
     DOM = 4
 
     TRUSTED_INPUT = 5
+
+    MENU_COMMAND = 6
 
 
 
@@ -1560,6 +1569,8 @@ class _UniffiFfiConverterTypeActionRoute(_UniffiConverterRustBuffer):
             return ActionRoute.DOM
         if variant == 6:
             return ActionRoute.TRUSTED_INPUT
+        if variant == 7:
+            return ActionRoute.MENU_COMMAND
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -1575,6 +1586,8 @@ class _UniffiFfiConverterTypeActionRoute(_UniffiConverterRustBuffer):
         if value == ActionRoute.DOM:
             return
         if value == ActionRoute.TRUSTED_INPUT:
+            return
+        if value == ActionRoute.MENU_COMMAND:
             return
         raise ValueError(value)
 
@@ -1592,6 +1605,8 @@ class _UniffiFfiConverterTypeActionRoute(_UniffiConverterRustBuffer):
             buf.write_i32(5)
         if value == ActionRoute.TRUSTED_INPUT:
             buf.write_i32(6)
+        if value == ActionRoute.MENU_COMMAND:
+            buf.write_i32(7)
 
 
 
@@ -1782,21 +1797,70 @@ class _UniffiFfiConverterOptionalTypeActionCommit(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterString.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterString.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterString.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalSequenceString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterSequenceString.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterSequenceString.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterSequenceString.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class ActionResult:
-    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], committed:typing.Optional[ActionCommit]):
+    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], committed:typing.Optional[ActionCommit], menu_path:typing.Optional[typing.List[str]]):
         self.effect = effect
         self.route = route
         self.delivery = delivery
         self.evidence = evidence
         self.escalation = escalation
         self.committed = committed
+        self.menu_path = menu_path
 
 
 
 
     def __str__(self):
-        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, committed={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.committed)
+        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, committed={}, menu_path={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.committed, self.menu_path)
     def __eq__(self, other):
         if self.effect != other.effect:
             return False
@@ -1810,6 +1874,8 @@ class ActionResult:
             return False
         if self.committed != other.committed:
             return False
+        if self.menu_path != other.menu_path:
+            return False
         return True
 
 class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
@@ -1822,6 +1888,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
             evidence=_UniffiFfiConverterOptionalSequenceTypeActionEvidence.read(buf),
             escalation=_UniffiFfiConverterOptionalTypeActionEscalation.read(buf),
             committed=_UniffiFfiConverterOptionalTypeActionCommit.read(buf),
+            menu_path=_UniffiFfiConverterOptionalSequenceString.read(buf),
         )
 
     @staticmethod
@@ -1832,6 +1899,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalSequenceTypeActionEvidence.check_lower(value.evidence)
         _UniffiFfiConverterOptionalTypeActionEscalation.check_lower(value.escalation)
         _UniffiFfiConverterOptionalTypeActionCommit.check_lower(value.committed)
+        _UniffiFfiConverterOptionalSequenceString.check_lower(value.menu_path)
 
     @staticmethod
     def write(value, buf):
@@ -1841,6 +1909,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, buf)
         _UniffiFfiConverterOptionalTypeActionEscalation.write(value.escalation, buf)
         _UniffiFfiConverterOptionalTypeActionCommit.write(value.committed, buf)
+        _UniffiFfiConverterOptionalSequenceString.write(value.menu_path, buf)
 
 @dataclass
 class AppInfo:
@@ -2471,29 +2540,6 @@ class _UniffiFfiConverterTypeClipboardReadInput(_UniffiConverterRustBuffer):
     def write(value, buf):
         _UniffiFfiConverterBoolean.write(value.include_text, buf)
         _UniffiFfiConverterOptionalString.write(value.session, buf)
-
-class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        for item in value:
-            _UniffiFfiConverterString.check_lower(item)
-
-    @classmethod
-    def write(cls, value, buf):
-        items = len(value)
-        buf.write_i32(items)
-        for item in value:
-            _UniffiFfiConverterString.write(item, buf)
-
-    @classmethod
-    def read(cls, buf):
-        count = buf.read_i32()
-        if count < 0:
-            raise InternalError("Unexpected negative sequence length")
-
-        return [
-            _UniffiFfiConverterString.read(buf) for i in range(count)
-        ]
 
 @dataclass
 class ClipboardReadOutput:
@@ -3187,31 +3233,6 @@ class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
             return None
         elif flag == 1:
             return _UniffiFfiConverterUInt64.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-class _UniffiFfiConverterOptionalSequenceString(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterSequenceString.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterSequenceString.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterSequenceString.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
 

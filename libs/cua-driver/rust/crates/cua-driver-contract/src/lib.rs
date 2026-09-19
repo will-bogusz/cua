@@ -64,7 +64,7 @@ pub const TOOLS_LIST_SCHEMA_VERSION: &str = "1";
 pub const CAPABILITY_VERSION: &str = "1";
 
 /// Shape version for the checked-in generated client contract.
-pub const CONTRACT_VERSION: &str = "0.9.0";
+pub const CONTRACT_VERSION: &str = "0.10.0";
 
 /// Legacy version negotiated by `initialize.params.protocolVersion` and served
 /// by the loopback HTTP compatibility endpoint. Modern stdio discovery and
