@@ -205,3 +205,117 @@ superseded any row above (0 hits on origin/main for the stack's identifiers).
 | `refactor(macos): build the click and set_value action records directly` (ebcbb451a) | RFC 3473 direction: producers state `ActionExecutionRecord`; `from_legacy` loses branches per migrated family. The AX click path (`ax_click_record`, probe verdict as `ProbeReport`) and `set_value` (`action_record`, builder gains `committed`) now state their contract; the `delivery_mode: "unknown"` legacy branch and its test are deleted. Still on the legacy payload and its vocabulary: `type_text` (`committed`, `escalation.target`; #3897 rewrites it), `hotkey` (`target: element`, `key_events_hid_fg`, `menu_command`, `menu_path`), `drag`/`hotkey` (observed-change rows). Wire unchanged for every legacy input. | with the contract RFC's "slice 2" (W5-8's from_legacy half is now partly gone) |
 | `fix(contract): keep 0.10 additive over 0.8 — window_change stays the kind, typed inputs gain constructors` (b76016c77) | Reverts W5-2's rename (`ActionEvidenceKind::ObservedChange` → `WindowChange` again, `signal` kept; manifest delta is exactly the nine spellings, schema keeps 0.8's `enum` shape) and answers W5-11/W5-28's struct-literal break: `ClickInput`/`DragInput`/`ScrollInput`/`TypeTextInput`/`PressKeyInput`/`HotkeyInput::new(required…)` leave the optional fields unset and `detect_window_change` carries `#[uniffi(default = None)]`, so the generated Python constructors no longer require it. `CONTRACT_VERSION` stays 0.10.0; manifest, both UniFFI binding sets regenerated; C ABI header unchanged. OMP reads `kind === "window_change"` again and re-vendors the manifest fixture. | the contract RFC (W5-2/W5-3/W5-4/W5-8) now describes a purely additive 0.10 |
 | `chore(cua-driver): add the OMP harness recipe as scripts/omp/harness.sh` + `test(cua-driver): register fork AppKit harness cases in the canonical macOS E2E allowlist` | Every Mac lane re-derived the same recipe: no cua-driver app identity here holds Screen Recording, so a `serve` daemon reports every window title as `""` and the AppKit harness dies at `find_window`; the installed `~/.omp/natives/cua-driver` binary in `mcp --direct` mode as a child of the granted terminal does see titles. `scripts/omp/harness.sh` (preflight / fixture / build / install / run / evidence / restore / allowlist-check, `--dry-run` on every mutating step) ships `direct-shim.sh` (rewrites `mcp --socket` to `mcp --direct`), a listening-only Unix socket for the testkit's reachability probe, rm-then-copy installs signed `OMP Computer Use`, `evidence.jsonl` → the exact-head markdown table. `allowlist-check` found 11 fork `harness_appkit_*` cases missing from `run-rust-e2e.sh`; they are registered now. | fork-only tooling; the allowlist wiring travels with each PR that adds its cell (maintainer expectation: same commit) |
+
+## Maintainer expects (2026-09-20)
+
+What each row still owes a maintainer, or `-` when nothing is pending, so a new session can pick any PR up from here without re-reading its thread. Dates are trycua/cua review or comment dates; "RFC" is the ActionResult vocabulary RFC (drafted, number assigned at filing). PR-level actions (fold, hold, close, slot order) are in the OMP skill reference `cua-upstream/references/consolidation-20260920.md`.
+### will/omp
+
+| Row | Maintainer expects |
+|---|---|
+| P1 | #3797 (f-trycua 09-13): uuid vs native_id vs primary rule, key-pinning contract test; answered 09-14 |
+| P2 | RFC #3796 (f-trycua 09-13): cooperative stop separate from abandonment; slice 1 core + transports |
+| P3 | #3796: drop cancel_operation from slice 1; notifications/cancelled and C ABI cancel only |
+| P4 | #3795: maintainer Lume rerun of the document-state row at ba23b4419 (asked 09-13T13:25) |
+| P5 | #3793: re-review at 0b26b62cf; two-window fixture if the reviewer wants the refusal native |
+| P6 | #3373 first; then a direct ActionExecutionRecord, no from_legacy branch (RFC 3473) |
+| P7 | #2874: the single-transport regression the maintainer asked for; no PR thread yet |
+| P8 | #3796: platform loops in a later slice with limitations stated |
+| P17 | RFC 3931 (#3934): validated capture geometry is a capture_id prerequisite; file after #3942 |
+| P18 | #3787 unreviewed; rebase drops the cache.rs helper hunk (a8a7b1e5e); dedupe launch half with #3456 |
+| P9 | #3796: bounded start after slice 1; Linux/Windows never advertised as full cancellation |
+| P16 | - |
+| P10 | as P4 |
+| P11 | as P5 |
+| P12 | #3781: re-review at b26880250; seam, z-order removal and native proof answered 09-13 |
+| P13 | #3783 approved at a0dc87e15 (09-13T15:27); merge pending; nothing owed |
+| P14 | #3785 approved at 42052d0e9 (09-13T15:00); merge pending; W5-16 follows after merge |
+| P15 | as P6 |
+| L1 | #3791 (f-trycua 09-13): ladder must match the tools; after #3864 advertise its two refusals |
+| L2 | - |
+| L3 | RFC 3931 calls screenshot_frame_valid non-portable; folded into #3814, expect pushback |
+
+### Bench fixes B1-B9
+
+| Row | Maintainer expects |
+|---|---|
+| B1 | - (closing #3816 into #3858) |
+| B2 | - |
+| B3 | - (folds into #3946) |
+| B4 | #3811 (injaneity 09-16): coordinate type_text.rs with #3897; hold until it lands |
+| B5 | - (folds into #3922) |
+| B6 | - (`description` blocked by manifest generator, #3802; folds into #3787) |
+| B7 | - (folds into #3787) |
+| B8 | - (#3864 conflict: test nodes need identity: None) |
+| B9 | #3836 (injaneity 09-15): re-review at c2e6298df, rebased dea964ccb; P2 fallback fix answered 07:03 |
+
+### Wave 4 B10-B31
+
+| Row | Maintainer expects |
+|---|---|
+| B10 | hold: #3897 returns TypedProgress; re-express with #3811 |
+| B11 | as P6 |
+| B12 | - (retitle fix(cua-driver): before the next push) |
+| B13 | - (chord PR after T11) |
+| B14 | - (folds into #3922) |
+| B15 | CONTRIBUTING: public ActionResult change needs the RFC first; closing #3857 into #3858 |
+| B16 | RFC before the committed verdict lands; the macOS typed write path can go first |
+| B17 | as B9 |
+| B18 | - (with P16) |
+| B19 | - (folds into #3787) |
+| B20 | as P6 |
+| B21 | - |
+| B22 | hold: #3897 replaces the classifier; re-express with #3811 |
+| B23 | RFC: element_disabled code and escalation are vocabulary; stacked on #3910 |
+| B24 | as P6 |
+| B25 | - (folds into #3950) |
+| B26 | - |
+| B27 | detect_window_change is an input contract change: Refs the RFC; #3373 adjacent |
+| B28 | - (folds into #3946) |
+| B29 | - (stacked on #3781) |
+| B30 | as P6 |
+| B31 | - |
+
+### Wave 5
+
+| Row | Maintainer expects |
+|---|---|
+| W5-1 | #3897: re-express on focused_element_in_window plus a retained target |
+| W5-2 | RFC first (public contract); additive `signal`, kind name kept (done at b76016c77) |
+| W5-3 | RFC first; upstream spells `escalation.recommended` (#3888), reader accepts both |
+| W5-4 | RFC (docs half) |
+| W5-5 | - |
+| W5-6 | #3897 wording "observe the target before retrying"; file with the re-expression |
+| W5-7 | - |
+| W5-8 | RFC for the projection; no new from_legacy branches (RFC 3473) |
+| W5-9 | - (with #3950) |
+| W5-10 | #3897: before == after is Unchanged; do not file Normalized |
+| W5-11 | - (fork-only) |
+| W5-12 | do not file: #3897 makes trusted partials retryable:false |
+| W5-13 | RFC for element_disabled and escalation; mirror #3888's Windows shape |
+| W5-14 | with #3858 (RFC-gated) |
+| W5-15 | - (chord PR after T11) |
+| W5-16 | after #3785 merges (approved 09-13) |
+| W5-17 | - (T11 replaces the mechanism) |
+| W5-18 | - (chord PR) |
+| W5-19 | RFC: element_no_longer_exists and escalation.target are vocabulary |
+| W5-20 | - (chord PR) |
+| W5-21 | ProvenAppMenu arm goes into #3793's next push (focused-window guard asked 09-13) |
+| W5-22 | new native cases wired into the canonical allowlist in the same commit |
+| W5-23 | - (chord PR) |
+| W5-24 | re-expressed on #3616's RetainedElement (cd0861727); file as the crash fix, first free slot |
+| W5-25 | - (with W5-13) |
+| W5-26 | - (with W5-13) |
+| W5-27 | - (with W5-13) |
+| W5-28 | - (fork-only) |
+
+### Sync and wave 6
+
+| Row | Maintainer expects |
+|---|---|
+| Sync c5550997b | - |
+| W6 menu-command dispatch | - (chord PR after T11; #3855 kept as its prerequisite) |
+| W6 RetainedElement refactor | - (RFC 3473 slice 1 shape; nothing owed) |
+| W6 direct click/set_value records | aligned with RFC 3473 slice 2; from_legacy branches shrink per family |
+| W6 contract 0.10 additive | RFC before the vocabulary lands; additive over 0.8 is what RFC 3473 asks |
+| W6 harness recipe + allowlist | exact-head evidence through the installed daemon; native cases in run-rust-e2e.sh |
