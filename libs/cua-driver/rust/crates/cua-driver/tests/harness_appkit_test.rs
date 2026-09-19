@@ -1668,6 +1668,148 @@ fn harness_appkit_menu_key_equivalent_through_hotkey() {
     );
 }
 
+/// The not-key arm, on a live seam: a second window of the same app is key at
+/// launch, so `Window > Arrange > Left` validates false for the harness window
+/// exactly the way Notes' Edit > Find items do until their window is key
+/// (measured: a background chord there landed 0/12). The chord at the not-key
+/// window is dispatched as that menu item — window made key, item pressed,
+/// prior key window put back — and the reply says so: `route=menu_command`
+/// with foreground delivery and the path, never a background chord, and no
+/// foreground rung to escalate to. A same-pid sibling window would have made
+/// the chord post itself refuse (`same_pid_keyboard_ambiguity`); the menu
+/// command is window-exact, so it is not gated by that.
+#[test]
+#[ignore]
+fn harness_appkit_disabled_until_key_chord_lands_as_its_menu_command() {
+    run_case_with_env(
+        native_foreground_case(
+            "appkit",
+            "hotkey_menu_command_not_key",
+            Targeting::Ax,
+            DriverRoute::MacosAxAction,
+        ),
+        &[("CUA_APPKIT_SECOND_KEY_WINDOW", "1")],
+        |pid, wid, driver| {
+            let (second, _) = driver
+                .find_window(pid as i64, "Second Key Window")
+                .expect("second key window not found");
+            assert_ne!(second, wid);
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("menu_action=none"),
+                "fixture did not start with an unfired menu action:\n{}",
+                before.tree_text()
+            );
+            let listed = driver.call(
+                "invoke_menu",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": second,
+                    "path": ["Window", "Arrange"]
+                }),
+            );
+            assert!(
+                listed.structured()["items"]
+                    .as_array()
+                    .is_some_and(|items| items
+                        .iter()
+                        .any(|item| item["title"] == "Left" && item["enabled"] == false)),
+                "the fixture item must read disabled while the second window is key: {}",
+                listed.raw
+            );
+
+            let reply = driver.call(
+                "hotkey",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "keys": ["cmd", "option", "l"]
+                }),
+            );
+            assert!(!reply.is_error(), "menu route failed: {}", reply.text());
+            let structured = reply.structured();
+            assert_eq!(
+                structured["route"],
+                serde_json::json!("menu_command"),
+                "a chord dispatched as its menu command must say so: {}",
+                reply.raw
+            );
+            assert_eq!(
+                structured["delivery"]["mode"],
+                serde_json::json!("foreground"),
+                "the window was made key for the dispatch; that is never background: {}",
+                reply.raw
+            );
+            assert_eq!(
+                structured["menu_path"],
+                serde_json::json!(["Window", "Arrange", "Left"]),
+                "{}",
+                reply.raw
+            );
+            assert_ne!(
+                reply.action_effect(),
+                Some("suspected_noop"),
+                "the menu command fired and moved the label: {}",
+                reply.raw
+            );
+            assert_eq!(
+                structured["escalation"],
+                serde_json::Value::Null,
+                "a menu command that landed and held has no rung to escalate to: {}",
+                reply.raw
+            );
+            assert!(
+                reply.text().contains("Window > Arrange > Left"),
+                "the reply names the path it took: {}",
+                reply.text()
+            );
+            assert!(
+                reply.text().contains("was not pid")
+                    && reply.text().contains("key window")
+                    && reply.text().contains("prior frontmost was restored"),
+                "the reply says the window was made key and the prior key window put back: {}",
+                reply.text()
+            );
+            assert!(
+                !reply.text().contains("not the frontmost application"),
+                "the app was already frontmost; the reply must not claim it was fronted: {}",
+                reply.text()
+            );
+            let after = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                after.contains("menu_action=window_arrange_left#1"),
+                "the menu command never reached the item:\n{after}"
+            );
+            let roster = driver.call(
+                "list_windows",
+                serde_json::json!({ "pid": pid as i64, "include_accessibility_metadata": true }),
+            );
+            let main_of = |window_id: u64| {
+                roster.structured()["accessibility_windows"]["windows"]
+                    .as_array()
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|row| row["window_id"].as_u64() == Some(window_id))
+                    })
+                    .map(|row| row["main"].clone())
+            };
+            assert_eq!(
+                main_of(second),
+                Some(serde_json::json!(true)),
+                "the second window must be the app's main window again after the dispatch: {}",
+                roster.raw
+            );
+            assert_eq!(
+                main_of(wid),
+                Some(serde_json::json!(false)),
+                "the harness window must have given key back: {}",
+                roster.raw
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
 /// A field whose `AXValue` catches up with the write over the next second is
 /// not a partially typed field. The AX rung used to read the value back once,
 /// microseconds after the write returned, and published the prefix it caught

@@ -57,6 +57,8 @@ let kMenuItemTitle = "Harness Test Item"
 let kSecondaryWindowTitle = "CuaTestHarness AppKit Secondary"
 let kSheetWindowTitle = "CuaTestHarness AppKit Sheet"
 let kFloatingWindowTitle = "CuaTestHarness AppKit Floating"
+/// Not a `kWindowTitle` substring: the harness finds its main window by that.
+let kSecondKeyWindowTitle = "CuaTestHarness Second Key Window"
 
 // MARK: - Controls
 
@@ -876,9 +878,26 @@ struct CuaAppKitHarness {
         if let mode = ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] {
             matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: mode)
         }
+        // A second ordinary window that takes key at launch, so the harness
+        // window is on screen and frontmost-owned but not key: its
+        // `Window > Arrange > Left` key equivalent then validates false
+        // exactly the way Notes' Edit > Find items do until the window is key.
+        var secondKeyWindow: NSWindow?
+        if ProcessInfo.processInfo.environment["CUA_APPKIT_SECOND_KEY_WINDOW"] == "1" {
+            let candidate = NSWindow(
+                contentRect: NSRect(x: 60, y: 60, width: 420, height: 240),
+                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            candidate.title = kSecondKeyWindowTitle
+            candidate.isReleasedWhenClosed = false
+            candidate.isRestorable = false
+            candidate.contentView = NSTextField(labelWithString: "second key window")
+            candidate.makeKeyAndOrderFront(nil)
+            secondKeyWindow = candidate
+        }
         app.activate(ignoringOtherApps: true)
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
         app.run()
         _ = matrixWindows
+        _ = secondKeyWindow
     }
 }
