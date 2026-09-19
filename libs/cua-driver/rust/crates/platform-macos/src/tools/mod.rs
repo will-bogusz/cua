@@ -282,9 +282,10 @@ pub(crate) struct ProcessFrontOrder {
     pub in_front: Option<ObscuringWindow>,
 }
 
-/// Resolve [`ProcessFrontOrder`] from one `visible_windows()` enumeration.
+/// Resolve [`ProcessFrontOrder`] from the window roster `list_windows`
+/// classifies: every layer-0 row, off-screen ones included.
 pub(crate) fn process_front_order(pid: i32, window_id: u32) -> ProcessFrontOrder {
-    let windows = crate::windows::visible_windows();
+    let windows = crate::windows::all_windows();
     let mut order = resolve_process_front_order(
         &windows,
         pid,
@@ -299,6 +300,12 @@ pub(crate) fn process_front_order(pid: i32, window_id: u32) -> ProcessFrontOrder
 
 /// Which of the process's own windows is drawn in front, over one captured
 /// enumeration and without consulting the accessibility tree.
+///
+/// `windows` is the whole roster, off-screen rows included, because that is
+/// what the classification rule needs: the capture-lease indicator is named by
+/// the provider view it encloses, and that view is enumerated off-screen while
+/// the indicator hosting it is on-screen. Only on-screen rows are candidates
+/// for the window in front.
 ///
 /// A row the window roster classifies `system_overlay` is excluded: the
 /// capture-lease indicator carries the captured application's pid on layer 0,
@@ -345,15 +352,17 @@ fn resolve_process_front_order(
     }
 }
 
-/// Whether a row may be attributed to the process that owns it. The driver's
-/// own cursor overlay and the rows the window roster classifies
-/// `system_overlay` are drawn over an application's windows without being one
-/// of them, so neither can be the panel a reply names as in front.
+/// Whether a row may be attributed to the process that owns it as a window it
+/// drew in front. Off-screen rows are enumerated only so the roster can
+/// classify the on-screen ones; the driver's own cursor overlay and the rows
+/// the window roster classifies `system_overlay` are drawn over an
+/// application's windows without being one of them.
 pub(crate) fn is_process_owned_window(
     window: &crate::windows::WindowInfo,
     system_overlays: &[u32],
 ) -> bool {
-    !system_overlays.contains(&window.window_id)
+    window.is_on_screen
+        && !system_overlays.contains(&window.window_id)
         && !crate::cursor::overlay::is_overlay_window(window.window_id)
 }
 
@@ -364,6 +373,8 @@ mod process_front_order_tests {
 
     const NOTES_PID: i32 = 84264;
     const PROVIDER_PID: i32 = 22402;
+    const LEASED_NOTES_PID: i32 = 21552;
+    const LEASE_PROVIDER_PID: i32 = 21772;
 
     fn window(
         window_id: u32,
@@ -441,6 +452,53 @@ mod process_front_order_tests {
         let in_front = order.in_front.expect("the app's own panel");
         assert_eq!(in_front.window_id, 19091);
         assert_eq!(in_front.title, "Print");
+    }
+
+    /// The enumeration measured under a live capture lease (pid 21552): the
+    /// 66x20 indicator is on-screen, and the provider view whose enclosure
+    /// names it is enumerated off-screen, as is one more window of Notes.
+    fn notes_under_a_capture_lease() -> Vec<WindowInfo> {
+        let mut document = window(19177, 3, "All iCloud", (100.0, 100.0, 1363.0, 850.0));
+        document.pid = LEASED_NOTES_PID;
+        let mut off_screen = window(19178, 2, "", (0.0, 617.0, 500.0, 500.0));
+        off_screen.pid = LEASED_NOTES_PID;
+        off_screen.is_on_screen = false;
+        let mut indicator = window(19180, 5, "Window", (116.0, 116.0, 66.0, 20.0));
+        indicator.pid = LEASED_NOTES_PID;
+        let mut provider_view = window(19179, 6, "", (116.0, 116.0, 66.0, 20.0));
+        provider_view.pid = LEASE_PROVIDER_PID;
+        provider_view.app_name = "ThemeWidgetControlViewService".into();
+        provider_view.is_on_screen = false;
+        vec![document, off_screen, indicator, provider_view]
+    }
+
+    #[test]
+    fn an_off_screen_provider_view_still_names_the_indicator_it_sits_in() {
+        let order = resolve_process_front_order(
+            &notes_under_a_capture_lease(),
+            LEASED_NOTES_PID,
+            19177,
+            |pid| pid == LEASE_PROVIDER_PID,
+        );
+        assert!(order.target_is_front, "{:?}", order.in_front);
+        assert_eq!(order.in_front, None);
+    }
+
+    /// A row the roster carries only so the indicator can be classified is not
+    /// drawn at all, so it is never the window the process put in front.
+    #[test]
+    fn an_off_screen_row_of_the_process_is_never_the_window_in_front() {
+        let mut windows = notes_under_a_capture_lease();
+        windows
+            .iter_mut()
+            .find(|window| window.window_id == 19178)
+            .expect("the off-screen row")
+            .z_index = 9;
+        let order = resolve_process_front_order(&windows, LEASED_NOTES_PID, 19177, |pid| {
+            pid == LEASE_PROVIDER_PID
+        });
+        assert!(order.target_is_front, "{:?}", order.in_front);
+        assert_eq!(order.in_front, None);
     }
 }
 
