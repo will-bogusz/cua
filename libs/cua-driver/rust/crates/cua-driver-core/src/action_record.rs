@@ -1009,11 +1009,6 @@ fn structured_delivery_mode(
         Some("background") if structured.get("delivery_mode").is_some() => {
             Some(ActualDelivery::Background)
         }
-        // A producer that dispatched but cannot establish what was delivered
-        // says so explicitly; the route label alone would overstate it.
-        Some("unknown") if structured.get("delivery_mode").is_some() => {
-            Some(ActualDelivery::Unknown)
-        }
         // A requested background mode alone is not proof when the legacy
         // producer returned no route. Keep it unknown until the path branch
         // below establishes background delivery.
@@ -1206,6 +1201,11 @@ impl ActionExecutionRecordBuilder {
 
     pub fn menu_path(mut self, path: Vec<String>) -> Self {
         self.0.menu_path = Some(path);
+        self
+    }
+
+    pub fn committed(mut self, commit: cua_driver_contract::ActionCommit) -> Self {
+        self.0.committed = Some(commit);
         self
     }
 
@@ -1704,11 +1704,12 @@ mod tests {
 
     /// The verdict is the only signal a caller has for "did the app take the
     /// value", so it has to reach the public result unchanged — and a stale
-    /// boolean spelling must not be read as a claim.
+    /// boolean spelling must not be read as a claim. `type_text` is the one
+    /// family still publishing it through the legacy payload.
     #[test]
     fn legacy_commit_verdict_reaches_the_public_result() {
         use cua_driver_contract::ActionCommit;
-        let args = serde_json::json!({ "pid": 42, "window_id": 77 });
+        let args = serde_json::json!({ "pid": 42, "window_id": 77, "delivery_mode": "background" });
         for (raw, expected) in [
             (
                 serde_json::json!("committed"),
@@ -1729,8 +1730,8 @@ mod tests {
                 "effect": "confirmed",
                 "committed": raw,
             });
-            let record = ActionExecutionRecord::from_legacy("set_value", &args, &structured)
-                .expect("legacy set_value should normalize");
+            let record = ActionExecutionRecord::from_legacy("type_text", &args, &structured)
+                .expect("legacy type_text should normalize");
             assert_eq!(record.committed, expected, "{structured}");
             assert_eq!(
                 record.public_result().expect("public result").committed,
@@ -1798,34 +1799,6 @@ mod tests {
                 "route": "synthetic_events",
                 "delivery": {"mode": "background"},
                 "evidence": [{"kind": "value_readback"}],
-            })
-        );
-    }
-
-    /// A producer that dispatched an action whose reply establishes neither
-    /// delivery nor a no-op publishes that, rather than letting its route
-    /// label claim the action was delivered in the mode it asked for.
-    #[test]
-    fn a_dispatch_with_an_indeterminate_reply_publishes_an_unknown_delivery() {
-        let record = ActionExecutionRecord::from_legacy(
-            "click",
-            &serde_json::json!({"delivery_mode": "background"}),
-            &serde_json::json!({
-                "path": "ax",
-                "verified": false,
-                "effect": "unverifiable",
-                "delivery_mode": "unknown",
-            }),
-        )
-        .expect("an unverifiable AX dispatch should normalize");
-
-        assert_eq!(record.actual_delivery, Some(ActualDelivery::Unknown));
-        assert_eq!(
-            serde_json::to_value(record.public_result().expect("public result")).unwrap(),
-            serde_json::json!({
-                "effect": "unverifiable",
-                "route": "accessibility",
-                "delivery": {"mode": "unknown"},
             })
         );
     }

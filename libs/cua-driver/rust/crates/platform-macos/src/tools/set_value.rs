@@ -19,6 +19,10 @@
 use async_trait::async_trait;
 use cua_driver_contract::ActionCommit;
 use cua_driver_core::{
+    action_record::{
+        ActionEffect, ActionEscalation, ActionEvidence, ActionExecutionRecord, ActionTransport,
+        ActualDelivery, EscalationKind, EvidenceKind, RequestedDelivery,
+    },
     protocol::ToolResult,
     tool::{Tool, ToolDef},
 };
@@ -259,35 +263,65 @@ impl Tool for SetValueTool {
             Ok(Ok(mut outcome)) => {
                 apply_surface_trust(&mut outcome, ax_echo_surface);
                 apply_verification_label(&mut outcome);
-                let committed = outcome.committed;
-                let mut msg = outcome.detail;
+                let mut msg = std::mem::take(&mut outcome.detail);
                 msg.push_str(&changes.result_suffix());
-                let verified = outcome.verified.unwrap_or(false);
-                let mut structured = serde_json::json!({
-                    "path": outcome.path,
-                    "verified": verified,
-                    "effect": if verified { "confirmed" } else { "unverifiable" },
-                });
-                if let Some(committed) = committed {
-                    structured["committed"] = serde_json::json!(committed.as_wire());
-                }
-                if let Some(delivered) = outcome.delivered {
-                    structured["delivered_chars"] = serde_json::json!(delivered);
-                }
-                if ax_echo_surface {
-                    structured["escalation"] = serde_json::json!({
-                        "recommended": "px",
-                        "reason": "AXValue read-back is not trusted for web content. Verify \
-                                   through the renderer; use browser page tools for a tab or \
-                                   manipulate the control through its pixel action."
-                    });
-                }
-                ToolResult::text(msg).with_structured(structured)
+                ToolResult::text(msg).with_action_record(action_record(&outcome, ax_echo_surface))
             }
             Ok(Err(e)) => ToolResult::error(format!("set_value failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+/// The action contract for a value write. `set_value` is always a background
+/// semantic mutation; the value travels on `AXValue` or, for a bound
+/// single-line control, on PID-routed keystrokes. Only a trusted read-back
+/// confirms it, and a read-back from web content is never trusted: the
+/// renderer may never have observed a write accessibility echoes back.
+fn action_record(outcome: &SetValueOutcome, ax_echo_surface: bool) -> ActionExecutionRecord {
+    let transport = if outcome.path == "key_events" {
+        ActionTransport::MacosCgEventPid
+    } else {
+        ActionTransport::MacosAxValue
+    };
+    let verified = outcome.verified == Some(true);
+    let mut record = ActionExecutionRecord::builder(
+        if verified {
+            ActionEffect::Confirmed
+        } else {
+            ActionEffect::Unverifiable
+        },
+        transport,
+        RequestedDelivery::Background,
+    )
+    .actual_delivery(ActualDelivery::Background);
+    if verified {
+        record = record.evidence(ActionEvidence {
+            kind: EvidenceKind::ValueReadback,
+            detail: "the control's AXValue read back as the requested value".into(),
+        });
+    }
+    if let Some(committed) = outcome.committed {
+        record = record.committed(committed);
+    }
+    if let Some(delivered) = outcome
+        .delivered
+        .and_then(|count| u32::try_from(count).ok())
+    {
+        record = record.delivered_count(delivered);
+    }
+    if ax_echo_surface {
+        record = record.escalation(ActionEscalation {
+            kind: EscalationKind::RetryWithPixelTarget,
+            detail: Some(
+                "AXValue read-back is not trusted for web content. Verify through the \
+                 renderer; use browser page tools for a tab or manipulate the control \
+                 through its pixel action."
+                    .into(),
+            ),
+        });
+    }
+    record.build().expect("set_value record is valid")
 }
 
 /// How the written value reaches the app's own editing pipeline.

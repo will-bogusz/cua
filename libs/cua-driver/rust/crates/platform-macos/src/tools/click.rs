@@ -16,6 +16,10 @@
 use async_trait::async_trait;
 use cua_driver_contract::ClickButton;
 use cua_driver_core::{
+    action_record::{
+        ActionEffect, ActionEscalation, ActionEvidence, ActionExecutionRecord, ActionTransport,
+        ActualDelivery, EscalationKind, EvidenceKind, RequestedDelivery,
+    },
     protocol::ToolResult,
     tool::{Tool, ToolDef},
     tool_args::parse_legacy_click_input,
@@ -536,6 +540,13 @@ impl NextRung {
         }
     }
 
+    fn escalation(self) -> EscalationKind {
+        match self {
+            NextRung::PixelForeground => EscalationKind::RetryWithPixelTarget,
+            NextRung::Foreground => EscalationKind::RetryWithForegroundDelivery,
+        }
+    }
+
     fn advice(self) -> &'static str {
         match self {
             NextRung::PixelForeground => {
@@ -582,26 +593,43 @@ fn pointerdown_note(chromium_family: bool) -> &'static str {
     }
 }
 
-fn apply_delivery_evidence(
-    msg: &mut String,
-    structured: &mut serde_json::Value,
+/// The post-dispatch probe's verdict together with what the reply needs to
+/// say about it: the rung that can still deliver when nothing reacted, and
+/// the facts that shape the no-op explanation.
+#[derive(Clone, Copy)]
+struct ProbeReport {
     outcome: delivery_probe::ProbeOutcome,
     rung: NextRung,
     chromium_family: bool,
     polled: bool,
+}
+
+impl ProbeReport {
+    fn noop_reason(&self) -> String {
+        noop_reason(self.chromium_family, watched_signals(self.polled))
+    }
+}
+
+fn apply_delivery_evidence(
+    msg: &mut String,
+    structured: &mut serde_json::Value,
+    report: ProbeReport,
     window_change: Option<&delivery_probe::WindowChangeEvidence>,
 ) {
-    let advice = format!("{} {}", pointerdown_note(chromium_family), rung.advice());
-    let signals = watched_signals(polled);
+    let advice = format!(
+        "{} {}",
+        pointerdown_note(report.chromium_family),
+        report.rung.advice()
+    );
     delivery_probe::apply_evidence(
         msg,
         structured,
-        outcome,
+        report.outcome,
         delivery_probe::NoopReport {
-            signals,
+            signals: watched_signals(report.polled),
             escalation: Some(serde_json::json!({
-                "recommended": rung.recommended(),
-                "reason": noop_reason(chromium_family, signals),
+                "recommended": report.rung.recommended(),
+                "reason": report.noop_reason(),
             })),
             advice: &advice,
         },
@@ -1333,32 +1361,40 @@ impl Tool for ClickTool {
                     // The probe contributes the remaining verdicts: `delivered`
                     // when the target reacted, `no_observed_change` when nothing
                     // did.
-                    if let Some(delivery) = evidence {
-                        let chromium_family =
-                            matches!(delivery.evidence, delivery_probe::Evidence::Unchanged)
-                                && cua_driver_core::operation::spawn_blocking(move || {
-                                    crate::browser::is_chromium_family(pid)
-                                })
-                                .await
-                                .unwrap_or(false);
-                        apply_delivery_evidence(
-                            &mut msg,
-                            &mut structured,
-                            delivery,
+                    let report = match evidence {
+                        Some(delivery) => Some(ProbeReport {
+                            outcome: delivery,
                             // The selection fallback already delivered real
                             // pixels; everything else on this branch is an AX
                             // action, which foreground cannot upgrade.
-                            if outcome.selection_via_pixel {
+                            rung: if outcome.selection_via_pixel {
                                 NextRung::Foreground
                             } else {
                                 NextRung::PixelForeground
                             },
-                            chromium_family,
-                            changes.polled,
+                            chromium_family: matches!(
+                                delivery.evidence,
+                                delivery_probe::Evidence::Unchanged
+                            ) && cua_driver_core::operation::spawn_blocking(
+                                move || crate::browser::is_chromium_family(pid),
+                            )
+                            .await
+                            .unwrap_or(false),
+                            polled: changes.polled,
+                        }),
+                        None => None,
+                    };
+                    if let Some(report) = report {
+                        apply_delivery_evidence(
+                            &mut msg,
+                            &mut structured,
+                            report,
                             window_change.as_ref(),
                         );
                     }
-                    ToolResult::text(msg).with_structured(structured)
+                    ToolResult::text(msg)
+                        .with_structured(structured)
+                        .with_action_record(ax_click_record(&outcome, foreground, report))
                 }
                 Ok(Err(e)) => ax_action_error(e),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1884,10 +1920,12 @@ impl Tool for ClickTool {
                         apply_delivery_evidence(
                             &mut msg,
                             &mut structured,
-                            outcome,
-                            NextRung::Foreground,
-                            chromium_family,
-                            changes.polled,
+                            ProbeReport {
+                                outcome,
+                                rung: NextRung::Foreground,
+                                chromium_family,
+                                polled: changes.polled,
+                            },
                             window_change.as_ref(),
                         );
                     }
@@ -1926,13 +1964,19 @@ struct AxClickOutcome {
     unverified: Option<AxActionReplyError>,
 }
 
-/// The machine-readable half of an AX click result. A generic click has no
-/// independent read-back, so `verified` stays false unless a selection write
-/// was confirmed, and the tri-state `effect` carries the richer verdict:
+/// Why an unadvertised action is escalated to the element's pixel action.
+const UNADVERTISED_ACTION_REASON: &str = "element does not advertise this action — the \
+                                          AX press likely no-op'd. Do an element px \
+                                          action: click by pixel (x,y) off the \
+                                          screenshot from get_window_state.";
+
+/// The diagnostic half of an AX click reply, kept beside the action record
+/// for the prose the probe appends. A generic click has no independent
+/// read-back, so `verified` stays false unless a selection write was
+/// confirmed, and the tri-state `effect` carries the richer verdict:
 /// `suspected_noop` for an action the element never advertised (cross to the
 /// vision/pixel path), `unverifiable` for a dispatch the driver cannot settle
-/// (the caller's own observation does). A reply that establishes neither
-/// delivery nor a no-op leaves the delivery mode unknown as well.
+/// (the caller's own observation does).
 fn ax_click_structured(outcome: &AxClickOutcome, fronted: bool) -> serde_json::Value {
     let mut structured = serde_json::json!({
         "path": if outcome.selection_via_pixel {
@@ -1954,19 +1998,96 @@ fn ax_click_structured(outcome: &AxClickOutcome, fronted: bool) -> serde_json::V
     if outcome.selection_verified {
         structured["evidence"] = serde_json::json!([{ "kind": "accessibility_readback" }]);
     }
-    if outcome.unverified.is_some() {
-        structured["delivery_mode"] = serde_json::json!("unknown");
-    }
     if outcome.suspected_noop {
         structured["escalation"] = serde_json::json!({
             "recommended": "px",
-            "reason": "element does not advertise this action — the \
-                       AX press likely no-op'd. Do an element px \
-                       action: click by pixel (x,y) off the \
-                       screenshot from get_window_state."
+            "reason": UNADVERTISED_ACTION_REASON,
         });
     }
     structured
+}
+
+/// The action contract for an AX click, stated from what the dispatch and the
+/// probe established rather than parsed back out of the reply.
+///
+/// The selection fallback delivers real pointer events on the rung the caller
+/// asked for; everything else is an accessibility action. A reply that
+/// establishes neither delivery nor a no-op leaves the delivery mode unknown.
+/// The probe's reaction is published as observed-change evidence — weaker
+/// than a read-back, so the effect it accompanies stays `unverifiable` — and
+/// its silence turns the effect into `suspected_noop` escalated to the rung
+/// that can still deliver.
+fn ax_click_record(
+    outcome: &AxClickOutcome,
+    foreground: bool,
+    probe: Option<ProbeReport>,
+) -> ActionExecutionRecord {
+    let transport = if !outcome.selection_via_pixel {
+        ActionTransport::MacosAxAction
+    } else if foreground {
+        ActionTransport::MacosCgEventHid
+    } else {
+        ActionTransport::MacosCgEventPid
+    };
+    let requested = if foreground {
+        RequestedDelivery::Foreground
+    } else {
+        RequestedDelivery::Background
+    };
+    let actual = if outcome.unverified.is_some() {
+        ActualDelivery::Unknown
+    } else if foreground {
+        ActualDelivery::Foreground
+    } else {
+        ActualDelivery::Background
+    };
+    // The probe's silence outranks the dispatch's own verdict: a press the
+    // element never advertised and a press nothing reacted to are the same
+    // suspected no-op, escalated to the rung that can still deliver.
+    let silent = probe
+        .filter(|report| matches!(report.outcome.evidence, delivery_probe::Evidence::Unchanged));
+    let (effect, escalation) = if outcome.selection_verified {
+        (ActionEffect::Confirmed, None)
+    } else if let Some(report) = silent {
+        (
+            ActionEffect::SuspectedNoop,
+            Some(ActionEscalation {
+                kind: report.rung.escalation(),
+                detail: Some(report.noop_reason()),
+            }),
+        )
+    } else if outcome.suspected_noop {
+        (
+            ActionEffect::SuspectedNoop,
+            Some(ActionEscalation {
+                kind: EscalationKind::RetryWithPixelTarget,
+                detail: Some(UNADVERTISED_ACTION_REASON.to_owned()),
+            }),
+        )
+    } else {
+        (ActionEffect::Unverifiable, None)
+    };
+    let mut record =
+        ActionExecutionRecord::builder(effect, transport, requested).actual_delivery(actual);
+    if outcome.selection_verified {
+        record = record.evidence(ActionEvidence {
+            kind: EvidenceKind::AccessibilityReadback,
+            detail: "AXSelected read back stable on the addressed collection item".into(),
+        });
+    }
+    if let Some(reaction) = probe
+        .map(|report| report.outcome.evidence)
+        .filter(|evidence| evidence.is_reaction())
+    {
+        record = record.evidence(ActionEvidence {
+            kind: EvidenceKind::ObservedChange,
+            detail: reaction.signal().to_owned(),
+        });
+    }
+    if let Some(escalation) = escalation {
+        record = record.escalation(escalation);
+    }
+    record.build().expect("AX click record is valid")
 }
 
 /// Roles whose click gesture is "put the caret here" rather than "activate".
@@ -2448,6 +2569,20 @@ mod tests {
         }
     }
 
+    fn report(
+        outcome: delivery_probe::ProbeOutcome,
+        rung: NextRung,
+        chromium_family: bool,
+        polled: bool,
+    ) -> ProbeReport {
+        ProbeReport {
+            outcome,
+            rung,
+            chromium_family,
+            polled,
+        }
+    }
+
     fn advertised(names: &[&str]) -> crate::ax::actions::ElementActions {
         crate::ax::actions::split(names.iter().map(|name| (*name).to_owned()).collect())
     }
@@ -2509,10 +2644,12 @@ mod tests {
         apply_delivery_evidence(
             &mut ax_msg,
             &mut ax,
-            outcome(delivery_probe::Evidence::Unchanged, 2000),
-            NextRung::PixelForeground,
-            false,
-            true,
+            report(
+                outcome(delivery_probe::Evidence::Unchanged, 2000),
+                NextRung::PixelForeground,
+                false,
+                true,
+            ),
             None,
         );
         assert_eq!(ax["effect"], "suspected_noop");
@@ -2533,10 +2670,12 @@ mod tests {
         apply_delivery_evidence(
             &mut pixel_msg,
             &mut pixel,
-            outcome(delivery_probe::Evidence::Unchanged, 2000),
-            NextRung::Foreground,
-            false,
-            true,
+            report(
+                outcome(delivery_probe::Evidence::Unchanged, 2000),
+                NextRung::Foreground,
+                false,
+                true,
+            ),
             None,
         );
         assert_eq!(pixel["escalation"]["recommended"], "foreground");
@@ -2551,10 +2690,12 @@ mod tests {
         apply_delivery_evidence(
             &mut native_msg,
             &mut native,
-            outcome(delivery_probe::Evidence::Unchanged, 2000),
-            NextRung::PixelForeground,
-            false,
-            true,
+            report(
+                outcome(delivery_probe::Evidence::Unchanged, 2000),
+                NextRung::PixelForeground,
+                false,
+                true,
+            ),
             None,
         );
         assert!(!native_msg.contains("pointerdown"), "{native_msg}");
@@ -2571,10 +2712,12 @@ mod tests {
         apply_delivery_evidence(
             &mut chromium_msg,
             &mut chromium,
-            outcome(delivery_probe::Evidence::Unchanged, 2000),
-            NextRung::PixelForeground,
-            true,
-            true,
+            report(
+                outcome(delivery_probe::Evidence::Unchanged, 2000),
+                NextRung::PixelForeground,
+                true,
+                true,
+            ),
             None,
         );
         assert!(chromium_msg.contains("pointerdown"), "{chromium_msg}");
@@ -2587,10 +2730,12 @@ mod tests {
         apply_delivery_evidence(
             &mut msg,
             &mut structured,
-            outcome(delivery_probe::Evidence::Changed("element_state"), 120),
-            NextRung::PixelForeground,
-            false,
-            true,
+            report(
+                outcome(delivery_probe::Evidence::Changed("element_state"), 120),
+                NextRung::PixelForeground,
+                false,
+                true,
+            ),
             None,
         );
         assert_eq!(structured["effect"], "unverifiable");
@@ -2607,10 +2752,12 @@ mod tests {
         apply_delivery_evidence(
             &mut declined_msg,
             &mut declined,
-            outcome(delivery_probe::Evidence::Unchanged, 2000),
-            NextRung::PixelForeground,
-            false,
-            false,
+            report(
+                outcome(delivery_probe::Evidence::Unchanged, 2000),
+                NextRung::PixelForeground,
+                false,
+                false,
+            ),
             None,
         );
         assert!(
@@ -2630,10 +2777,12 @@ mod tests {
         apply_delivery_evidence(
             &mut polled_msg,
             &mut polled,
-            outcome(delivery_probe::Evidence::Unchanged, 2000),
-            NextRung::PixelForeground,
-            false,
-            true,
+            report(
+                outcome(delivery_probe::Evidence::Unchanged, 2000),
+                NextRung::PixelForeground,
+                false,
+                true,
+            ),
             None,
         );
         assert!(
@@ -2660,10 +2809,12 @@ mod tests {
             apply_delivery_evidence(
                 &mut msg,
                 &mut structured,
-                outcome(delivery_probe::Evidence::Changed(signal), 120),
-                NextRung::PixelForeground,
-                false,
-                true,
+                report(
+                    outcome(delivery_probe::Evidence::Changed(signal), 120),
+                    NextRung::PixelForeground,
+                    false,
+                    true,
+                ),
                 Some(&observed),
             );
             assert_eq!(structured["evidence"][0]["kind"], signal);
@@ -2695,13 +2846,15 @@ mod tests {
         apply_delivery_evidence(
             &mut msg,
             &mut structured,
-            outcome(
-                delivery_probe::Evidence::Changed(delivery_probe::WINDOW_SIGNAL),
-                0,
+            report(
+                outcome(
+                    delivery_probe::Evidence::Changed(delivery_probe::WINDOW_SIGNAL),
+                    0,
+                ),
+                NextRung::PixelForeground,
+                false,
+                true,
             ),
-            NextRung::PixelForeground,
-            false,
-            true,
             Some(&observed),
         );
         let appeared = &structured["evidence"][0]["appeared_windows"][0];
@@ -2718,10 +2871,12 @@ mod tests {
         apply_delivery_evidence(
             &mut msg,
             &mut structured,
-            outcome(delivery_probe::Evidence::Unusable, 2000),
-            NextRung::PixelForeground,
-            false,
-            true,
+            report(
+                outcome(delivery_probe::Evidence::Unusable, 2000),
+                NextRung::PixelForeground,
+                false,
+                true,
+            ),
             None,
         );
         assert_eq!(structured["effect"], "suspected_noop");
@@ -2812,12 +2967,16 @@ mod tests {
         );
     }
 
+    fn public(record: &ActionExecutionRecord) -> serde_json::Value {
+        serde_json::to_value(record.public_result().expect("public result")).unwrap()
+    }
+
     /// The published result of a dispatch the application answered: uncertain,
     /// with the delivery mode unknown and no read-back evidence. Only a
     /// confirmed selection write earns `confirmed`.
     #[test]
     fn an_answered_dispatch_is_not_published_as_a_confirmed_effect() {
-        let dispatched = ax_click_structured(
+        let dispatched = ax_click_record(
             &AxClickOutcome {
                 unverified: Some(AxActionReplyError {
                     action: "AXPress".to_owned(),
@@ -2826,23 +2985,91 @@ mod tests {
                 ..AxClickOutcome::default()
             },
             false,
+            None,
         );
-        assert_eq!(dispatched["effect"], "unverifiable");
-        assert_eq!(dispatched["verified"], false);
-        assert_eq!(dispatched["delivery_mode"], "unknown");
-        assert!(dispatched.get("evidence").is_none(), "{dispatched}");
+        assert_eq!(
+            public(&dispatched),
+            serde_json::json!({
+                "effect": "unverifiable",
+                "route": "accessibility",
+                "delivery": {"mode": "unknown"},
+            })
+        );
 
-        let selected = ax_click_structured(
+        let selected = ax_click_record(
             &AxClickOutcome {
                 selection_verified: true,
+                selection_via_pixel: true,
                 ..AxClickOutcome::default()
             },
             false,
+            None,
         );
-        assert_eq!(selected["effect"], "confirmed");
-        assert_eq!(selected["verified"], true);
-        assert_eq!(selected["evidence"][0]["kind"], "accessibility_readback");
-        assert!(selected.get("delivery_mode").is_none(), "{selected}");
+        assert_eq!(
+            public(&selected),
+            serde_json::json!({
+                "effect": "confirmed",
+                "route": "synthetic_events",
+                "delivery": {"mode": "background"},
+                "evidence": [{"kind": "value_readback"}],
+            })
+        );
+    }
+
+    /// The probe settles what the dispatch could not: a reaction is published
+    /// as observed-change evidence under an effect that stays unverifiable,
+    /// and silence is a suspected no-op escalated to the rung that can still
+    /// deliver — over the unadvertised-action escalation the dispatch chose.
+    #[test]
+    fn the_probe_verdict_reaches_the_published_result() {
+        let reacted = ax_click_record(
+            &AxClickOutcome::default(),
+            true,
+            Some(report(
+                outcome(delivery_probe::Evidence::ElementGone, 120),
+                NextRung::PixelForeground,
+                false,
+                true,
+            )),
+        );
+        assert_eq!(
+            public(&reacted),
+            serde_json::json!({
+                "effect": "unverifiable",
+                "route": "accessibility",
+                "delivery": {"mode": "foreground"},
+                "evidence": [{"kind": "observed_change", "signal": "element_state"}],
+            })
+        );
+
+        let silent = ax_click_record(
+            &AxClickOutcome {
+                suspected_noop: true,
+                ..AxClickOutcome::default()
+            },
+            false,
+            Some(report(
+                outcome(delivery_probe::Evidence::Unchanged, 2000),
+                NextRung::Foreground,
+                true,
+                false,
+            )),
+        );
+        assert_eq!(silent.effect, ActionEffect::SuspectedNoop);
+        let escalation = silent.escalation.as_ref().expect("escalation");
+        assert_eq!(escalation.kind, EscalationKind::RetryWithForegroundDelivery);
+        assert!(
+            escalation
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("pointerdown"),
+            "{escalation:?}"
+        );
+        assert_eq!(
+            public(&silent)["escalation"],
+            serde_json::json!({"target": "foreground", "reason": "suspected_noop"})
+        );
     }
 
     /// A reply the framework produced rather than an application answering an
