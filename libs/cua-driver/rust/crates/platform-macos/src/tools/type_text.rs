@@ -35,7 +35,7 @@ use crate::apps;
 use crate::ax::bindings::{
     copy_string_attr, focused_element_of_pid, kAXErrorSuccess, set_string_attr, AXUIElementRef,
 };
-use crate::ax::OwnedElement;
+use crate::ax::RetainedElement;
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::CFRelease;
@@ -917,8 +917,7 @@ async fn background_keyboard_policy(
         decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
     };
     let lease = super::acquire_background_mutation(pid).await;
-    let element_guard =
-        element_ptr.map(|ptr| unsafe { crate::ax::cache::RetainedElement::retain(ptr) });
+    let element_guard = element_ptr.map(|ptr| unsafe { crate::ax::RetainedElement::retain(ptr) });
     let facts = match cua_driver_core::operation::spawn_blocking(move || {
         let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
         crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
@@ -1359,7 +1358,7 @@ fn await_typed_progress(
 /// The focused element `type_text` may address, retained. A window-addressed
 /// request may only use focus that provably belongs to that exact window: a
 /// sibling window's focused field is not the requested target.
-fn resolve_window_focus(pid: i32, window_id: Option<u32>) -> Option<OwnedElement> {
+fn resolve_window_focus(pid: i32, window_id: Option<u32>) -> Option<RetainedElement> {
     // SAFETY: both resolvers return a `+1` reference, which the guard takes
     // over and releases when the call that holds it ends.
     unsafe {
@@ -1367,7 +1366,7 @@ fn resolve_window_focus(pid: i32, window_id: Option<u32>) -> Option<OwnedElement
             Some(window_id) => crate::ax::exact_target::focused_element_in_window(pid, window_id),
             None => focused_element_of_pid(pid),
         }
-        .and_then(|element| OwnedElement::adopt(element))
+        .and_then(|element| RetainedElement::adopt(element))
     }
 }
 
@@ -1445,7 +1444,7 @@ fn type_text_blocking(
         // activation installs the window's remembered first responder, which
         // is not what the agent addressed. When nothing resolved, look again
         // inside the activation rather than typing blind.
-        let mut late_focus: Option<OwnedElement> = None;
+        let mut late_focus: Option<RetainedElement> = None;
         let mut destination = target;
         let mut do_type = || {
             if destination.is_none() {

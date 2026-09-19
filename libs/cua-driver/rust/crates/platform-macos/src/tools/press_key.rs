@@ -17,7 +17,7 @@ use crate::apps;
 use crate::ax::bindings::{
     copy_bool_attr, copy_string_attr, focused_element_of_pid, AXUIElementRef,
 };
-use crate::ax::OwnedElement;
+use crate::ax::RetainedElement;
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 
@@ -143,11 +143,11 @@ fn dispatch_with_ax_oracle(
                 Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
                 None => focused_element_of_pid(pid),
             }
-            .and_then(|element| OwnedElement::adopt(element))
+            .and_then(|element| RetainedElement::adopt(element))
         },
     };
     let element_ptr =
-        explicit_element_ptr.or_else(|| owned_focus.as_ref().map(OwnedElement::as_ptr));
+        explicit_element_ptr.or_else(|| owned_focus.as_ref().map(RetainedElement::as_ptr));
     let before = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
     let mut probe = None;
     let result = {

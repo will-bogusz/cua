@@ -46,7 +46,7 @@ use crate::ax::bindings::{
     element_screen_rect, focused_element_of_pid, kAXErrorInvalidUIElement, try_copy_string_attr,
     AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
-use crate::ax::OwnedElement;
+use crate::ax::RetainedElement;
 use crate::window_change_detector::WindowEvent;
 use core_foundation::base::{CFRelease, CFTypeRef};
 
@@ -251,7 +251,7 @@ pub struct DeliveryProbe {
     /// pointer to a destroyed element traps inside CoreFoundation instead of
     /// answering. Owning a reference turns that into
     /// `kAXErrorInvalidUIElement`, which is a verdict rather than a crash.
-    element: Option<OwnedElement>,
+    element: Option<RetainedElement>,
     before: Signals,
     /// The window's subtree digest was identical across two pre-dispatch
     /// samples, so a post-dispatch difference is attributable to the action.
@@ -268,7 +268,7 @@ impl DeliveryProbe {
         let start = Instant::now();
         // SAFETY: the caller's contract is a live pointer at capture time,
         // which is exactly what `retain` needs.
-        let element = element_ptr.and_then(|ptr| unsafe { OwnedElement::retain(ptr) });
+        let element = element_ptr.map(|ptr| unsafe { RetainedElement::retain(ptr) });
         let state = element
             .as_ref()
             .map_or(ElementRead::Unreadable, element_state);
@@ -456,9 +456,9 @@ pub fn classify(before: &Signals, after: &Signals, quiescent: bool) -> Evidence 
 /// The role read reports its AX error so a destroyed element
 /// (`kAXErrorInvalidUIElement`) is told apart from one that is merely busy or
 /// slow — the first is a reaction, the second is unknown.
-fn element_state(element: &OwnedElement) -> ElementRead {
-    let element = element.as_element();
-    // SAFETY: `OwnedElement` holds a reference to this element, so it is a
+fn element_state(element: &RetainedElement) -> ElementRead {
+    let element = element.as_ptr() as AXUIElementRef;
+    // SAFETY: `RetainedElement` holds a reference to this element, so it is a
     // valid AX element for every read below even if the application already
     // destroyed the control behind it.
     unsafe {
@@ -491,7 +491,7 @@ fn element_state(element: &OwnedElement) -> ElementRead {
 fn focus_state(pid: i32) -> Option<String> {
     // SAFETY: `focused_element_of_pid` returns a `+1` reference, which the
     // guard takes over and releases when this sample ends.
-    let focused = unsafe { focused_element_of_pid(pid).and_then(|f| OwnedElement::adopt(f)) }?;
+    let focused = unsafe { focused_element_of_pid(pid).and_then(|f| RetainedElement::adopt(f)) }?;
     element_state(&focused).state().map(str::to_owned)
 }
 
@@ -836,11 +836,11 @@ mod tests {
         // means the element is gone. An app that cannot be reached at all
         // (kAXErrorCannotComplete) says nothing about its elements.
         let invalid = unsafe { AXUIElementCreateApplication(-1) }; // no such process
-        let guard = unsafe { OwnedElement::adopt(invalid) }.expect("element");
+        let guard = unsafe { RetainedElement::adopt(invalid) }.expect("element");
         assert_eq!(element_state(&guard), ElementRead::Gone);
 
         let unreachable = unsafe { AXUIElementCreateApplication(999_999) }; // above pid_max
-        let guard = unsafe { OwnedElement::adopt(unreachable) }.expect("element");
+        let guard = unsafe { RetainedElement::adopt(unreachable) }.expect("element");
         assert_eq!(element_state(&guard), ElementRead::Unreadable);
     }
 }
