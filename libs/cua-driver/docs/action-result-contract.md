@@ -23,15 +23,16 @@ Every successful action returns a closed `structuredContent` object:
 }
 ```
 
-An action that only proved the target reacted publishes the coarse kind plus
-the signal the platform watched:
+An action that only proved the target reacted publishes the `window_change`
+kind plus the signal the platform watched — the kind keeps its 0.8 name, and
+a row without `signal` is the 0.8 window poll:
 
 ```json
 {
   "effect": "unverifiable",
   "route": "synthetic_events",
   "delivery": {"mode": "background"},
-  "evidence": [{"kind": "observed_change", "signal": "app_focus"}]
+  "evidence": [{"kind": "window_change", "signal": "app_focus"}]
 }
 ```
 
@@ -42,10 +43,11 @@ the signal the platform watched:
 | `effect` | `confirmed`, `partial`, `unverifiable`, `suspected_noop`, `refused` |
 | `route` | `accessibility`, `synthetic_events`, `global_input`, `system_api`, `dom`, `trusted_input`, `menu_command` |
 | `delivery.mode` | `background`, `foreground`, `not_applicable`, `unknown` |
-| `evidence[].kind` | `value_readback`, `observed_change` |
-| `evidence[].signal` | `element_state`, `app_focus`, `window_tree`, `window_change` — optional; absent when the producer named no signal, or named one this version does not publish |
+| `evidence[].kind` | `value_readback`, `window_change` |
+| `evidence[].signal` | `element_state`, `app_focus`, `window_tree`, `window_change` — optional on `window_change` rows; absent when the producer named no signal (the 0.8 window poll), or named one this version does not publish |
 | `escalation.target` | `pixel`, `foreground`, `page`, `session`, `element`, `snapshot` |
 | `escalation.reason` | `route_unavailable`, `delivery_failed`, `effect_unconfirmed`, `suspected_noop`, `permission_required` |
+| `committed` | value-setting actions only (`set_value`, `type_text`): `committed`, `not_committed`, `unproven` — what the driver observed of the application's own end-of-edit, beside `effect`; absent on every other action |
 | `menu_path` | `menu_command` routes only: the application's own menu titles the driver dispatched, top level first (`["Edit", "Find", "Find…"]`); absent on every other route |
 
 The action-result tools are:
@@ -65,7 +67,7 @@ scope, targets, platform transport names, diagnostic pointers, or the old
 
 The invariants are:
 
-- `confirmed` has publishable readback or observed-change evidence;
+- `confirmed` has publishable readback or window-change evidence;
 - `partial` has `delivery.delivered_count`;
 - `refused` has neither delivery nor evidence;
 - `menu_command` is never a background delivery: the driver made the target

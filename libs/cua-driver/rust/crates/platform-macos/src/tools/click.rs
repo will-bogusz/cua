@@ -2080,7 +2080,7 @@ fn ax_click_record(
         .filter(|evidence| evidence.is_reaction())
     {
         record = record.evidence(ActionEvidence {
-            kind: EvidenceKind::ObservedChange,
+            kind: EvidenceKind::WindowChange,
             detail: reaction.signal().to_owned(),
         });
     }
@@ -3038,7 +3038,7 @@ mod tests {
                 "effect": "unverifiable",
                 "route": "accessibility",
                 "delivery": {"mode": "foreground"},
-                "evidence": [{"kind": "observed_change", "signal": "element_state"}],
+                "evidence": [{"kind": "window_change", "signal": "element_state"}],
             })
         );
 

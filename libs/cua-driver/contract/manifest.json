@@ -269,7 +269,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },
@@ -723,7 +723,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },
@@ -2268,7 +2268,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },
@@ -2487,7 +2487,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },
@@ -3218,7 +3218,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },
@@ -3486,7 +3486,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },
@@ -3774,7 +3774,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },
@@ -4306,7 +4306,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },
@@ -4710,7 +4710,7 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "observed_change"
+                    "window_change"
                   ],
                   "type": "string"
                 },

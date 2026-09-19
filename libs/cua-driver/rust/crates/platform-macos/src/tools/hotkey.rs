@@ -1055,7 +1055,7 @@ mod tests {
         );
         assert_eq!(
             public["evidence"],
-            serde_json::json!([{ "kind": "observed_change", "signal": "app_focus" }])
+            serde_json::json!([{ "kind": "window_change", "signal": "app_focus" }])
         );
         assert_eq!(public["escalation"]["target"], "element");
         assert_eq!(public["escalation"]["reason"], "route_unavailable");

@@ -528,15 +528,20 @@ pub struct ActionDelivery {
     pub delivered_count: Option<u32>,
 }
 
+/// `window_change`: the platform's post-dispatch probe saw the target react.
+/// The kind keeps its 0.8 name; which signal moved is `ActionEvidence.signal`,
+/// so a row without one is the 0.8 window poll and a row with one says exactly
+/// what was watched. (Variant docs are deliberately absent: they would turn
+/// the generated schema from the 0.8 `enum` into a `oneOf`.)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionEvidenceKind {
     ValueReadback,
-    ObservedChange,
+    WindowChange,
 }
 
 /// Which post-dispatch observation a platform probe named. The coarse
-/// [`ActionEvidenceKind::ObservedChange`] says the target reacted; this says
+/// [`ActionEvidenceKind::WindowChange`] says the target reacted; this says
 /// what was watched when it did.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
@@ -933,7 +938,7 @@ mod tests {
         );
         assert_eq!(
             evidence["properties"]["kind"]["enum"],
-            json!(["value_readback", "observed_change"])
+            json!(["value_readback", "window_change"])
         );
         assert_eq!(
             evidence["properties"]["signal"]["enum"],
@@ -1067,11 +1072,11 @@ mod tests {
         ] {
             let mut result = confirmed_result();
             result.evidence = Some(vec![ActionEvidence {
-                kind: ActionEvidenceKind::ObservedChange,
+                kind: ActionEvidenceKind::WindowChange,
                 signal: Some(signal),
             }]);
             let payload = serde_json::to_value(&result).expect("serialize");
-            assert_eq!(payload["evidence"][0]["kind"], json!("observed_change"));
+            assert_eq!(payload["evidence"][0]["kind"], json!("window_change"));
             assert_eq!(payload["evidence"][0]["signal"], json!(signal.as_wire()));
             assert_eq!(
                 ActionEvidenceSignal::from_wire(signal.as_wire()),
@@ -1093,7 +1098,7 @@ mod tests {
         let unpublished = json!({
             "effect": "unverifiable",
             "route": "accessibility",
-            "evidence": [{"kind": "observed_change", "signal": "vibes"}]
+            "evidence": [{"kind": "window_change", "signal": "vibes"}]
         });
         assert!(serde_json::from_value::<ActionResult>(unpublished).is_err());
     }
@@ -1130,7 +1135,7 @@ mod tests {
         );
         result.delivery = None;
         result.evidence = Some(vec![ActionEvidence {
-            kind: ActionEvidenceKind::ObservedChange,
+            kind: ActionEvidenceKind::WindowChange,
             signal: None,
         }]);
         assert_eq!(

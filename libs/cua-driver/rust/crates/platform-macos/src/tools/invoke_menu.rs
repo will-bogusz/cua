@@ -827,7 +827,7 @@ fn invoked(path: Vec<String>, reaction: Option<super::delivery_probe::Evidence>)
     });
     if let Some(reaction) = reaction.filter(|reaction| reaction.is_reaction()) {
         record = record.evidence(ActionEvidence {
-            kind: EvidenceKind::ObservedChange,
+            kind: EvidenceKind::WindowChange,
             detail: reaction.signal().to_owned(),
         });
     }
@@ -1130,7 +1130,7 @@ mod tests {
         .expect("projection serializes");
         assert_eq!(
             reacted["evidence"],
-            serde_json::json!([{ "kind": "observed_change", "signal": "app_focus" }])
+            serde_json::json!([{ "kind": "window_change", "signal": "app_focus" }])
         );
     }
 

@@ -901,20 +901,16 @@ fn typed_click_target_uses_accessible_label_without_markdown_ids() {
 }
 
 fn sdk_background_click(fixture: &Fixture, token: String) -> ClickInput {
-    ClickInput {
-        target: ActionTarget::Window {
+    ClickInput::new(
+        ActionTarget::Window {
             pid: fixture.pid,
             window_id: fixture.wid,
         },
-        position: ClickPosition::Element {
+        ClickPosition::Element {
             element_token: token,
         },
-        delivery_mode: InputDeliveryMode::Background,
-        session: None,
-        button: None,
-        count: None,
-        detect_window_change: None,
-    }
+        InputDeliveryMode::Background,
+    )
 }
 
 fn run_typed_sdk_native_window(fixture: &mut Fixture) -> Observation {

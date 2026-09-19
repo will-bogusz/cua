@@ -1303,10 +1303,17 @@ class _UniffiFfiConverterTypeActionEscalation(_UniffiConverterRustBuffer):
 
 
 class ActionEvidenceKind(enum.Enum):
+    """
+    `window_change`: the platform's post-dispatch probe saw the target react.
+    The kind keeps its 0.8 name; which signal moved is `ActionEvidence.signal`,
+    so a row without one is the 0.8 window poll and a row with one says exactly
+    what was watched. (Variant docs are deliberately absent: they would turn
+    the generated schema from the 0.8 `enum` into a `oneOf`.)
+"""
 
     VALUE_READBACK = 0
 
-    OBSERVED_CHANGE = 1
+    WINDOW_CHANGE = 1
 
 
 
@@ -1317,14 +1324,14 @@ class _UniffiFfiConverterTypeActionEvidenceKind(_UniffiConverterRustBuffer):
         if variant == 1:
             return ActionEvidenceKind.VALUE_READBACK
         if variant == 2:
-            return ActionEvidenceKind.OBSERVED_CHANGE
+            return ActionEvidenceKind.WINDOW_CHANGE
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
     def check_lower(value):
         if value == ActionEvidenceKind.VALUE_READBACK:
             return
-        if value == ActionEvidenceKind.OBSERVED_CHANGE:
+        if value == ActionEvidenceKind.WINDOW_CHANGE:
             return
         raise ValueError(value)
 
@@ -1332,7 +1339,7 @@ class _UniffiFfiConverterTypeActionEvidenceKind(_UniffiConverterRustBuffer):
     def write(value, buf):
         if value == ActionEvidenceKind.VALUE_READBACK:
             buf.write_i32(1)
-        if value == ActionEvidenceKind.OBSERVED_CHANGE:
+        if value == ActionEvidenceKind.WINDOW_CHANGE:
             buf.write_i32(2)
 
 
@@ -1345,7 +1352,7 @@ class _UniffiFfiConverterTypeActionEvidenceKind(_UniffiConverterRustBuffer):
 class ActionEvidenceSignal(enum.Enum):
     """
     Which post-dispatch observation a platform probe named. The coarse
-    [`ActionEvidenceKind::ObservedChange`] says the target reacted; this says
+    [`ActionEvidenceKind::WindowChange`] says the target reacted; this says
     what was watched when it did.
 """
 
@@ -2441,14 +2448,17 @@ class _UniffiFfiConverterOptionalTypeClickButton(_UniffiConverterRustBuffer):
 
 @dataclass
 class ClickInput:
-    def __init__(self, *, target:ActionTarget, position:ClickPosition, delivery_mode:InputDeliveryMode, session:typing.Optional[str], button:typing.Optional[ClickButton], count:typing.Optional[int], detect_window_change:typing.Optional[bool]):
+    def __init__(self, *, target:ActionTarget, position:ClickPosition, delivery_mode:InputDeliveryMode, session:typing.Optional[str], button:typing.Optional[ClickButton], count:typing.Optional[int], detect_window_change:typing.Optional[bool] = _DEFAULT):
         self.target = target
         self.position = position
         self.delivery_mode = delivery_mode
         self.session = session
         self.button = button
         self.count = count
-        self.detect_window_change = detect_window_change
+        if detect_window_change is _DEFAULT:
+            self.detect_window_change = None
+        else:
+            self.detect_window_change = detect_window_change
 
 
 
@@ -3238,7 +3248,7 @@ class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
 
 @dataclass
 class DragInput:
-    def __init__(self, *, from_x:float, from_y:float, to_x:float, to_y:float, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], duration_ms:typing.Optional[int], steps:typing.Optional[int], button:typing.Optional[ClickButton], modifier:typing.Optional[typing.List[str]], detect_window_change:typing.Optional[bool]):
+    def __init__(self, *, from_x:float, from_y:float, to_x:float, to_y:float, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], duration_ms:typing.Optional[int], steps:typing.Optional[int], button:typing.Optional[ClickButton], modifier:typing.Optional[typing.List[str]], detect_window_change:typing.Optional[bool] = _DEFAULT):
         self.from_x = from_x
         self.from_y = from_y
         self.to_x = to_x
@@ -3250,7 +3260,10 @@ class DragInput:
         self.steps = steps
         self.button = button
         self.modifier = modifier
-        self.detect_window_change = detect_window_change
+        if detect_window_change is _DEFAULT:
+            self.detect_window_change = None
+        else:
+            self.detect_window_change = detect_window_change
 
 
 
@@ -4038,12 +4051,15 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
 
 @dataclass
 class HotkeyInput:
-    def __init__(self, *, keys:typing.List[str], target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], detect_window_change:typing.Optional[bool]):
+    def __init__(self, *, keys:typing.List[str], target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], detect_window_change:typing.Optional[bool] = _DEFAULT):
         self.keys = keys
         self.target = target
         self.scope = scope
         self.session = session
-        self.detect_window_change = detect_window_change
+        if detect_window_change is _DEFAULT:
+            self.detect_window_change = None
+        else:
+            self.detect_window_change = detect_window_change
 
 
 
@@ -5227,13 +5243,16 @@ class _UniffiFfiConverterTypePredicateOutcome(_UniffiConverterRustBuffer):
 
 @dataclass
 class PressKeyInput:
-    def __init__(self, *, key:str, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], modifiers:typing.Optional[typing.List[str]], detect_window_change:typing.Optional[bool]):
+    def __init__(self, *, key:str, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], modifiers:typing.Optional[typing.List[str]], detect_window_change:typing.Optional[bool] = _DEFAULT):
         self.key = key
         self.target = target
         self.scope = scope
         self.session = session
         self.modifiers = modifiers
-        self.detect_window_change = detect_window_change
+        if detect_window_change is _DEFAULT:
+            self.detect_window_change = None
+        else:
+            self.detect_window_change = detect_window_change
 
 
 
@@ -5408,7 +5427,7 @@ class _UniffiFfiConverterOptionalTypeScrollBy(_UniffiConverterRustBuffer):
 
 @dataclass
 class ScrollInput:
-    def __init__(self, *, x:float, y:float, direction:ScrollDirection, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], by:typing.Optional[ScrollBy], amount:typing.Optional[int], detect_window_change:typing.Optional[bool]):
+    def __init__(self, *, x:float, y:float, direction:ScrollDirection, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], by:typing.Optional[ScrollBy], amount:typing.Optional[int], detect_window_change:typing.Optional[bool] = _DEFAULT):
         self.x = x
         self.y = y
         self.direction = direction
@@ -5417,7 +5436,10 @@ class ScrollInput:
         self.session = session
         self.by = by
         self.amount = amount
-        self.detect_window_change = detect_window_change
+        if detect_window_change is _DEFAULT:
+            self.detect_window_change = None
+        else:
+            self.detect_window_change = detect_window_change
 
 
 
@@ -6324,12 +6346,15 @@ class _UniffiFfiConverterTypeStatePredicate(_UniffiConverterRustBuffer):
 
 @dataclass
 class TypeTextInput:
-    def __init__(self, *, text:str, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], detect_window_change:typing.Optional[bool]):
+    def __init__(self, *, text:str, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str], detect_window_change:typing.Optional[bool] = _DEFAULT):
         self.text = text
         self.target = target
         self.scope = scope
         self.session = session
-        self.detect_window_change = detect_window_change
+        if detect_window_change is _DEFAULT:
+            self.detect_window_change = None
+        else:
+            self.detect_window_change = detect_window_change
 
 
 

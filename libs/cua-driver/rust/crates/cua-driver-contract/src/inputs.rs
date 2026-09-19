@@ -626,6 +626,7 @@ pub struct ClickInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub detect_window_change: Option<bool>,
 }
 
@@ -688,6 +689,26 @@ impl TryFrom<ClickWireInput> for ClickInput {
         };
         input.validate()?;
         Ok(input)
+    }
+}
+
+impl ClickInput {
+    /// A click with every optional field unset. Typed callers that construct
+    /// through here are not broken when the contract adds an optional field.
+    pub fn new(
+        target: ActionTarget,
+        position: ClickPosition,
+        delivery_mode: InputDeliveryMode,
+    ) -> Self {
+        Self {
+            target,
+            position,
+            delivery_mode,
+            session: None,
+            button: None,
+            count: None,
+            detect_window_change: None,
+        }
     }
 }
 
@@ -771,7 +792,28 @@ pub struct DragInput {
     pub modifier: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
     pub detect_window_change: Option<bool>,
+}
+
+impl DragInput {
+    /// A drag with every optional field unset; see [`ClickInput::new`].
+    pub fn new(from_x: f64, from_y: f64, to_x: f64, to_y: f64) -> Self {
+        Self {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            target: None,
+            scope: None,
+            session: None,
+            duration_ms: None,
+            steps: None,
+            button: None,
+            modifier: None,
+            detect_window_change: None,
+        }
+    }
 }
 
 impl ToolInput for DragInput {
@@ -805,7 +847,25 @@ pub struct ScrollInput {
     pub amount: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
     pub detect_window_change: Option<bool>,
+}
+
+impl ScrollInput {
+    /// A scroll with every optional field unset; see [`ClickInput::new`].
+    pub fn new(x: f64, y: f64, direction: ScrollDirection) -> Self {
+        Self {
+            x,
+            y,
+            direction,
+            target: None,
+            scope: None,
+            session: None,
+            by: None,
+            amount: None,
+            detect_window_change: None,
+        }
+    }
 }
 
 impl ToolInput for ScrollInput {
@@ -829,7 +889,21 @@ pub struct TypeTextInput {
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
     pub detect_window_change: Option<bool>,
+}
+
+impl TypeTextInput {
+    /// A text entry with every optional field unset; see [`ClickInput::new`].
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            target: None,
+            scope: None,
+            session: None,
+            detect_window_change: None,
+        }
+    }
 }
 
 impl ToolInput for TypeTextInput {
@@ -900,7 +974,22 @@ pub struct PressKeyInput {
     pub modifiers: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
     pub detect_window_change: Option<bool>,
+}
+
+impl PressKeyInput {
+    /// A key press with every optional field unset; see [`ClickInput::new`].
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            target: None,
+            scope: None,
+            session: None,
+            modifiers: None,
+            detect_window_change: None,
+        }
+    }
 }
 
 impl ToolInput for PressKeyInput {
@@ -925,7 +1014,21 @@ pub struct HotkeyInput {
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
     pub detect_window_change: Option<bool>,
+}
+
+impl HotkeyInput {
+    /// A chord with every optional field unset; see [`ClickInput::new`].
+    pub fn new(keys: Vec<String>) -> Self {
+        Self {
+            keys,
+            target: None,
+            scope: None,
+            session: None,
+            detect_window_change: None,
+        }
+    }
 }
 
 impl ToolInput for HotkeyInput {

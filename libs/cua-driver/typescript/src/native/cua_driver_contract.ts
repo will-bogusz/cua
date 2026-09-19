@@ -346,9 +346,16 @@ const FfiConverterTypeActionEscalation = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * `window_change`: the platform's post-dispatch probe saw the target react.
+ * The kind keeps its 0.8 name; which signal moved is `ActionEvidence.signal`,
+ * so a row without one is the 0.8 window poll and a row with one says exactly
+ * what was watched. (Variant docs are deliberately absent: they would turn
+ * the generated schema from the 0.8 `enum` into a `oneOf`.)
+ */
 export enum ActionEvidenceKind {
     ValueReadback,
-    ObservedChange
+    WindowChange
 }
 
 const FfiConverterTypeActionEvidenceKind = (() => {
@@ -358,14 +365,14 @@ const FfiConverterTypeActionEvidenceKind = (() => {
         read(from: RustBuffer): TypeName {
             switch (ordinalConverter.read(from)) {
                 case 1: return ActionEvidenceKind.ValueReadback;
-                case 2: return ActionEvidenceKind.ObservedChange;
+                case 2: return ActionEvidenceKind.WindowChange;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
         write(value: TypeName, into: RustBuffer): void {
             switch (value) {
                 case ActionEvidenceKind.ValueReadback: return ordinalConverter.write(1, into);
-                case ActionEvidenceKind.ObservedChange: return ordinalConverter.write(2, into);
+                case ActionEvidenceKind.WindowChange: return ordinalConverter.write(2, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -377,7 +384,7 @@ const FfiConverterTypeActionEvidenceKind = (() => {
 
 /**
  * Which post-dispatch observation a platform probe named. The coarse
- * [`ActionEvidenceKind::ObservedChange`] says the target reacted; this says
+ * [`ActionEvidenceKind::WindowChange`] says the target reacted; this says
  * what was watched when it did.
  */
 export enum ActionEvidenceSignal {
@@ -1161,6 +1168,7 @@ export type ClickInput = {
  */
 export const ClickInput = (() => {
     const defaults = () => ({
+        detectWindowChange: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<ClickInput, ReturnType<typeof defaults>>(defaults);
@@ -1849,6 +1857,7 @@ export type DragInput = {
  */
 export const DragInput = (() => {
     const defaults = () => ({
+        detectWindowChange: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<DragInput, ReturnType<typeof defaults>>(defaults);
@@ -2703,6 +2712,7 @@ export type HotkeyInput = {
  */
 export const HotkeyInput = (() => {
     const defaults = () => ({
+        detectWindowChange: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<HotkeyInput, ReturnType<typeof defaults>>(defaults);
@@ -3606,6 +3616,7 @@ export type PressKeyInput = {
  */
 export const PressKeyInput = (() => {
     const defaults = () => ({
+        detectWindowChange: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<PressKeyInput, ReturnType<typeof defaults>>(defaults);
@@ -3739,6 +3750,7 @@ export type ScrollInput = {
  */
 export const ScrollInput = (() => {
     const defaults = () => ({
+        detectWindowChange: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<ScrollInput, ReturnType<typeof defaults>>(defaults);
@@ -4548,6 +4560,7 @@ export type TypeTextInput = {
  */
 export const TypeTextInput = (() => {
     const defaults = () => ({
+        detectWindowChange: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<TypeTextInput, ReturnType<typeof defaults>>(defaults);

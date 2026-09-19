@@ -250,16 +250,15 @@ async fn typed_click_returns_action_facts_and_flat_native_arguments() {
     let driver = CuaDriver::connect(Some(socket)).unwrap();
     let output: ActionResult = driver
         .click(ClickInput {
-            target: ActionTarget::Window {
-                pid: 42,
-                window_id: 73,
-            },
-            position: ClickPosition::Coordinates { x: 10.5, y: 20.0 },
-            delivery_mode: InputDeliveryMode::Background,
             session: Some("run-1".into()),
-            button: None,
-            count: None,
-            detect_window_change: None,
+            ..ClickInput::new(
+                ActionTarget::Window {
+                    pid: 42,
+                    window_id: 73,
+                },
+                ClickPosition::Coordinates { x: 10.5, y: 20.0 },
+                InputDeliveryMode::Background,
+            )
         })
         .await
         .unwrap();
@@ -324,15 +323,7 @@ async fn invalid_typed_click_is_rejected_before_transport() {
         ),
     ] {
         let error = driver
-            .click(ClickInput {
-                target,
-                position,
-                delivery_mode,
-                session: None,
-                button: None,
-                count: None,
-                detect_window_change: None,
-            })
+            .click(ClickInput::new(target, position, delivery_mode))
             .await
             .unwrap_err();
         assert!(matches!(error, DriverError::InvalidArguments { tool, .. } if tool == "click"));

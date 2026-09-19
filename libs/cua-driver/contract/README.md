@@ -51,6 +51,16 @@ explicit `ActionTarget`, and an explicit `InputDeliveryMode`, and returns
 See the [0.8 SDK contract migration](../docs/native-window-sdk-migration.md)
 for the intentional SDK break and unchanged CLI/MCP wire forms.
 
+Everything after 0.8 is additive over it. `ActionResult` gained
+`evidence[].signal` (which observation a `window_change` row names),
+`committed`, `menu_path`, the `element` / `snapshot` escalation targets and
+the `menu_command` route; every input that runs the post-action window poll
+gained an optional `detect_window_change`. The kind name `window_change` and
+every 0.8 field are unchanged. Each typed input has a `new` constructor that
+leaves its optional fields unset (`ClickInput::new(target, position,
+delivery_mode)` with `..` for the rest), so a typed caller is not broken by
+the next optional field either.
+
 The canonical session-owned cursor slice is shared exactly by MCP and both
 generated SDKs:
 
