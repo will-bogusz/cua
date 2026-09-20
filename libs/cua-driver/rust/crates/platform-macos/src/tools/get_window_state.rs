@@ -31,7 +31,10 @@ fn def() -> &'static ToolDef {
             INVARIANT: call get_window_state once per turn per (pid, window_id) before any \
             element-indexed action. The index map is replaced by the next snapshot.\n\n\
             PREFERRED CONSUMERS read `structuredContent.elements` (one entry per \
-            indexed row with `element_index`, `role`, `label`, `value` (the \
+            indexed row with `element_index`, `role`, `label` (the element's own \
+            title/description/value; a list row or cell that names nothing itself \
+            carries the text of its display-only descendants instead, so a \
+            Notes/Mail/Finder row reads as its visible title and snippet), `value` (the \
             element's text/AXValue when present — use it to verify what a field \
             holds, preserving empty strings and whitespace), optional `placeholder` \
             (a separate hint, never the value), `description` (AXDescription, \
@@ -923,7 +926,8 @@ fn elements_are_complete(scope_matched: bool, walk_truncated: Option<bool>) -> b
 /// Render the actionable nodes from the AX walk into the
 /// `structuredContent.elements` array shape described on the tool: one entry
 /// per node with an `element_index`, carrying role, label (built from
-/// title/description/value/identifier), frame, parent_index, depth, and —
+/// title/description/value/placeholder, then a list item's descendant text,
+/// then identifier), frame, parent_index, depth, and —
 /// Surface 6 — an opaque `element_token` for the same row.
 ///
 /// Order matches the markdown rendering exactly (DFS, same indices). Only
@@ -947,8 +951,10 @@ fn build_elements_array_with_policy(
         .filter_map(|node| {
             let idx = node.element_index?;
             // `label` is a best-effort human-readable string: title first,
-            // then description, nonblank value, placeholder, then identifier. Mirrors what
-            // a human reading the markdown row would call this element.
+            // then description, nonblank value, placeholder, the text of a
+            // list item's display-only descendants (`descendant_text`, see the
+            // walker's rules), then identifier. Mirrors what a human reading
+            // the markdown row would call this element.
             let label = node
                 .title
                 .clone()
@@ -959,6 +965,7 @@ fn build_elements_array_with_policy(
                         .clone()
                         .filter(|hint| !hint.trim().is_empty())
                 })
+                .or_else(|| node.descendant_text.clone())
                 .or_else(|| node.identifier.clone());
             let frame = node
                 .frame
@@ -1293,6 +1300,7 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+            descendant_text: None,
         }
     }
 
@@ -1738,20 +1746,26 @@ mod tests {
 
     #[test]
     fn elements_label_fallback_chain() {
-        // title missing → description → value → identifier
+        // title missing → description → value → descendant text → identifier
         let nodes = vec![
             node(Some(0), "AXButton", None, 0, None, None, vec![]),
             node(Some(1), "AXButton", None, 0, None, None, vec![]),
-            node(Some(2), "AXButton", None, 0, None, None, vec![]),
+            node(Some(2), "AXCell", None, 0, None, None, vec![]),
+            node(Some(3), "AXButton", None, 0, None, None, vec![]),
         ];
         let mut nodes = nodes;
         nodes[0].description = Some("from-desc".into());
         nodes[1].value = Some("from-val".into());
-        nodes[2].identifier = Some("from-id".into());
+        // Notes' list cell: the identifier is the only attribute the app
+        // sets, but the walker read the note title beneath it.
+        nodes[2].identifier = Some("ICMNoteListCell".into());
+        nodes[2].descendant_text = Some("Meeting 047 …warehouse pallet audit".into());
+        nodes[3].identifier = Some("from-id".into());
         let elements = build_elements_array_with_token(&nodes, None);
         assert_eq!(elements[0]["label"], "from-desc");
         assert_eq!(elements[1]["label"], "from-val");
-        assert_eq!(elements[2]["label"], "from-id");
+        assert_eq!(elements[2]["label"], "Meeting 047 …warehouse pallet audit");
+        assert_eq!(elements[3]["label"], "from-id");
     }
 
     #[test]

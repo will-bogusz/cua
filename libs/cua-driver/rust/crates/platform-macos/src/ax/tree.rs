@@ -13,6 +13,17 @@
 //! - Non-actionable leaf nodes with a value are rendered as `AXRole = "value"`.
 //! - AXStaticText with no title/value is omitted.
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
+//! - A list item (`AXRow`, `AXCell`, `AXMenuItem`) whose own title, value,
+//!   description and placeholder are all empty gets `descendant_text`: the
+//!   text of its display-only descendants (`AXStaticText`, `AXHeading`,
+//!   `AXTextField`, `AXTextArea`, `AXLink` — value, else title, else
+//!   description) in DFS order, whitespace-collapsed, single-spaced, cut at
+//!   [`DESCENDANT_TEXT_MAX_CHARS`] with an ellipsis. It fills the structured
+//!   element's `label` ahead of the identifier and never touches an element
+//!   that names itself, the markdown row, or index assignment. Notes' note
+//!   list is the motivating case: every row is `AXRow` > `AXCell` > `AXCell
+//!   id=ICMNoteListCell` with the title and snippet in non-actionable static
+//!   text, which `elements[]` (actionable rows only) could not carry.
 
 use super::bindings::*;
 use super::row_collapse::collapse_offscreen_rows;
@@ -37,6 +48,23 @@ pub const DEFAULT_MAX_DEPTH: usize = 25;
 /// Callers can override per-call via `walk_tree`'s `max_elements` parameter
 /// (issue #22865).
 pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
+
+/// Roles whose own AX attributes are routinely empty while the text a person
+/// reads sits in display-only descendants. Only these get `descendant_text`.
+const LIST_ITEM_ROLES: &[&str] = &["AXRow", "AXCell", "AXMenuItem"];
+
+/// Descendant roles whose title/value/description is the text a person reads
+/// in a list item. Images, buttons and nested items keep their own labels.
+const TEXT_ROLES: &[&str] = &[
+    "AXStaticText",
+    "AXHeading",
+    "AXTextField",
+    "AXTextArea",
+    "AXLink",
+];
+
+/// Longest `descendant_text` (in chars) before it is cut and ends in `…`.
+pub const DESCENDANT_TEXT_MAX_CHARS: usize = 120;
 
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
@@ -91,6 +119,11 @@ pub struct AXNode {
     /// This trust marker is independent of actionable ancestry because
     /// AXWebArea is commonly non-actionable and therefore has no element index.
     pub in_web_content: bool,
+    /// Text read from display-only descendants for a list item that has no
+    /// title/value/description/placeholder of its own (see the module rules).
+    /// `None` on every other node. Filled by [`fill_descendant_text`] after
+    /// the walk; the markdown row and `element_index` are unaffected.
+    pub descendant_text: Option<String>,
 }
 
 #[derive(Default)]
@@ -400,6 +433,8 @@ pub(crate) fn walk_tree_with_timeout(
 
         CFRelease(app_elem as CFTypeRef);
     }
+
+    fill_descendant_text(&mut nodes);
 
     let stop_reason = super::budget::stop_reason();
     let timed_out = stop_reason == Some(super::budget::StopReason::Deadline);
@@ -728,6 +763,7 @@ unsafe fn walk_element(
             enabled: control_state.enabled,
             selected: control_state.selected,
             in_web_content,
+            descendant_text: None,
         }
     } else {
         AXNode {
@@ -761,6 +797,7 @@ unsafe fn walk_element(
             enabled: control_state.enabled,
             selected: control_state.selected,
             in_web_content,
+            descendant_text: None,
         }
     };
 
@@ -840,6 +877,80 @@ unsafe fn walk_children(
                 rows.total()
             ),
         ));
+    }
+}
+
+/// The text a person reads in `descendants` (the DFS slice under one list
+/// item): each text-role node's value, else title, else description, with
+/// whitespace collapsed and the pieces joined by single spaces. Stops once
+/// [`DESCENDANT_TEXT_MAX_CHARS`] is exceeded and ends the cut text in `…`.
+fn descendant_text(descendants: &[AXNode]) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = 0;
+    'pieces: for node in descendants {
+        if !TEXT_ROLES.contains(&node.role.as_str()) {
+            continue;
+        }
+        let text = match node.value.as_deref().filter(|v| !v.trim().is_empty()) {
+            Some(value) => value,
+            None => match node.title.as_deref().or(node.description.as_deref()) {
+                Some(text) => text,
+                None => continue,
+            },
+        };
+        for word in text.split_whitespace() {
+            if chars > DESCENDANT_TEXT_MAX_CHARS {
+                break 'pieces;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+                chars += 1;
+            }
+            out.push_str(word);
+            chars += word.chars().count();
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if chars > DESCENDANT_TEXT_MAX_CHARS {
+        let cut = out
+            .char_indices()
+            .nth(DESCENDANT_TEXT_MAX_CHARS)
+            .map_or(out.len(), |(index, _)| index);
+        out.truncate(cut);
+        out.truncate(out.trim_end().len());
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// Whether the app already names this element through its own attributes.
+fn has_own_label(node: &AXNode) -> bool {
+    node.title.is_some()
+        || node.description.is_some()
+        || node.value.as_deref().is_some_and(|v| !v.trim().is_empty())
+        || node.placeholder.as_deref().is_some_and(|hint| !hint.trim().is_empty())
+}
+
+/// Fill `descendant_text` on every list item (see [`LIST_ITEM_ROLES`]) that has
+/// no label of its own, from the nodes of its subtree. `nodes` is the walk
+/// output in DFS order, so a node's subtree is the run of following nodes
+/// deeper than it. Nested items (`AXRow` > `AXCell`) each read their own
+/// subtree, so a row and its cell can carry the same text; nothing is added,
+/// reordered or re-indexed.
+pub(crate) fn fill_descendant_text(nodes: &mut [AXNode]) {
+    for index in 0..nodes.len() {
+        let item = &nodes[index];
+        if !LIST_ITEM_ROLES.contains(&item.role.as_str()) || has_own_label(item) {
+            continue;
+        }
+        let depth = item.depth;
+        let subtree_end = nodes[index + 1..]
+            .iter()
+            .position(|node| node.depth <= depth)
+            .map_or(nodes.len(), |offset| index + 1 + offset);
+        nodes[index].descendant_text = descendant_text(&nodes[index + 1..subtree_end]);
     }
 }
 
@@ -1067,6 +1178,7 @@ mod tests {
             enabled: Some(true),
             selected: None,
             in_web_content: false,
+            descendant_text: None,
         }
     }
 
@@ -1232,5 +1344,141 @@ mod tests {
         let rendered = render_lines(&lines);
         let expected = format!("  {UNREADABLE_SUBTREE_LINE}");
         assert_eq!(rendered.lines().nth(1), Some(expected.as_str()));
+    }
+
+    /// One walked node: `index` is its `element_index`, `depth` its rendered
+    /// depth; `title`/`value`/`description` are the app's own attributes.
+    fn walked(
+        index: Option<usize>,
+        role: &str,
+        depth: usize,
+        title: Option<&str>,
+        value: Option<&str>,
+        description: Option<&str>,
+    ) -> AXNode {
+        AXNode {
+            element_index: index,
+            depth,
+            title: title.map(str::to_owned),
+            value: value.map(str::to_owned),
+            description: description.map(str::to_owned),
+            actions: index.map(|_| vec!["AXPress".to_owned()]).unwrap_or_default(),
+            ..indexed_node(role)
+        }
+    }
+
+    /// Notes' note list after a search, as the walker publishes it: the row,
+    /// its cell and the `ICMNoteListCell` cell name nothing themselves; the
+    /// title, snippet and folder are non-actionable static text beneath.
+    fn notes_list() -> Vec<AXNode> {
+        let mut list_cell = walked(Some(2), "AXCell", 2, None, None, None);
+        list_cell.identifier = Some("ICMNoteListCell".into());
+        vec![
+            walked(Some(0), "AXRow", 0, None, Some(""), None),
+            walked(Some(1), "AXCell", 1, None, None, None),
+            list_cell,
+            walked(None, "AXStaticText", 3, None, Some("Meeting 047"), None),
+            walked(
+                None,
+                "AXStaticText",
+                3,
+                None,
+                Some("…warehouse pallet audit  5:10 AM\n"),
+                None,
+            ),
+            walked(Some(3), "AXImage", 3, Some("move"), None, None),
+            walked(
+                None,
+                "AXStaticText",
+                3,
+                None,
+                None,
+                Some("in folder: Bench — iCloud"),
+            ),
+            walked(Some(4), "AXRow", 0, Some("Top Hits"), None, None),
+            walked(None, "AXStaticText", 1, None, Some("not the row's label"), None),
+        ]
+    }
+
+    #[test]
+    fn a_list_item_without_its_own_label_reads_its_descendant_text() {
+        let mut nodes = notes_list();
+        let before: Vec<(Option<usize>, String)> = nodes
+            .iter()
+            .map(|node| (node.element_index, node.role.clone()))
+            .collect();
+
+        fill_descendant_text(&mut nodes);
+
+        let expected = "Meeting 047 …warehouse pallet audit 5:10 AM in folder: Bench — iCloud";
+        for index in 0..3 {
+            assert_eq!(
+                nodes[index].descendant_text.as_deref(),
+                Some(expected),
+                "{} carries the text beneath it, images excluded",
+                nodes[index].role
+            );
+        }
+        assert_eq!(
+            nodes[7].descendant_text, None,
+            "a row the app titles itself is left alone"
+        );
+        assert!(
+            nodes[3..7]
+                .iter()
+                .chain(nodes[8..].iter())
+                .all(|node| node.descendant_text.is_none()),
+            "only list items are synthesised"
+        );
+        let after: Vec<(Option<usize>, String)> = nodes
+            .iter()
+            .map(|node| (node.element_index, node.role.clone()))
+            .collect();
+        assert_eq!(after, before, "no node is added, dropped or re-indexed");
+    }
+
+    #[test]
+    fn descendant_text_stops_at_the_cap_with_an_ellipsis() {
+        let long = (0..60)
+            .map(|n| format!("w{n:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut nodes = vec![
+            walked(Some(0), "AXRow", 0, None, None, None),
+            walked(None, "AXStaticText", 1, None, Some(&long), None),
+            walked(None, "AXStaticText", 1, None, Some("never reached"), None),
+        ];
+        fill_descendant_text(&mut nodes);
+
+        let text = nodes[0].descendant_text.as_deref().unwrap();
+        assert!(text.chars().count() <= DESCENDANT_TEXT_MAX_CHARS + 1, "{text:?}");
+        assert!(text.chars().count() >= DESCENDANT_TEXT_MAX_CHARS - 3, "{text:?}");
+        assert!(text.ends_with('…'), "{text:?}");
+        assert!(text.starts_with("w00 w01 "), "{text:?}");
+        assert!(!text.contains("never reached"));
+
+        let mut short = vec![
+            walked(Some(0), "AXRow", 0, None, None, None),
+            walked(None, "AXStaticText", 1, None, Some("fits"), None),
+        ];
+        fill_descendant_text(&mut short);
+        assert_eq!(short[0].descendant_text.as_deref(), Some("fits"));
+    }
+
+    #[test]
+    fn a_control_outside_a_list_never_borrows_descendant_text() {
+        let mut nodes = vec![
+            walked(Some(0), "AXButton", 0, None, None, None),
+            walked(None, "AXStaticText", 1, None, Some("Save"), None),
+            walked(Some(1), "AXRow", 0, None, None, None),
+            walked(Some(2), "AXButton", 1, Some("Close"), None, None),
+            walked(Some(3), "AXImage", 1, Some("trash"), None, None),
+        ];
+        fill_descendant_text(&mut nodes);
+        assert_eq!(nodes[0].descendant_text, None, "not a list item");
+        assert_eq!(
+            nodes[2].descendant_text, None,
+            "buttons and images beneath a row are not its text"
+        );
     }
 }
