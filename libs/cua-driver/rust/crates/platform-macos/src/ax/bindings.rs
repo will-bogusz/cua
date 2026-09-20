@@ -962,6 +962,33 @@ pub unsafe fn set_range_attr(
     result
 }
 
+/// Read an AX CFRange attribute such as `AXSelectedTextRange` as
+/// `(location, length)`. Returns `None` when the attribute is missing or is
+/// not a CFRange-typed `AXValue`.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn copy_range_attr(element: AXUIElementRef, attr_name: &str) -> Option<(isize, isize)> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let mut range = CFRangeValue {
+        location: 0,
+        length: 0,
+    };
+    let ok = AXValueGetValue(
+        value as AXValueRef,
+        kAXValueCFRangeType,
+        &mut range as *mut CFRangeValue as *mut c_void,
+    );
+    CFRelease(value);
+    ok.then_some((range.location, range.length))
+}
+
 /// Set an AX attribute to a CFBoolean true value.
 ///
 /// # Safety

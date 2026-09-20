@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_string_attr, focused_element_of_pid, kAXErrorSuccess, set_string_attr, AXUIElementRef,
+    copy_range_attr, copy_string_attr, focused_element_of_pid, kAXErrorSuccess, set_range_attr,
+    set_string_attr, AXUIElementRef,
 };
 use crate::ax::RetainedElement;
 use crate::focus_guard;
@@ -72,6 +73,16 @@ fn def() -> &'static ToolDef {
              `get_window_state` snapshot) directs the write to a specific field. \
              Without `element_index`, the write goes to the pid's currently \
              focused element.\n\n\
+             CARET: by default the text lands at the element's current insertion \
+             point (after a click on a multi-line body that is usually the start). \
+             Pass `caret` with `element_index`/`element_token` to place the caret by \
+             content first: \"start\", \"end\", {\"after\": \"<substring>\"} or \
+             {\"before\": \"<substring>\"} (first occurrence). The driver reads AXValue, \
+             collapses AXSelectedTextRange at that offset, reads it back, then types; \
+             an absent substring or a control that refuses the range is a typed \
+             refusal (`caret_anchor_not_found`, `caret_not_placed`, ...) and nothing \
+             is dispatched. The reply carries `caret_index` (UTF-16 offset) and \
+             `caret_anchor`.\n\n\
              WEB CONTENT (Chromium/WebKit/Electron — browser tabs, Slack, VS Code, \
              X's compose box): AXValue is not independent proof that the \
              renderer/DOM observed an AX write or synthesized keystrokes. The \
@@ -108,6 +119,14 @@ fn def() -> &'static ToolDef {
                     "minimum": 0,
                     "maximum": 200,
                     "description": "Milliseconds between characters in the CGEvent fallback path. Default 30. Ignored when the AX path succeeds."
+                },
+                "caret": {
+                    "description": "Where to put the insertion point before typing, resolved against the element's AXValue: \"start\", \"end\", {\"after\": \"<substring>\"} (caret right after the first occurrence) or {\"before\": \"<substring>\"} (right before it). Requires element_index or element_token. Omit to type at the current insertion point. Offsets are UTF-16 code units, as AX counts them.",
+                    "oneOf": [
+                        { "type": "string", "enum": ["start", "end"] },
+                        { "type": "object", "properties": { "after": { "type": "string", "minLength": 1 } }, "required": ["after"], "additionalProperties": false },
+                        { "type": "object", "properties": { "before": { "type": "string", "minLength": 1 } }, "required": ["before"], "additionalProperties": false }
+                    ]
                 },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Use desktop with no pid/window_id to type into the frontmost application." },
                 "delivery_mode": {
@@ -255,6 +274,18 @@ impl Tool for TypeTextTool {
             );
         }
 
+        let caret = match CaretSpec::parse(args.get("caret")) {
+            Ok(caret) => caret,
+            Err(error) => return error,
+        };
+        if caret.is_some() && element_index.is_none() {
+            return caret_refusal_result(&CaretRefusal::Unsupported {
+                reason: "caret placement needs a named element: pass element_index or \
+                         element_token (the px form and the focused-element form carry no \
+                         AXValue to resolve the offset against)",
+            });
+        }
+
         let element_guard = element_guard.zip(element_index);
 
         // ── Exact-target background gate (macOS background input v1) ──
@@ -358,6 +389,34 @@ impl Tool for TypeTextTool {
         // "success but nothing typed" symptom.
         let is_terminal_target = crate::terminal::is_terminal_pid(pid);
 
+        // ── Caret placement (element-addressed only) ──
+        // Runs under the mutation lease, after every gate and before any
+        // rung: the caret is collapsed at the resolved offset and read back,
+        // so a refusal here has dispatched nothing and the keystrokes below
+        // land exactly where the reply says they did.
+        let caret_placed = match (&caret, element_guard.as_ref()) {
+            (Some(spec), Some((element, _))) => {
+                if is_terminal_target {
+                    return caret_refusal_result(&CaretRefusal::Unsupported {
+                        reason: "the target pid is a terminal emulator; its AXTextArea does \
+                                 not take a caret, keystrokes go to the shell's own line editor",
+                    });
+                }
+                let spec = spec.clone();
+                let guard = element.clone();
+                let placed = cua_driver_core::operation::spawn_blocking(move || {
+                    place_caret(guard.as_ptr() as AXUIElementRef, &spec)
+                })
+                .await;
+                match placed {
+                    Ok(Ok(placement)) => Some(placement),
+                    Ok(Err(refusal)) => return caret_refusal_result(&refusal),
+                    Err(error) => return ToolResult::error(format!("Task error: {error}")),
+                }
+            }
+            _ => None,
+        };
+
         let blocking_policy = keyboard_policy.clone();
         let native_guard = element_guard.clone();
         let result = focus_guard::with_focus_suppressed(
@@ -410,6 +469,7 @@ impl Tool for TypeTextTool {
                     outcome.delivered_chars.unwrap_or_default(),
                     &outcome.detail,
                     outcome.path,
+                    caret_placed.as_ref(),
                 )
             }
             Ok(Ok(outcome)) => {
@@ -499,8 +559,12 @@ impl Tool for TypeTextTool {
                 } else {
                     ""
                 };
+                let caret_note = caret_placed
+                    .as_ref()
+                    .map(CaretPlacement::note)
+                    .unwrap_or_default();
                 ToolResult::text(format!(
-                    "{mark} {char_count} char(s){detail}.{note}{commit_note}{}",
+                    "{mark} {char_count} char(s){detail}{caret_note}.{note}{commit_note}{}",
                     changes.result_suffix()
                 ))
                 .with_structured({
@@ -522,6 +586,9 @@ impl Tool for TypeTextTool {
                     }
                     if let Some(delivered_chars) = delivered_chars {
                         s["delivered_chars"] = serde_json::json!(delivered_chars);
+                    }
+                    if let Some(placement) = &caret_placed {
+                        placement.attach_evidence(&mut s);
                     }
                     if untrusted_web_readback {
                         // Web-content AXValue read-back. A real browser TAB → the
@@ -820,13 +887,17 @@ fn incomplete_result(
     delivered_chars: usize,
     detail: &str,
     path: &'static str,
+    caret_placed: Option<&CaretPlacement>,
 ) -> ToolResult {
     let remainder: String = text.chars().skip(delivered_chars).collect();
-    ToolResult::error(format!(
-        "type_text incomplete: delivered {delivered_chars} of {requested_chars} \
-         character(s){detail}; retry with text: {remainder:?}"
-    ))
-    .with_structured(serde_json::json!({
+    // A placed caret now sits after the delivered prefix; re-sending the
+    // same anchor would put the remainder in front of it.
+    let caret_note = if caret_placed.is_some() {
+        " and without `caret` (the insertion point already follows the delivered prefix)"
+    } else {
+        ""
+    };
+    let mut structured = serde_json::json!({
         "code": "type_text_incomplete",
         "path": path,
         "effect": "partial",
@@ -835,7 +906,278 @@ fn incomplete_result(
         "retryable": true,
         "retry_from_character": delivered_chars,
         "retry_text": remainder,
-    }))
+    });
+    if let Some(placement) = caret_placed {
+        placement.attach_evidence(&mut structured);
+    }
+    ToolResult::error(format!(
+        "type_text incomplete: delivered {delivered_chars} of {requested_chars} \
+         character(s){detail}; retry with text: {remainder:?}{caret_note}"
+    ))
+    .with_structured(structured)
+}
+
+// ── Caret placement ───────────────────────────────────────────────────────────
+//
+// AX text ranges (`AXSelectedTextRange`, `AXNumberOfCharacters`) count UTF-16
+// code units, as NSString does: a non-BMP scalar (emoji, supplementary CJK)
+// occupies two units. Every offset this section produces or reports is in
+// those units — never Rust `char`s or bytes — so the arithmetic re-encodes the
+// relevant prefix rather than counting characters.
+
+/// Where the caller wants the insertion point before the text is typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CaretSpec {
+    Start,
+    End,
+    /// Right after the first occurrence of the substring.
+    After(String),
+    /// Right before the first occurrence of the substring.
+    Before(String),
+}
+
+impl CaretSpec {
+    /// Parse the `caret` argument: `"start"`, `"end"`, `{"after": s}` or
+    /// `{"before": s}` with a non-empty `s`. `None` when the argument is absent.
+    fn parse(value: Option<&Value>) -> Result<Option<Self>, ToolResult> {
+        const SHAPE: &str = "caret must be \"start\", \"end\", {\"after\": \"<substring>\"} or \
+                             {\"before\": \"<substring>\"}";
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let invalid = |detail: &str| {
+            Err(
+                ToolResult::error(format!("type_text: {SHAPE}; got {detail}")).with_structured(
+                    serde_json::json!({
+                        "code": "invalid_arguments",
+                        "tool": "type_text",
+                        "detail": format!("{SHAPE}; got {detail}"),
+                    }),
+                ),
+            )
+        };
+        match value {
+            Value::Null => Ok(None),
+            Value::String(name) => match name.as_str() {
+                "start" => Ok(Some(Self::Start)),
+                "end" => Ok(Some(Self::End)),
+                other => invalid(&format!("{other:?}")),
+            },
+            Value::Object(fields) => {
+                let single = (fields.len() == 1).then(|| fields.iter().next()).flatten();
+                let (key, anchor) = match single {
+                    Some((key, Value::String(anchor))) if key == "after" || key == "before" => {
+                        (key.as_str(), anchor)
+                    }
+                    _ => return invalid(&value.to_string()),
+                };
+                if anchor.is_empty() {
+                    return invalid(&format!("an empty {key:?} substring"));
+                }
+                Ok(Some(if key == "after" {
+                    Self::After(anchor.clone())
+                } else {
+                    Self::Before(anchor.clone())
+                }))
+            }
+            other => invalid(&other.to_string()),
+        }
+    }
+
+    /// The substring the caller anchored on, when the form names one.
+    fn anchor(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::Start | Self::End => None,
+            Self::After(anchor) => Some(("after", anchor)),
+            Self::Before(anchor) => Some(("before", anchor)),
+        }
+    }
+
+    /// The request echoed in wire form: `"start"`, `"end"`, `{"after": s}`,
+    /// `{"before": s}`.
+    fn as_wire(&self) -> Value {
+        match self {
+            Self::Start => Value::from("start"),
+            Self::End => Value::from("end"),
+            Self::After(anchor) => serde_json::json!({ "after": anchor }),
+            Self::Before(anchor) => serde_json::json!({ "before": anchor }),
+        }
+    }
+}
+
+/// Why the caret was not placed. Every variant is returned before any
+/// keystroke or AX text write, so `effect` is always `refused`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CaretRefusal {
+    /// The call cannot carry a caret at all (no named element, terminal pid).
+    Unsupported { reason: &'static str },
+    /// The element publishes no string `AXValue` to resolve the offset against.
+    ValueUnreadable,
+    /// The anchored substring does not occur in the value.
+    AnchorNotFound {
+        anchor: String,
+        value_utf16_length: usize,
+    },
+    /// The element rejected the collapsed `AXSelectedTextRange`, or read a
+    /// different range back.
+    NotPlaced {
+        requested_index: usize,
+        ax_error: i32,
+        observed: Option<(isize, isize)>,
+    },
+}
+
+impl CaretRefusal {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Unsupported { .. } => "caret_unsupported",
+            Self::ValueUnreadable => "caret_value_unreadable",
+            Self::AnchorNotFound { .. } => "caret_anchor_not_found",
+            Self::NotPlaced { .. } => "caret_not_placed",
+        }
+    }
+}
+
+/// The caret the driver placed and read back before typing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaretPlacement {
+    /// UTF-16 offset the collapsed selection was confirmed at.
+    index: usize,
+    spec: CaretSpec,
+}
+
+impl CaretPlacement {
+    fn note(&self) -> String {
+        match self.spec.anchor() {
+            Some((relation, anchor)) => format!(" at caret {} ({relation} {anchor:?})", self.index),
+            None => format!(" at caret {}", self.index),
+        }
+    }
+
+    fn attach_evidence(&self, structured: &mut Value) {
+        structured["caret_index"] = serde_json::json!(self.index);
+        if self.spec.anchor().is_some() {
+            structured["caret_anchor"] = self.spec.as_wire();
+        }
+    }
+}
+
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Resolve the caret spec against the element's current value to a UTF-16
+/// offset. Anchors match the first occurrence, byte-exact.
+fn resolve_caret_index(value: &str, spec: &CaretSpec) -> Result<usize, CaretRefusal> {
+    let anchored = |anchor: &str| {
+        value
+            .find(anchor)
+            .map(|byte_index| utf16_len(&value[..byte_index]))
+            .ok_or_else(|| CaretRefusal::AnchorNotFound {
+                anchor: anchor.to_owned(),
+                value_utf16_length: utf16_len(value),
+            })
+    };
+    match spec {
+        CaretSpec::Start => Ok(0),
+        CaretSpec::End => Ok(utf16_len(value)),
+        CaretSpec::After(anchor) => anchored(anchor).map(|start| start + utf16_len(anchor)),
+        CaretSpec::Before(anchor) => anchored(anchor),
+    }
+}
+
+/// Collapse the element's selection at the resolved offset and prove it by
+/// reading `AXSelectedTextRange` back. Nothing is typed here.
+fn place_caret(element: AXUIElementRef, spec: &CaretSpec) -> Result<CaretPlacement, CaretRefusal> {
+    let value =
+        unsafe { copy_string_attr(element, "AXValue") }.ok_or(CaretRefusal::ValueUnreadable)?;
+    let index = resolve_caret_index(&value, spec)?;
+    let err = unsafe { set_range_attr(element, "AXSelectedTextRange", index as isize, 0) };
+    let observed = (err == kAXErrorSuccess)
+        .then(|| unsafe { copy_range_attr(element, "AXSelectedTextRange") })
+        .flatten();
+    if err != kAXErrorSuccess || observed != Some((index as isize, 0)) {
+        return Err(CaretRefusal::NotPlaced {
+            requested_index: index,
+            ax_error: err,
+            observed,
+        });
+    }
+    Ok(CaretPlacement {
+        index,
+        spec: spec.clone(),
+    })
+}
+
+/// The reply for a caret that was not placed: nothing was dispatched, the
+/// caller can re-anchor or drop `caret` and type at the current insertion point.
+fn caret_refusal_result(refusal: &CaretRefusal) -> ToolResult {
+    let mut structured = serde_json::json!({
+        "code": refusal.code(),
+        "effect": "refused",
+        "delivered_chars": 0,
+        "retryable": true,
+    });
+    let message = match refusal {
+        CaretRefusal::Unsupported { reason } => {
+            structured["retryable"] = Value::Bool(false);
+            format!("type_text refused the caret before typing: {reason}")
+        }
+        CaretRefusal::ValueUnreadable => {
+            "type_text refused the caret before typing: the element publishes no string \
+             AXValue to resolve the offset against; address the text control itself"
+                .to_owned()
+        }
+        CaretRefusal::AnchorNotFound {
+            anchor,
+            value_utf16_length,
+        } => {
+            structured["anchor"] = Value::from(anchor.as_str());
+            structured["value_utf16_length"] = serde_json::json!(value_utf16_length);
+            structured["escalation"] = serde_json::json!({
+                "recommended": "re_anchor",
+                "reason": "The anchor does not occur in the element's current value (matched \
+                           byte-exact, first occurrence). Read the value and anchor on text \
+                           it holds, or use \"start\"/\"end\".",
+            });
+            format!(
+                "type_text refused the caret before typing: {anchor:?} does not occur in the \
+                 element's value ({value_utf16_length} UTF-16 units); nothing was typed"
+            )
+        }
+        CaretRefusal::NotPlaced {
+            requested_index,
+            ax_error,
+            observed,
+        } => {
+            structured["requested_index"] = serde_json::json!(requested_index);
+            structured["ax_error"] = serde_json::json!(ax_error);
+            if let Some((location, length)) = observed {
+                structured["observed_range"] =
+                    serde_json::json!({ "location": location, "length": length });
+            }
+            structured["escalation"] = serde_json::json!({
+                "recommended": "click",
+                "reason": "The element did not take a collapsed AXSelectedTextRange. Place the \
+                           insertion point another way (click in the text, then arrow/End \
+                           keys) and type without `caret`.",
+            });
+            let outcome = match observed {
+                Some((location, length)) => {
+                    format!("the element read back location {location} length {length} instead")
+                }
+                None if *ax_error == kAXErrorSuccess => {
+                    "the element accepted the write but published no range to confirm it".to_owned()
+                }
+                None => format!("the element rejected the write (AXError {ax_error})"),
+            };
+            format!(
+                "type_text refused to type: the caret was not placed at UTF-16 offset \
+                 {requested_index} — {outcome}; nothing was typed"
+            )
+        }
+    };
+    ToolResult::error(message).with_structured(structured)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1696,6 +2038,188 @@ fn type_text_blocking(
 mod tests {
     use super::*;
 
+    // ── Caret placement ──────────────────────────────────────────────────
+
+    fn after(anchor: &str) -> CaretSpec {
+        CaretSpec::After(anchor.into())
+    }
+
+    fn before(anchor: &str) -> CaretSpec {
+        CaretSpec::Before(anchor.into())
+    }
+
+    /// Offsets are UTF-16 code units: an ASCII value counts characters, a
+    /// multi-byte BMP character still counts one unit, and a non-BMP scalar
+    /// (emoji) counts two — before and inside the anchor alike.
+    #[test]
+    fn caret_index_counts_utf16_units() {
+        let ascii = "Meeting 047\nAgenda: warehouse pallet audit\n";
+        assert_eq!(resolve_caret_index(ascii, &CaretSpec::Start), Ok(0));
+        assert_eq!(resolve_caret_index(ascii, &CaretSpec::End), Ok(43));
+        assert_eq!(resolve_caret_index(ascii, &before("warehouse")), Ok(20));
+        assert_eq!(
+            resolve_caret_index(ascii, &after("warehouse pallet audit")),
+            Ok(42)
+        );
+
+        // "é" is two bytes, one UTF-16 unit; byte offsets must not leak.
+        let bmp = "café au lait";
+        assert_eq!(resolve_caret_index(bmp, &after("café")), Ok(4));
+        assert_eq!(resolve_caret_index(bmp, &before("lait")), Ok(8));
+        assert_eq!(resolve_caret_index(bmp, &CaretSpec::End), Ok(12));
+
+        // "🚀" is four bytes, one char, TWO UTF-16 units.
+        let astral = "go 🚀 now";
+        assert_eq!(resolve_caret_index(astral, &before("🚀")), Ok(3));
+        assert_eq!(resolve_caret_index(astral, &after("🚀")), Ok(5));
+        assert_eq!(resolve_caret_index(astral, &after("now")), Ok(9));
+        assert_eq!(resolve_caret_index(astral, &after("go 🚀")), Ok(5));
+        assert_eq!(resolve_caret_index(astral, &CaretSpec::End), Ok(9));
+    }
+
+    /// The first occurrence wins, so `after` on a repeated word lands after
+    /// the earliest one, not the last.
+    #[test]
+    fn caret_anchor_matches_first_occurrence() {
+        let value = "one two one two";
+        assert_eq!(resolve_caret_index(value, &after("one")), Ok(3));
+        assert_eq!(resolve_caret_index(value, &before("two")), Ok(4));
+    }
+
+    /// An absent anchor is a refusal that carries what was searched for and
+    /// how long the value is, in the same units the caller would anchor in.
+    #[test]
+    fn caret_absent_anchor_is_a_refusal_with_search_evidence() {
+        let value = "Meeting 047 🚀";
+        assert_eq!(
+            resolve_caret_index(value, &after("pallet")),
+            Err(CaretRefusal::AnchorNotFound {
+                anchor: "pallet".into(),
+                value_utf16_length: 14,
+            })
+        );
+        // Matching is byte-exact: case and whitespace differ → absent.
+        assert!(resolve_caret_index(value, &before("meeting")).is_err());
+    }
+
+    /// An empty value still resolves `start`/`end` (both 0) and refuses every
+    /// anchor with a zero length.
+    #[test]
+    fn caret_on_empty_value() {
+        assert_eq!(resolve_caret_index("", &CaretSpec::Start), Ok(0));
+        assert_eq!(resolve_caret_index("", &CaretSpec::End), Ok(0));
+        assert_eq!(
+            resolve_caret_index("", &after("x")),
+            Err(CaretRefusal::AnchorNotFound {
+                anchor: "x".into(),
+                value_utf16_length: 0,
+            })
+        );
+    }
+
+    /// The wire forms accepted for `caret`, and the malformed ones that are
+    /// argument-shape errors before any gate runs.
+    #[test]
+    fn caret_argument_parses_its_four_forms_and_rejects_the_rest() {
+        use serde_json::json;
+        let parsed = |value: Option<&Value>| CaretSpec::parse(value).ok().flatten();
+        assert_eq!(parsed(None), None);
+        assert_eq!(parsed(Some(&Value::Null)), None);
+        assert_eq!(parsed(Some(&json!("start"))), Some(CaretSpec::Start));
+        assert_eq!(parsed(Some(&json!("end"))), Some(CaretSpec::End));
+        assert_eq!(
+            parsed(Some(&json!({"after": "audit"}))),
+            Some(after("audit"))
+        );
+        assert_eq!(
+            parsed(Some(&json!({"before": "Follow"}))),
+            Some(before("Follow"))
+        );
+        for malformed in [
+            json!("middle"),
+            json!(7),
+            json!({"after": ""}),
+            json!({"after": "a", "before": "b"}),
+            json!({"at": 3}),
+            json!({}),
+        ] {
+            let error = CaretSpec::parse(Some(&malformed))
+                .err()
+                .unwrap_or_else(|| panic!("{malformed} must be rejected"));
+            let structured = error.structured_content.expect("typed argument error");
+            assert_eq!(structured["code"], "invalid_arguments", "{malformed}");
+        }
+    }
+
+    /// The anchor refusal is typed, dispatches nothing, and names the search.
+    #[test]
+    fn caret_anchor_refusal_shape() {
+        let result = caret_refusal_result(&CaretRefusal::AnchorNotFound {
+            anchor: "warehouse".into(),
+            value_utf16_length: 57,
+        });
+        assert_eq!(result.is_error, Some(true));
+        let s = result.structured_content.expect("structured refusal");
+        assert_eq!(s["code"], "caret_anchor_not_found");
+        assert_eq!(s["effect"], "refused");
+        assert_eq!(s["delivered_chars"], 0);
+        assert_eq!(s["retryable"], true);
+        assert_eq!(s["anchor"], "warehouse");
+        assert_eq!(s["value_utf16_length"], 57);
+        assert_eq!(s["escalation"]["recommended"], "re_anchor");
+    }
+
+    /// A range the element did not take is reported with what it read back.
+    #[test]
+    fn caret_not_placed_refusal_shape() {
+        let result = caret_refusal_result(&CaretRefusal::NotPlaced {
+            requested_index: 42,
+            ax_error: kAXErrorSuccess,
+            observed: Some((0, 0)),
+        });
+        let s = result.structured_content.expect("structured refusal");
+        assert_eq!(s["code"], "caret_not_placed");
+        assert_eq!(s["effect"], "refused");
+        assert_eq!(s["requested_index"], 42);
+        assert_eq!(
+            s["observed_range"],
+            serde_json::json!({"location": 0, "length": 0})
+        );
+        assert_eq!(s["escalation"]["recommended"], "click");
+
+        let rejected = caret_refusal_result(&CaretRefusal::NotPlaced {
+            requested_index: 42,
+            ax_error: -25205,
+            observed: None,
+        });
+        let s = rejected.structured_content.expect("structured refusal");
+        assert_eq!(s["ax_error"], -25205);
+        assert!(s.get("observed_range").is_none());
+    }
+
+    /// A placed caret shows up in the reply as `caret_index`, plus the anchor
+    /// only when one was named.
+    #[test]
+    fn caret_placement_evidence() {
+        let mut s = serde_json::json!({});
+        CaretPlacement {
+            index: 42,
+            spec: after("audit"),
+        }
+        .attach_evidence(&mut s);
+        assert_eq!(s["caret_index"], 42);
+        assert_eq!(s["caret_anchor"], serde_json::json!({"after": "audit"}));
+
+        let mut s = serde_json::json!({});
+        CaretPlacement {
+            index: 0,
+            spec: CaretSpec::End,
+        }
+        .attach_evidence(&mut s);
+        assert_eq!(s["caret_index"], 0);
+        assert!(s.get("caret_anchor").is_none());
+    }
+
     /// A request that resolved no text destination escalates to the element
     /// on BOTH keystroke paths. The foreground rung used to be excluded from
     /// escalation entirely, so a window-scoped foreground type that landed
@@ -2018,7 +2542,8 @@ mod tests {
     #[test]
     fn an_incomplete_insertion_spells_the_undelivered_remainder() {
         let text = "(408) 961-1560";
-        let result = incomplete_result(text, text.chars().count(), 6, " via CGEvent", PATH_AX);
+        let result =
+            incomplete_result(text, text.chars().count(), 6, " via CGEvent", PATH_AX, None);
         let structured = result
             .structured_content
             .clone()
@@ -2040,7 +2565,7 @@ mod tests {
     #[test]
     fn the_remainder_is_sliced_by_character() {
         let text = "Ωcafé-tail";
-        let result = incomplete_result(text, text.chars().count(), 5, "", PATH_KEY_EVENTS);
+        let result = incomplete_result(text, text.chars().count(), 5, "", PATH_KEY_EVENTS, None);
         assert_eq!(
             result.structured_content.expect("payload")["retry_text"],
             serde_json::json!("-tail")
