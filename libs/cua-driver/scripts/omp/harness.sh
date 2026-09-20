@@ -23,6 +23,7 @@ STAGED="$OUT_DIR/cua-driver"
 BUILD_JSON="$OUT_DIR/build.json"
 EVIDENCE="$OUT_DIR/evidence.jsonl"
 LOG_DIR="$OUT_DIR/logs"
+RECORDINGS_DIR="$OUT_DIR/recordings"
 DUMMY_SOCK="$OUT_DIR/daemon.sock"
 IDENTITY="${CODESIGN_IDENTITY:-OMP Computer Use}"
 BUNDLE_ID="com.ohmypi.cua-driver"
@@ -266,6 +267,7 @@ cmd_run() {
 		"CUA_E2E_MACOS_DAEMON_SOCKET=$DUMMY_SOCK"
 		"CUA_TEST_APPS_ROOT=$RUST_ROOT/test-apps"
 		"CUA_TEST_REQUIRE_FIXTURES=1"
+		"CUA_E2E_RECORDINGS_ROOT=$RECORDINGS_DIR"
 	)
 	if [ "$DRY" = 1 ]; then
 		say "+ python3 (unix listener) $DUMMY_SOCK &"
