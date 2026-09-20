@@ -83,7 +83,12 @@ fn def() -> &'static ToolDef {
             this pid but its accessibility surface can't be resolved, the tree comes back \
             EMPTY with `degraded_reason: ax_window_unresolved` and the screenshot of the \
             requested window — act by pixel there. This tool never returns another \
-            surface's elements under your window_id. Before exposing a screenshot, \
+            surface's elements under your window_id. One surface has no AXWindow by \
+            design: a display's desktop (the `kind: desktop` row of list_windows, owned by \
+            Finder). Its icons come back as the tree, one AXImage per file, and the reply \
+            carries `tree_scope: {code: \"desktop_surface\", reason}` naming what was read: \
+            the application-level content inside that window's frame plus the menu bar. \
+            Before exposing a screenshot, \
             its raw dimensions are validated as a coherent 1x/2x representation of \
             the requested WindowServer bounds. `px_frame_mismatch` or \
             `px_capture_unavailable` omits an unprovable screenshot/pixel frame \
@@ -360,7 +365,7 @@ impl Tool for GetWindowStateTool {
             .is_some_and(|r| r.stop_reason.is_some())
             && window_scope
                 .as_ref()
-                .is_none_or(|scope| !scope.is_matched())
+                .is_none_or(|scope| !scope.is_resolved())
         {
             if !observation_only {
                 self.state.element_cache.remove(pid, u64::from(window_id));
@@ -384,8 +389,11 @@ impl Tool for GetWindowStateTool {
             }
         }
         // `window_scope` is None only when no window_id was requested, which
-        // this tool never does — so treat that as resolved.
-        let scope_matched = window_scope.as_ref().is_none_or(|s| s.is_matched());
+        // this tool never does — so treat that as resolved. A resolved scope is
+        // the window's own AXWindow or, for a desktop surface, the
+        // application-level content inside its frame; only then are elements
+        // published and cached.
+        let scope_matched = window_scope.as_ref().is_none_or(|s| s.is_resolved());
 
         if !scope_matched && !observation_only {
             self.state.element_cache.remove(pid, u64::from(window_id));
@@ -790,13 +798,25 @@ impl Tool for GetWindowStateTool {
         // names the surface even on the capture-only path, where no AX tree is
         // present to identify it. Omitted per-field when WindowServer reports an
         // empty string.
-        if let Some(info) = crate::windows::window_info_by_id(window_id) {
+        let server_window = crate::windows::window_info_by_id(window_id);
+        if let Some(info) = server_window.as_ref() {
             if !info.app_name.is_empty() {
                 structured["app_name"] = serde_json::json!(info.app_name);
             }
             if !info.title.is_empty() {
                 structured["window_title"] = serde_json::json!(info.title);
             }
+        }
+        // The scope a tree was read under is implicit (the window's own
+        // AXWindow) except for a desktop surface, which names itself so no
+        // consumer mistakes application-level content for a window subtree.
+        if let Some(crate::ax::WindowScope::DesktopSurface { content_children }) = window_scope {
+            structured["tree_scope"] = desktop_surface_scope_json(
+                pid,
+                window_id,
+                content_children,
+                server_window.as_ref().map(|info| &info.bounds),
+            );
         }
         cua_driver_core::window_inspection::mark_browser_chrome_capture_coverage(
             &mut structured,
@@ -834,7 +854,9 @@ fn window_scope_refusal(
     use crate::ax::WindowScope;
     match scope {
         // Resolved, or resolvable-as-degraded — the caller gets a response.
-        WindowScope::Matched | WindowScope::AxUnresolved { .. } => None,
+        WindowScope::Matched
+        | WindowScope::DesktopSurface { .. }
+        | WindowScope::AxUnresolved { .. } => None,
         WindowScope::NotFound => Some(
             ToolResult::error(format!(
                 "window_id {window_id} is not a live window (closed, or the id is stale). \
@@ -892,7 +914,10 @@ enum Degradation {
 /// Decide the degradation rung. Pure: `walk_attempted` is false in the
 /// screenshot-only path (an empty tree is expected there, not degraded), and
 /// the unresolved-scope rung outranks the generic empty-tree rung because it
-/// explains *why* the tree is empty.
+/// explains *why* the tree is empty. A desktop surface is never degraded: its
+/// content root was found and walked, and a desktop with no icons has no
+/// actionable elements to publish — that is the truthful answer, not a
+/// non-AX surface.
 fn degradation_for(
     walk_attempted: bool,
     element_count: usize,
@@ -901,15 +926,50 @@ fn degradation_for(
     if !walk_attempted {
         return Degradation::None;
     }
-    if let Some(crate::ax::WindowScope::AxUnresolved { ax_window_count }) = scope {
-        return Degradation::AxWindowUnresolved {
-            ax_window_count: *ax_window_count,
-        };
+    match scope {
+        Some(crate::ax::WindowScope::AxUnresolved { ax_window_count }) => {
+            return Degradation::AxWindowUnresolved {
+                ax_window_count: *ax_window_count,
+            }
+        }
+        Some(crate::ax::WindowScope::DesktopSurface { .. }) => return Degradation::None,
+        _ => {}
     }
     if element_count == 0 {
         return Degradation::AxTreeEmpty;
     }
     Degradation::None
+}
+
+const DESKTOP_SURFACE_SCOPE: &str = "desktop_surface";
+
+/// The `tree_scope` a desktop-surface snapshot carries: a typed code plus the
+/// sentence saying exactly what was read, so a consumer can tell this tree
+/// (application-level content inside the window's frame) from a window
+/// subtree without parsing prose.
+fn desktop_surface_scope_json(
+    pid: i32,
+    window_id: u32,
+    content_children: usize,
+    bounds: Option<&crate::windows::WindowBounds>,
+) -> serde_json::Value {
+    let frame = bounds.map_or_else(
+        || "its display's bounds".to_owned(),
+        |b| format!("{}×{} at {},{}", b.width, b.height, b.x, b.y),
+    );
+    serde_json::json!({
+        "code": DESKTOP_SURFACE_SCOPE,
+        "content_children": content_children,
+        "reason": format!(
+            "window_id {window_id} is pid {pid}'s desktop icon window (WindowServer level \
+             kCGDesktopIconWindowLevel, {frame}). No AXWindow claims it: AppKit exposes the \
+             desktop as children of the application element, so the tree is the \
+             {content_children} application-level surface(s) whose frame lies inside this \
+             window's bounds (Finder: AXScrollArea \"desktop\" holding one AXImage per icon), \
+             plus the menu bar every window-scoped tree carries. No other window's content \
+             is included."
+        )
+    })
 }
 
 /// Whether `elements` may promise that a control absent from it is absent
@@ -1157,6 +1217,59 @@ mod window_scope_contract_tests {
                 .is_none(),
             "a live same-pid window degrades; it does not error"
         );
+        assert!(
+            window_scope_refusal(
+                800,
+                9814,
+                &WindowScope::DesktopSurface {
+                    content_children: 1
+                }
+            )
+            .is_none(),
+            "a desktop surface is a readable window"
+        );
+    }
+
+    /// A desktop with no files on it walks its content root and publishes no
+    /// actionable rows. That is the answer, not a non-AX surface, so the
+    /// `ax_tree_empty` rung (which tells the caller to switch to pixels) must
+    /// not fire.
+    #[test]
+    fn an_empty_desktop_surface_is_not_degraded() {
+        let scope = WindowScope::DesktopSurface {
+            content_children: 1,
+        };
+        assert_eq!(degradation_for(true, 0, Some(&scope)), Degradation::None);
+        assert_eq!(degradation_for(true, 23, Some(&scope)), Degradation::None);
+    }
+
+    /// The reply names the scope it read under with a typed code, the count of
+    /// application-level surfaces, and the window's frame; a missing
+    /// WindowServer row (the window closed mid-call) degrades the sentence,
+    /// never the code.
+    #[test]
+    fn desktop_surface_scope_is_typed_and_names_the_frame() {
+        let bounds = crate::windows::WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1728.0,
+            height: 1117.0,
+        };
+        let scope = desktop_surface_scope_json(75696, 9814, 1, Some(&bounds));
+        assert_eq!(scope["code"], "desktop_surface");
+        assert_eq!(scope["content_children"], 1);
+        let reason = scope["reason"].as_str().unwrap();
+        assert!(reason.contains("window_id 9814") && reason.contains("pid 75696"));
+        assert!(reason.contains("1728×1117 at 0,0"), "{reason}");
+        assert!(reason.contains("No other window's content is included"));
+
+        let without_row = desktop_surface_scope_json(75696, 9814, 2, None);
+        assert_eq!(without_row["code"], "desktop_surface");
+        assert_eq!(without_row["content_children"], 2);
+        assert!(without_row["reason"]
+            .as_str()
+            .unwrap()
+            .contains("its display's bounds"));
     }
 
     /// The reported failure signature: a wrong-surface walk returns a healthy
@@ -1203,6 +1316,7 @@ mod window_scope_contract_tests {
             "window_id_not_found",
             "window_owner_pid_mismatch",
             "ax_window_unresolved",
+            DESKTOP_SURFACE_SCOPE,
         ] {
             assert!(
                 description.contains(code),

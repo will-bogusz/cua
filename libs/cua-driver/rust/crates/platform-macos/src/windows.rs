@@ -46,11 +46,18 @@ pub(crate) struct WindowEnumeration {
 // re-introduces them. Mirrors platform-windows::uia/windows_enum.rs which uses
 // the same allow for UIA_* constants.
 #[allow(non_upper_case_globals)]
+const kCGWindowListOptionAll: u32 = 0;
+#[allow(non_upper_case_globals)]
 const kCGWindowListExcludeDesktopElements: u32 = 16;
 #[allow(non_upper_case_globals)]
 const kCGWindowListOptionOnScreenOnly: u32 = 1;
 #[allow(non_upper_case_globals)]
 const kCGNullWindowID: u32 = 0;
+/// `CGWindowLevelKey` for the level Finder draws each display's desktop icons
+/// on. The numeric level behind it is resolved at runtime through
+/// `CGWindowLevelForKey`, never hard-coded: it has moved between releases.
+#[allow(non_upper_case_globals)]
+const kCGDesktopIconWindowLevelKey: i32 = 18;
 
 // ── Internal CGWindowInfo parsing ─────────────────────────────────────────────
 //
@@ -66,6 +73,23 @@ extern "C" {
         option: u32,
         relativeToWindow: u32,
     ) -> core_foundation::array::CFArrayRef;
+    fn CGWindowLevelForKey(key: i32) -> i32;
+}
+
+/// The CGWindow level of a desktop icon window, as this macOS reports it.
+pub fn desktop_icon_window_level() -> i32 {
+    static LEVEL: std::sync::LazyLock<i32> =
+        std::sync::LazyLock::new(|| unsafe { CGWindowLevelForKey(kCGDesktopIconWindowLevelKey) });
+    *LEVEL
+}
+
+/// Whether WindowServer files `window` as a desktop surface: the per-display
+/// window Finder draws the desktop icons on. It sits at
+/// `kCGDesktopIconWindowLevel`, below every application window, and
+/// `kCGWindowListExcludeDesktopElements` hides it, so it is neither a layer-0
+/// window nor an accessory one.
+pub fn is_desktop_surface(window: &WindowInfo) -> bool {
+    window.layer == desktop_icon_window_level()
 }
 
 /// Enumerate all windows (including off-screen).
@@ -89,26 +113,62 @@ pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
     )
 }
 
+/// What `list_windows` reports: every layer-0 window plus each display's
+/// desktop surface, from one enumeration so every `z_index` in the listing
+/// comes from the same WindowServer order (on screen, the desktop sits behind
+/// every application window).
+///
+/// Kept apart from [`all_windows`]: the desktop is a place to read, not a
+/// candidate for main-window selection or keyboard-destination counting.
+pub(crate) fn listable_windows_with_space_snapshot(on_screen_only: bool) -> WindowEnumeration {
+    let options = if on_screen_only {
+        kCGWindowListOptionOnScreenOnly
+    } else {
+        kCGWindowListOptionAll
+    };
+    enumerate_windows(options, LayerFilter::ZeroOrDesktopSurface)
+}
+
 /// Enumerate windows on every CGWindow layer, including the accessory layers
-/// (`layer != 0`) that [`all_windows`] hides.
+/// (`layer != 0`) that [`all_windows`] hides and the desktop elements that
+/// `kCGWindowListExcludeDesktopElements` would drop.
 ///
 /// Only used to answer "does this CGWindowID exist, and who owns it?" — the
 /// question `list_windows` must NOT answer, because surfacing tooltips,
 /// popovers, the Dock and every NSMenu window would swamp callers. Keeping the
 /// layer filter on enumeration and off identity lookup is what lets
 /// `get_window_state` tell "no such window" apart from "exists, but is not a
-/// layer-0 window" (issue #2237).
+/// layer-0 window" (issue #2237), and admitting desktop elements here is what
+/// lets it recognise Finder's desktop surface as a live window of Finder's.
 fn all_windows_any_layer() -> Vec<WindowInfo> {
-    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer).windows
+    enumerate_windows(kCGWindowListOptionAll, LayerFilter::AnyLayer).windows
 }
 
 /// Which CGWindow layers an enumeration admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerFilter {
-    /// Normal application windows only — what `list_windows` reports.
+    /// Normal application windows only.
     ZeroOnly,
+    /// Normal application windows plus the desktop surfaces — what
+    /// `list_windows` reports.
+    ZeroOrDesktopSurface,
     /// Every layer, accessory windows included.
     AnyLayer,
+}
+
+impl LayerFilter {
+    fn admits(self, layer: i32) -> bool {
+        match self {
+            LayerFilter::ZeroOnly => layer == 0,
+            LayerFilter::ZeroOrDesktopSurface => layer == 0 || layer == desktop_icon_window_level(),
+            LayerFilter::AnyLayer => true,
+        }
+    }
+
+    /// Space metadata is attached to listings, not to identity lookups.
+    fn reports_spaces(self) -> bool {
+        !matches!(self, LayerFilter::AnyLayer)
+    }
 }
 
 fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
@@ -122,7 +182,8 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
     };
     use std::os::raw::c_void;
 
-    let space_query = (layers == LayerFilter::ZeroOnly)
+    let space_query = layers
+        .reports_spaces()
         .then(crate::input::skylight::SpaceQuery::new)
         .flatten();
     let current_space_id = space_query
@@ -202,8 +263,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
         let layer = get_num("kCGWindowLayer") as i32;
         let is_on_screen = get_bool("kCGWindowIsOnscreen");
 
-        // Only include layer-0 windows, unless the caller asked for every layer.
-        if layer != 0 && layers == LayerFilter::ZeroOnly {
+        if !layers.admits(layer) {
             continue;
         }
 
@@ -256,7 +316,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
         });
     }
 
-    if layers == LayerFilter::ZeroOnly {
+    if layers.reports_spaces() {
         let Some(query) = &space_query else {
             return WindowEnumeration {
                 windows: results,
@@ -555,5 +615,30 @@ mod tests {
             WindowOwner::SamePid
         );
         assert_eq!(resolve_window_owner_in(&[], 900, 42), WindowOwner::Unknown);
+    }
+
+    /// Finder draws each display's desktop icons on a window WindowServer
+    /// files below every application window. A listing must offer it (it is
+    /// a place a caller can read) without admitting the accessory layers,
+    /// and an identity lookup must recognise every layer.
+    #[test]
+    fn listing_admits_layer_zero_and_desktop_surfaces_only() {
+        let desktop = desktop_icon_window_level();
+        assert!(desktop < 0, "desktop icons sit below the application layer");
+        for (filter, layer, admitted) in [
+            (LayerFilter::ZeroOrDesktopSurface, 0, true),
+            (LayerFilter::ZeroOrDesktopSurface, desktop, true),
+            (LayerFilter::ZeroOrDesktopSurface, desktop - 1, false),
+            (LayerFilter::ZeroOrDesktopSurface, 25, false),
+            (LayerFilter::ZeroOnly, desktop, false),
+            (LayerFilter::AnyLayer, desktop, true),
+            (LayerFilter::AnyLayer, 25, true),
+        ] {
+            assert_eq!(filter.admits(layer), admitted, "{filter:?} layer {layer}");
+        }
+        let mut surface = window(9814, 800, "Finder");
+        surface.layer = desktop;
+        assert!(is_desktop_surface(&surface));
+        assert!(!is_desktop_surface(&window(42, 800, "Finder")));
     }
 }
