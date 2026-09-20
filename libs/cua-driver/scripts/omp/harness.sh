@@ -10,7 +10,9 @@ RUST_ROOT="$REPO_ROOT/libs/cua-driver/rust"
 TEST_FILE="$RUST_ROOT/crates/cua-driver/tests/harness_appkit_test.rs"
 E2E_SCRIPT="$REPO_ROOT/scripts/ci/macos/run-rust-e2e.sh"
 FIXTURE_BUILD="$REPO_ROOT/libs/cua-driver/tests/fixtures/build/macos.sh"
+FIXTURE_SRC="$REPO_ROOT/libs/cua-driver/tests/fixtures"
 FIXTURE_APP="$RUST_ROOT/test-apps/harness-appkit/CuaTestHarness.AppKit.app"
+ELECTRON_APP="$RUST_ROOT/test-apps/harness-electron/CuaTestHarness.Electron.app"
 SHIM="$SCRIPT_DIR/direct-shim.sh"
 
 INSTALL_DIR="${OMP_CUA_DRIVER_DIR:-$HOME/.omp/natives/cua-driver}"
@@ -87,6 +89,33 @@ EOF
 }
 target_dir_private() { [ -n "${CARGO_TARGET_DIR:-}" ] && case "$CARGO_TARGET_DIR" in *shared*) false ;; *) true ;; esac; }
 
+# A staged fixture bundle carries the sha256 of the sources it was built from at
+# Contents/Resources/sources.sha256; the fixture build scripts replace the whole bundle, so
+# a bundle without the stamp, or with a stamp that no longer matches the tree, is stale.
+fixture_sources() {
+	case "$1" in
+		appkit) printf '%s\n' "$FIXTURE_SRC"/apps/macos/appkit/*.swift ;;
+		electron)
+			printf '%s\n' "$FIXTURE_SRC"/apps/cross-platform/electron/{build.sh,main.js,preload.js,package.json,package-lock.json} \
+				"$FIXTURE_SRC"/shared/web/index.html
+			;;
+		*) die "unknown fixture: $1" ;;
+	esac
+}
+fixture_sources_sha() { fixture_sources "$1" | sort | tr '\n' '\0' | xargs -0 cat | shasum -a 256 | cut -d' ' -f1; }
+fixture_bundle() { case "$1" in appkit) printf '%s' "$FIXTURE_APP" ;; electron) printf '%s' "$ELECTRON_APP" ;; esac; }
+fixture_exe() {
+	case "$1" in
+		appkit) printf '%s' "$FIXTURE_APP/Contents/MacOS/CuaTestHarness.AppKit" ;;
+		electron) printf '%s' "$ELECTRON_APP/Contents/MacOS/Electron" ;;
+	esac
+}
+stamp_fixture() { fixture_sources_sha "$1" >"$(fixture_bundle "$1")/Contents/Resources/sources.sha256"; }
+fixture_current() {
+	local stamp="$(fixture_bundle "$1")/Contents/Resources/sources.sha256"
+	[ -x "$(fixture_exe "$1")" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$(fixture_sources_sha "$1")" ]
+}
+
 cmd_preflight() {
 	check "host is macOS" test "$(uname -s)" = Darwin
 	check "no driver/harness process" no_driver_processes
@@ -97,7 +126,8 @@ cmd_preflight() {
 	check "signing identity in keychain" signing_identity_present
 	check "terminal session AX+capture" session_permissions_granted
 	check "shim present" test -x "$SHIM"
-	check "AppKit fixture built" test -x "$FIXTURE_APP/Contents/MacOS/CuaTestHarness.AppKit"
+	check "AppKit fixture built from HEAD sources" fixture_current appkit
+	check "Electron fixture built from HEAD sources" fixture_current electron
 	check "CARGO_TARGET_DIR private" target_dir_private
 	check "cargo on PATH" command -v cargo
 	if [ "$DRY" = 1 ]; then return 0; fi
@@ -106,6 +136,15 @@ cmd_preflight() {
 
 cmd_fixture() {
 	run_cmd "$FIXTURE_BUILD" --only appkit
+	run_cmd "$FIXTURE_BUILD" --only electron
+	if [ "$DRY" = 1 ]; then
+		say "+ write sources.sha256 into $FIXTURE_APP and $ELECTRON_APP"
+		return 0
+	fi
+	mkdir -p "$FIXTURE_APP/Contents/Resources" "$ELECTRON_APP/Contents/Resources"
+	stamp_fixture appkit
+	stamp_fixture electron
+	say "fixtures stamped: appkit $(fixture_sources_sha appkit) electron $(fixture_sources_sha electron)"
 }
 
 cmd_build() {
@@ -236,7 +275,8 @@ cmd_run() {
 		return 0
 	fi
 	[ -x "$INSTALLED" ] || die "no installed driver at $INSTALLED"
-	[ -x "$FIXTURE_APP/Contents/MacOS/CuaTestHarness.AppKit" ] || die "AppKit fixture missing; run: $0 fixture"
+	fixture_current appkit || die "AppKit fixture missing or stale against HEAD sources; run: $0 fixture"
+	fixture_current electron || die "Electron fixture missing or stale against HEAD sources; run: $0 fixture"
 	no_driver_processes || die "a driver/harness process is still running; run preflight"
 	mkdir -p "$LOG_DIR"
 	local head bin_sha bin_head=unknown identity macos
