@@ -325,3 +325,9 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 | W6 harness recipe + allowlist | exact-head evidence through the installed daemon; native cases in run-rust-e2e.sh |
 | W6 fixture stamp + recordings root | - (recipe; a PR's evidence names the fixture build with the binary sha) |
 | W6 competing-window cell | - (P14's approved cell, carried on the fork) |
+
+## Wave 9
+
+| Patch (commit title) | What the runs showed | Upstream PR? |
+|---|---|---|
+| `feat(macos): label a list row or cell that names nothing by its descendant text` (0c2194bed) | Stepdiff S11 (+3 steps on every native-act-notes run): after the search settles every note-list row reaches the model as `AXRow ""` > `AXCell ""` > `AXCell "ICMNoteListCell"` and it screenshots to tell which hit is which, while Codex's tree shows `text …warehouse pallet audit 5:10 AM` under the row. Cause: `elements[]` carries actionable nodes only and OMP renders from it; Notes' title, snippet and folder are non-actionable `AXStaticText` beneath the cell, and the row/cell own no title/value, so `label` fell to the identifier. The walker now fills `AXNode.descendant_text` after the walk for `AXRow`/`AXCell`/`AXMenuItem` nodes with no title/value/description/placeholder of their own (text-role descendants in DFS order, single-spaced, 120 chars + `…`), and `label` takes it ahead of the identifier. No new rows, no re-indexing, markdown row untouched, wire shape unchanged. Read-only walk of the running Contacts window: 46/46 indexed rows/cells gain text (`[5] AXRow -> "Google"` where the 0919 tree showed `AXRow ""`). Live Notes not re-run (desktop reserved). | not yet (fork-only until the base is dialed in) |
