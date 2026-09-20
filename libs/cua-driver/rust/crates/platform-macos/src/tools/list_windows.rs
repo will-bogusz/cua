@@ -28,12 +28,16 @@ fn def() -> &'static ToolDef {
             with complete=false when enumeration or any mapping is unavailable. This metadata \
             does not activate the app, exclude minimized windows, or remove WindowServer rows.\n\n\
             A record may also carry kind, which is present only on windows that are not ordinary \
-            application windows. The only value today is \"system_overlay\": the small system \
-            window-sharing indicator macOS places inside an application while another process holds \
-            a screen-capture lease on it. That record stays in the list so callers can observe that \
-            the application is being captured, but it is not part of the application's own UI — \
-            callers enumerating real windows will usually want to filter out every record that \
-            carries a kind. Ordinary windows omit the key entirely.".into(),
+            application windows. \"system_overlay\" is the small system window-sharing indicator \
+            macOS places inside an application while another process holds a screen-capture \
+            lease on it: it stays in the list so callers can observe that the application is \
+            being captured, but it is not part of the application's own UI. \"desktop\" is a \
+            display's desktop surface — the window Finder draws the desktop icons on, owned by \
+            Finder, sized to its display and behind every application window (it is not a \
+            layer-0 window; it is listed because get_window_state can read it: the desktop's \
+            icons come back as that window's tree). Callers enumerating an application's own \
+            windows will usually want to filter out every record that carries a kind. Ordinary \
+            windows omit the key entirely.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -80,11 +84,7 @@ impl Tool for ListWindowsTool {
             return ToolResult::error("include_accessibility_metadata requires a positive pid");
         }
 
-        let enumeration = if on_screen_only {
-            crate::windows::visible_windows_with_space_snapshot()
-        } else {
-            crate::windows::all_windows_with_space_snapshot()
-        };
+        let enumeration = crate::windows::listable_windows_with_space_snapshot(on_screen_only);
         let current_space_id = enumeration.current_space_id;
         let mut windows = enumeration.windows;
         let system_overlays = crate::window_kind::system_overlay_window_ids(&windows);
@@ -98,9 +98,13 @@ impl Tool for ListWindowsTool {
         let windows_json: Vec<Value> = windows
             .iter()
             .map(|w| {
-                let kind = system_overlays
-                    .contains(&w.window_id)
-                    .then_some(crate::window_kind::SYSTEM_OVERLAY_KIND);
+                let kind = if system_overlays.contains(&w.window_id) {
+                    Some(crate::window_kind::SYSTEM_OVERLAY_KIND)
+                } else if crate::windows::is_desktop_surface(w) {
+                    Some(crate::window_kind::DESKTOP_KIND)
+                } else {
+                    None
+                };
                 let ax_backed = roster
                     .as_ref()
                     .and_then(|roster| roster.ax_backed(w.window_id));

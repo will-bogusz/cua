@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use crate::windows::{WindowBounds, WindowInfo};
 
 pub const SYSTEM_OVERLAY_KIND: &str = "system_overlay";
+/// The per-display window Finder draws the desktop icons on. Not an
+/// application window, but a surface a caller may read through
+/// `get_window_state`.
+pub const DESKTOP_KIND: &str = "desktop";
 
 const INDICATOR_PROVIDER_EXECUTABLE: &str = "/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService";
 

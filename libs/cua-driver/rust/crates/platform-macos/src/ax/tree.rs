@@ -16,7 +16,10 @@
 
 use super::bindings::*;
 use super::row_collapse::collapse_offscreen_rows;
-use super::window_scope::{decide_window_scope, is_related_sheet, TopLevelCandidate, WindowScope};
+use super::window_scope::{
+    decide_desktop_surface_scope, decide_window_scope, is_related_sheet, TopLevelCandidate,
+    WindowScope,
+};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 
 /// Default maximum depth for AX tree walks. Deep menus and complex web views
@@ -167,8 +170,8 @@ pub struct TreeWalkResult {
     ///
     /// Issue #2237: without this, an unresolvable id was indistinguishable
     /// from a clean snapshot — callers had no way to tell that the tree they
-    /// were handed belonged to a different surface. Any variant other than
-    /// [`WindowScope::Matched`] comes with an EMPTY walk, so `nodes` never
+    /// were handed belonged to a different surface. Any variant that is not
+    /// [`WindowScope::is_resolved`] comes with an EMPTY walk, so `nodes` never
     /// describes a window other than the requested one.
     pub window_scope: Option<WindowScope>,
     /// The requested window's document URL (`AXDocument`), when it has one.
@@ -325,6 +328,12 @@ pub(crate) fn walk_tree_with_timeout(
         // nothing claims the requested id, `decide_window_scope` reports why
         // and walks nothing; it must never fall back to "everything that isn't
         // a window", which is how issue #2237 returned menu bars as panels.
+        //
+        // One exception is proven from WindowServer rather than from AX: a
+        // desktop surface (Finder's desktop icons) is a live window of the
+        // requested pid whose content AppKit hangs off the application element
+        // instead of an AXWindow. `decide_desktop_surface_scope` admits exactly
+        // the application-level children inside that window's bounds.
         let walk_these: Vec<AXUIElementRef> = if let Some(wid) = window_id {
             let candidates: Vec<TopLevelCandidate> = top_level
                 .iter()
@@ -348,9 +357,50 @@ pub(crate) fn walk_tree_with_timeout(
                     }
                 })
                 .collect();
-            let decision = decide_window_scope(&candidates, wid, || {
-                crate::windows::resolve_window_owner(pid, wid)
+            // The WindowServer row is kept from the one enumeration the owner
+            // lookup performs, so the desktop decision costs no second one.
+            let mut server_window: Option<crate::windows::WindowInfo> = None;
+            let mut decision = decide_window_scope(&candidates, wid, || {
+                let info = crate::windows::window_info_by_id(wid);
+                let owner = crate::windows::resolve_window_owner_in(info.as_slice(), pid, wid);
+                server_window = info;
+                owner
             });
+            if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
+                if let Some(surface) = server_window
+                    .as_ref()
+                    .filter(|info| crate::windows::is_desktop_surface(info))
+                {
+                    decision =
+                        decide_desktop_surface_scope(&candidates, &surface.bounds, |index| {
+                            if super::budget::exhausted() {
+                                return None;
+                            }
+                            element_screen_rect(top_level[index]).map(|[x, y, width, height]| {
+                                crate::windows::WindowBounds {
+                                    x,
+                                    y,
+                                    width,
+                                    height,
+                                }
+                            })
+                        });
+                    if let WindowScope::DesktopSurface { content_children } = decision.scope {
+                        lines.push((
+                            0,
+                            format!(
+                                "- Desktop surface: window_id={wid} is pid {pid}'s desktop icon \
+                                 window ({}×{} at {},{}); the rows below are the {content_children} \
+                                 application-level surface(s) inside its frame, plus the menu bar",
+                                surface.bounds.width,
+                                surface.bounds.height,
+                                surface.bounds.x,
+                                surface.bounds.y
+                            ),
+                        ));
+                    }
+                }
+            }
             let walk = decision
                 .walk
                 .iter()
@@ -1038,7 +1088,7 @@ mod tests {
         );
         assert!(result.timed_out && result.truncated);
         assert!(result.nodes.is_empty());
-        assert!(!result.window_scope.unwrap().is_matched());
+        assert!(!result.window_scope.unwrap().is_resolved());
         assert!(!super::super::budget::exhausted());
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
