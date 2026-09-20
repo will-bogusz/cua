@@ -45,3 +45,23 @@ $h preflight && $h fixture && $h build && $h install && $h run && $h evidence; $
 
 Never replace the installed binary in place while a driver process still maps it: macOS
 SIGKILLs every later reader of that path. `install` and `restore` unlink first for that reason.
+
+## What the evidence can and cannot say
+
+- `harness_appkit_exact_activation_with_agent_cursor` fails under `mcp --direct`: the cell's live
+  cursor producer asks the driver to move the agent cursor overlay and the driver refuses with
+  `macOS agent cursor overlay is unavailable: this runtime owner has no certified AppKit
+  main-thread host adapter or no Window Server graphic-session access`. Every head measured this
+  way (origin/main included) shows that one failure; it is a limitation of the direct-mode recipe,
+  not of the head under test.
+- `snapshot_publication::harness_appkit_pending_snapshot_cannot_retarget_token` fails under
+  `mcp --direct` at `assert_ne!(first.snapshot_id(), second.snapshot_id())` with `s00000001` on
+  both sides: the cell opens a second proxy that must "connect to the same installed daemon" and
+  proves the first proxy's element token cannot retarget across a capture the second one holds
+  pending. Through the shim each proxy is its own `mcp --direct` process with its own snapshot
+  numbering and token table, so the shared-daemon invariant under test does not exist. Only a
+  `serve` daemon whose app identity holds Screen Recording can prove this cell.
+- `build` codesigns with `OMP Computer Use`, and that signature is not byte-deterministic: the
+  same head signed twice yields two sha256 values. The `binary sha256` column of an evidence table
+  therefore identifies the binary that ran, not the head; `head (driver binary)` (from
+  `build.json`) is the head. Compare heads, not hashes, across tables.
