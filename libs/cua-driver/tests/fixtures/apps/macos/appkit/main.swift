@@ -81,6 +81,9 @@ let kNonBmpPlaceholder = "Non-BMP seed"
 /// covers three of them and leaves the "B" for typed text to be appended to.
 let kNonBmpSeedValue = "\u{1F600}AB"
 let kEndOfEditStateAID = "lbl-end-of-edit"
+let kRowNameCellAID = "txt-row-name"
+let kRowNameCellValue = "row name cell"
+let kFirstResponderAID = "lbl-first-responder"
 /// menu_popover — a popup button whose press opens a native NSMenu, and a
 /// button that shows an NSPopover tall enough to hang past the window's
 /// bottom edge (`CUA_APPKIT_MENU_POPOVER=1`). Both are the shapes a
@@ -226,6 +229,42 @@ final class HelpfulGroupView: NSView {
     override func accessibilityPerformPress() -> Bool {
         onPress()
         return true
+    }
+}
+
+/// The Finder/Mail/Notes row-name-cell shape: a row that *looks* like a text
+/// field — role `AXTextField`, a value, an advertised action — and is not an
+/// editor. It never becomes first responder, so the `AXFocused` write is
+/// accepted and changes nothing, and keystrokes aimed at it land on whatever
+/// the window's real first responder is. A rename gesture is what opens an
+/// editor over such a row; the row itself never holds one.
+final class RowNameCellField: NSTextField {
+    override var acceptsFirstResponder: Bool { false }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .textField }
+
+    override func accessibilityActionNames() -> [NSAccessibility.Action] { [.confirm] }
+
+    override func accessibilityPerformConfirm() -> Bool { true }
+
+    override func isAccessibilityFocused() -> Bool { false }
+
+    override func setAccessibilityFocused(_ accessibilityFocused: Bool) {}
+}
+
+/// A window that publishes its own first responder.
+///
+/// AppKit posts no first-responder-changed notification and the driver's tree
+/// carries no `AXFocused` column, so which control holds keyboard focus is
+/// only assertable if the application says it.
+final class HarnessWindow: NSWindow {
+    var onFirstResponderChange: (() -> Void)?
+
+    @discardableResult
+    override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
+        let accepted = super.makeFirstResponder(responder)
+        onFirstResponderChange?()
+        return accepted
     }
 }
 
@@ -401,7 +440,7 @@ final class ChildEditorSurface: NSObject, NSTextFieldDelegate {
 // MARK: - Controller
 
 final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
-    let window: NSWindow
+    let window: HarnessWindow
     let counterLabel = NSTextField(labelWithString: "counter=0")
     var counterValue = 0
     let textInput = LaggingTextField(string: "")
@@ -445,6 +484,8 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let accelCountLabel = NSTextField(labelWithString: "accel_fired=0")
     var accelCount = 0
     var keyMonitor: Any?
+    let rowNameCell = RowNameCellField(string: kRowNameCellValue)
+    let firstResponderLabel = NSTextField(labelWithString: "first_responder=none")
     let popupButton = NSPopUpButton()
     let popupChoiceLabel = NSTextField(labelWithString: "popup_choice=none")
     let popoverButton = NSButton(title: "Show popover", target: nil, action: nil)
@@ -468,7 +509,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         // No `.resizable`: a resizable window can be left at a different size,
         // and macOS would persist/restore that drifted frame on the next launch.
         let mask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable]
-        window = NSWindow(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
+        window = HarnessWindow(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
         window.title = kWindowTitle
         window.setAccessibilityIdentifier(kWindowAID)
         window.isReleasedWhenClosed = false
@@ -762,6 +803,26 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         publishEndOfEdit()
         content.addArrangedSubview(endOfEditRow)
         content.addArrangedSubview(endOfEditLabel)
+
+        // focus_target — appended last so no section above it shifts. A row
+        // that looks like a text field and cannot take keyboard focus, beside
+        // the window's own report of which control holds it.
+        content.addArrangedSubview(sectionLabel("focus_target"))
+        rowNameCell.setAccessibilityIdentifier(kRowNameCellAID)
+        rowNameCell.isEditable = false
+        rowNameCell.isSelectable = false
+        rowNameCell.isBezeled = false
+        rowNameCell.drawsBackground = false
+        firstResponderLabel.setAccessibilityIdentifier(kFirstResponderAID)
+        firstResponderLabel.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        let focusRow = NSStackView()
+        focusRow.orientation = .horizontal
+        focusRow.spacing = 12
+        focusRow.addArrangedSubview(rowNameCell)
+        focusRow.addArrangedSubview(firstResponderLabel)
+        content.addArrangedSubview(focusRow)
+        window.onFirstResponderChange = { [weak self] in self?.publishFirstResponder() }
+        publishFirstResponder()
         var extraHeight: CGFloat = 0
         if HarnessWindowController.envFlag("CUA_APPKIT_MENU_POPOVER") {
             content.addArrangedSubview(sectionLabel("menu_popover"))
@@ -830,6 +891,28 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         f.font = NSFont.systemFont(ofSize: 13, weight: .bold)
         f.textColor = .secondaryLabelColor
         return f
+    }
+
+    /// The control the window's first responder belongs to, as
+    /// `first_responder=<accessibility identifier>`.
+    ///
+    /// AppKit makes a field editor (an `NSTextView` with `isFieldEditor`) the
+    /// first responder while a text field is being edited, and that editor is
+    /// not the control an agent addressed — so it resolves to its client,
+    /// which is the field itself.
+    private func publishFirstResponder() {
+        var responder = window.firstResponder
+        if let editor = responder as? NSTextView, editor.isFieldEditor {
+            responder = editor.delegate as? NSResponder ?? responder
+        }
+        let name: String
+        if let view = responder as? NSView {
+            let identifier = view.accessibilityIdentifier()
+            name = identifier.isEmpty ? String(describing: type(of: view)) : identifier
+        } else {
+            name = "none"
+        }
+        firstResponderLabel.stringValue = "first_responder=\(name)"
     }
 
     private func installKeyboardMonitor() {

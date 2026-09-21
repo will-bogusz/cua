@@ -413,6 +413,18 @@
     }
    },
    {
+    "id": "focus_target",
+    "kind": "focus_target",
+    "description": "Which control holds keyboard focus, and a row that cannot take it. The window publishes its own first responder as first_responder=<accessibility identifier> (AppKit posts no notification for it and the AX tree carries no AXFocused column). txt-row-name is the list/table name-cell shape: role AXTextField, a value and an advertised AXConfirm, never first responder, so the AXFocused write is accepted and changes nothing. With CUA_APPKIT_REMEMBERED_RESPONDER=1 the window installs the selection table as its first responder on becoming key, so txt-input starts unfocused. Tests that a text insert takes focus before writing, and that an insert at a row that cannot take focus reports nothing landed rather than a retryable partial.",
+    "controls": {
+     "textbox_aid": "txt-input",
+     "row_name_cell_aid": "txt-row-name",
+     "row_name_cell_value": "row name cell",
+     "first_responder_label_aid": "lbl-first-responder",
+     "remembered_responder_env": "CUA_APPKIT_REMEMBERED_RESPONDER"
+    }
+   },
+   {
     "id": "menu_popover",
     "kind": "menu_and_popover",
     "description": "CUA_APPKIT_MENU_POPOVER=1 adds an NSPopUpButton whose AXPress opens a native NSMenu, and a button that shows a 320x460 NSPopover anchored at the window's trailing edge so the popover hangs past the window's right edge. The menu is an accessory window outside the window's AX subtree and the popover is a same-process window the window server draws with the window: tests that a press that opened a menu is reported as delivery instead of suspected_noop and that the menu is in the window's tree, and that a capture taken while the popover is open reports the rect its pixels actually cover instead of the window's own frame. popup_choice= label records the option chosen.",

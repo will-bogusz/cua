@@ -170,6 +170,22 @@ fn element_token_by_id(snapshot: &ToolResponse, identifier: &str) -> String {
         .to_owned()
 }
 
+/// The `AXValue` the snapshot published for one identified element. `None`
+/// when the element publishes no readable value.
+fn element_value_by_id(snapshot: &ToolResponse, identifier: &str) -> Option<String> {
+    let index = element_index_by_id(snapshot.tree_text(), identifier)
+        .unwrap_or_else(|| panic!("{identifier} element_index not found"));
+    snapshot.structured()["elements"]
+        .as_array()
+        .and_then(|elements| {
+            elements
+                .iter()
+                .find(|element| element["element_index"].as_u64() == Some(index))
+        })
+        .and_then(|element| element["value"].as_str())
+        .map(str::to_owned)
+}
+
 fn element_pixel_frame(snapshot: &ToolResponse, identifier: &str) -> (f64, f64, f64, f64) {
     let index = element_index_by_id(snapshot.tree_text(), identifier)
         .unwrap_or_else(|| panic!("{identifier} element_index not found"));
@@ -1896,6 +1912,147 @@ fn harness_appkit_window_scoped_type_reaches_the_focused_field() {
                 "the keystrokes went to the remembered responder:\n{post}"
             );
             Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
+/// An `AXSelectedText` write edits the field editor the application installs
+/// around the control that holds keyboard focus, so a text insert has to take
+/// focus before it writes. Measured on Contacts' search field: the value read
+/// back as written and the app never ran the query, because the write landed
+/// in a field the app was not editing. `CUA_APPKIT_REMEMBERED_RESPONDER`
+/// makes the window install the selection table as its first responder on
+/// becoming key, so the addressed field starts unfocused; the window
+/// publishes which control holds focus as `first_responder=`.
+#[test]
+#[ignore]
+fn harness_appkit_type_takes_focus_before_it_writes() {
+    run_background_case_with_env(
+        "type_text_focus_first",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_APPKIT_REMEMBERED_RESPONDER", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let tree = before.tree_text().to_owned();
+            assert!(
+                tree.contains("first_responder=") && !tree.contains("first_responder=txt-input"),
+                "the addressed field must start unfocused:\n{tree}"
+            );
+            let idx =
+                element_index_by_id(&tree, "txt-input").expect("txt-input element_index not found");
+            let text = "focus-first-cua";
+            let typed = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid, "element_index": idx,
+                    "snapshot_id": before.snapshot_id(),
+                    "text": text, "delivery_mode": "background"
+                }),
+            );
+            assert!(!typed.is_error(), "type_text failed: {}", typed.text());
+
+            std::thread::sleep(Duration::from_millis(250));
+            let post = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                post.contains(text),
+                "the text never reached the addressed field:\n{post}"
+            );
+            assert!(
+                post.contains("first_responder=txt-input"),
+                "the insert wrote a field it never focused:\n{post}"
+            );
+        },
+    );
+}
+
+/// A row that looks like a text field and cannot take keyboard focus is not
+/// an editor: the keystrokes land on whatever the window's real first
+/// responder is, nothing reaches the row, and re-sending the same call cannot
+/// change that. Measured on a Finder row-name cell, where `retryable: true`
+/// plus a spelled-out remainder bought two identical retries of a 0-of-8
+/// insert before the run abandoned the route. The fixture's `txt-row-name`
+/// publishes role `AXTextField`, a value and an `AXConfirm`, and refuses
+/// first-responder status.
+#[test]
+#[ignore]
+fn harness_appkit_type_at_a_row_that_cannot_focus_is_not_retryable() {
+    run_background_case_with_env(
+        "type_text_unfocusable_row",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        // The selection table holds first responder, so the blind keystrokes
+        // have no editor anywhere to land in — the Finder shape exactly: a
+        // list has keyboard focus and the addressed row is one of its cells.
+        &[("CUA_APPKIT_REMEMBERED_RESPONDER", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let idx = element_index_by_id(before.tree_text(), "txt-row-name")
+                .expect("txt-row-name element_index not found");
+            let text = "Invoices";
+            let typed = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid, "element_index": idx,
+                    "snapshot_id": before.snapshot_id(),
+                    "text": text, "delivery_mode": "background"
+                }),
+            );
+            assert!(
+                typed.is_error(),
+                "an insert that landed nothing was reported as delivered: {}",
+                typed.raw
+            );
+            let structured = typed.structured();
+            assert_eq!(
+                structured["code"],
+                serde_json::json!("type_text_incomplete"),
+                "{}",
+                typed.raw
+            );
+            assert_eq!(
+                structured["delivered_chars"],
+                serde_json::json!(0),
+                "{}",
+                typed.raw
+            );
+            assert_eq!(
+                structured["retryable"],
+                serde_json::json!(false),
+                "a route that cannot land must not advertise a retry: {}",
+                typed.raw
+            );
+            assert_eq!(
+                structured["target_focused"],
+                serde_json::json!(false),
+                "{}",
+                typed.raw
+            );
+            assert_eq!(
+                structured["retry_text"],
+                serde_json::Value::Null,
+                "a route that cannot land must offer no remainder: {}",
+                typed.raw
+            );
+            assert!(
+                typed.text().contains("did not take keyboard focus"),
+                "the reply must say why nothing landed: {}",
+                typed.text()
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert_eq!(
+                element_value_by_id(&after, "txt-row-name").as_deref(),
+                Some("row name cell"),
+                "the row's own value must be untouched:\n{}",
+                after.tree_text()
+            );
+            assert!(
+                !after.tree_text().contains(text),
+                "the keystrokes landed somewhere while the reply said nothing did:\n{}",
+                after.tree_text()
+            );
         },
     );
 }

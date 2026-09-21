@@ -398,17 +398,73 @@ pub(crate) fn resolve_bundle_id_to_locator(bundle_id: &str) -> Option<AppLocator
     }
 }
 
+/// Where a bare app name is looked up, in precedence order.
+///
+/// `/Applications` first so a name a user install and an OS app both answer
+/// to resolves to the one the user put there; system roots after it, home
+/// roots last. `/System/Library/CoreServices` is where macOS files the UI
+/// apps that are part of the system itself rather than of the shipped app
+/// set, so a lookup that stops at the `Applications` roots answers "not
+/// installed" for apps that are running in front of the caller.
+fn app_bundle_search_roots(home: &str) -> Vec<String> {
+    vec![
+        "/Applications".to_owned(),
+        "/System/Applications".to_owned(),
+        "/System/Applications/Utilities".to_owned(),
+        "/System/Library/CoreServices".to_owned(),
+        "/System/Library/CoreServices/Applications".to_owned(),
+        "/Applications/Utilities".to_owned(),
+        format!("{home}/Applications"),
+        format!("{home}/Applications/Chrome Apps.localized"),
+    ]
+}
+
+/// The running application a bare display name names, if exactly one does.
+///
+/// `NSRunningApplication` publishes the same localized name the window roster
+/// reports, which is the name a caller has in hand. The match is exact
+/// (case-insensitive): a substring match would answer "Safari" with "Safari
+/// Technology Preview". Two processes of one app share a bundle id and still
+/// name one application to launch; two different bundle ids under one display
+/// name do not, and the caller has to say which by bundle id or path.
+fn running_app_matching_display_name<'a>(apps: &'a [AppInfo], name: &str) -> Option<&'a AppInfo> {
+    let wanted = name.strip_suffix(".app").unwrap_or(name);
+    let mut matched = apps
+        .iter()
+        .filter(|app| app.name.eq_ignore_ascii_case(wanted));
+    let first = matched.next()?;
+    let ambiguous = matched.any(|other| other.bundle_id != first.bundle_id);
+    (!ambiguous).then_some(first)
+}
+
+/// Resolve a display name through the applications that are actually running.
+///
+/// The canonical roots are where installed apps are usually filed, not where
+/// they must be: a system UI app lives outside them and a Cryptex-installed
+/// one lives under `/System/Cryptexes/App`, so a root scan alone cannot find
+/// either by name. A running process carries both of the facts that do
+/// resolve it — its bundle id, which goes back through
+/// `URLForApplicationWithBundleIdentifier` so the launch keeps the live
+/// NSURL, and its bundle URL as the fallback when it publishes no bundle id.
+fn locate_running_by_display_name(name: &str) -> Option<AppLocator> {
+    let apps = list_running_apps();
+    let app = running_app_matching_display_name(&apps, name)?;
+    app.bundle_id
+        .as_deref()
+        .and_then(resolve_bundle_id_to_locator)
+        .or_else(|| app.launch_path.clone().map(AppLocator::Path))
+}
+
 /// Mirror of Swift's `AppLauncher.locate(name:)`.
 ///
 /// 1. filesystem lookup by bundle filename in the canonical roots
-///    (system first so /Applications wins over ~/Applications);
+///    ([`app_bundle_search_roots`]);
 /// 2. LaunchServices bundle-id lookup, in case the caller passed a
 ///    bundle identifier in the `name` slot — preserved as
 ///    `AppLocator::BundleId` so the launch path uses the live NSURL
 ///    (Cryptex-safe — see CodeRabbit #3);
-/// 3. (skipped) full localized-name scan — not yet needed by current
-///    integration tests; can be added if we hit a non-English-name app
-///    in the wild.
+/// 3. the running applications' own localized names, which is how an app
+///    whose bundle is filed outside every canonical root is named at all.
 pub(crate) fn locate_by_name(name: &str) -> Option<AppLocator> {
     // Explicit bundle paths are exact targets, not names to append to every
     // search root or reinterpret as a bundle ID. Keep the selected path even
@@ -436,15 +492,7 @@ pub(crate) fn locate_by_name(name: &str) -> Option<AppLocator> {
         format!("{name}.app")
     };
     let home = std::env::var("HOME").unwrap_or_default();
-    let roots = [
-        "/Applications".to_owned(),
-        "/System/Applications".to_owned(),
-        "/System/Applications/Utilities".to_owned(),
-        "/Applications/Utilities".to_owned(),
-        format!("{home}/Applications"),
-        format!("{home}/Applications/Chrome Apps.localized"),
-    ];
-    for root in &roots {
+    for root in app_bundle_search_roots(&home) {
         let path = format!("{root}/{app_name}");
         if std::path::Path::new(&path).is_dir() {
             return Some(AppLocator::Path(path));
@@ -453,7 +501,10 @@ pub(crate) fn locate_by_name(name: &str) -> Option<AppLocator> {
     // Fallback: maybe caller passed a bundle id as `name`. Use the
     // Cryptex-safe locator (carries the bundle id, never the lossy
     // url.path()).
-    resolve_bundle_id_to_locator(name)
+    if let Some(locator) = resolve_bundle_id_to_locator(name) {
+        return Some(locator);
+    }
+    locate_running_by_display_name(name)
 }
 
 /// Read `CFBundleIdentifier` from an `.app` bundle's `Info.plist`.
@@ -775,7 +826,92 @@ pub fn format_app_list(apps: &[AppInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{finder_folder_handoff, locate_by_name, unix_secs_to_rfc3339, AppLocator};
+    use super::{
+        app_bundle_search_roots, finder_folder_handoff, locate_by_name,
+        running_app_matching_display_name, unix_secs_to_rfc3339, AppInfo, AppLocator,
+    };
+
+    fn running(name: &str, pid: i32, bundle_id: Option<&str>, path: Option<&str>) -> AppInfo {
+        AppInfo {
+            name: name.to_owned(),
+            pid,
+            bundle_id: bundle_id.map(str::to_owned),
+            running: true,
+            active: false,
+            launch_path: path.map(str::to_owned),
+            kind: Some("desktop".to_owned()),
+            last_used: None,
+        }
+    }
+
+    /// A name-only lookup that scans the `Applications` roots alone reports
+    /// "no installed app found" for the UI apps macOS files under
+    /// `/System/Library/CoreServices`, which are the ones always running in
+    /// front of the caller.
+    #[test]
+    fn the_search_roots_cover_the_system_ui_apps_root() {
+        let roots = app_bundle_search_roots("/Users/fixture");
+        assert!(
+            roots.iter().any(|root| root == "/System/Library/CoreServices"),
+            "{roots:?}"
+        );
+        let applications = roots
+            .iter()
+            .position(|root| root == "/Applications")
+            .expect("the user root");
+        let home = roots
+            .iter()
+            .position(|root| root == "/Users/fixture/Applications")
+            .expect("the home root");
+        assert!(applications < home, "system roots win over home ones: {roots:?}");
+    }
+
+    /// The bundle a display name resolves to is the running process's, so an
+    /// app whose bundle is filed outside every canonical root is still
+    /// nameable. Exact, case-insensitive: a substring match would answer a
+    /// name with a longer app that merely starts the same way.
+    #[test]
+    fn a_display_name_resolves_to_the_one_running_app_that_carries_it() {
+        let apps = [
+            running("Fixture", 11, Some("dev.omp.fixture"), Some("/x/Fixture.app")),
+            running(
+                "Fixture Technology Preview",
+                12,
+                Some("dev.omp.fixture.preview"),
+                Some("/x/Preview.app"),
+            ),
+        ];
+        let matched = running_app_matching_display_name(&apps, "fixture").expect("exact match");
+        assert_eq!(matched.pid, 11);
+        assert_eq!(
+            running_app_matching_display_name(&apps, "Fixture.app")
+                .map(|app| app.pid)
+                .expect("the .app suffix is the same name"),
+            11
+        );
+        assert!(running_app_matching_display_name(&apps, "Fix").is_none());
+        assert!(running_app_matching_display_name(&apps, "").is_none());
+    }
+
+    /// Two processes of one app name one application to launch; two different
+    /// applications wearing one display name name none, and saying so beats
+    /// launching whichever came back first.
+    #[test]
+    fn one_display_name_over_two_different_applications_resolves_to_neither() {
+        let same = [
+            running("Fixture", 11, Some("dev.omp.fixture"), None),
+            running("Fixture", 12, Some("dev.omp.fixture"), None),
+        ];
+        assert_eq!(
+            running_app_matching_display_name(&same, "Fixture").map(|app| app.pid),
+            Some(11)
+        );
+        let different = [
+            running("Fixture", 11, Some("dev.omp.fixture"), None),
+            running("Fixture", 12, Some("dev.omp.other"), None),
+        ];
+        assert!(running_app_matching_display_name(&different, "Fixture").is_none());
+    }
 
     #[test]
     fn explicit_app_paths_resolve_exactly_without_name_or_bundle_fallback() {

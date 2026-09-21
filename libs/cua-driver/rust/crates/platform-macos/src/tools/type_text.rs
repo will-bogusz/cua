@@ -470,6 +470,7 @@ impl Tool for TypeTextTool {
                     &outcome.detail,
                     outcome.path,
                     caret_placed.as_ref(),
+                    outcome.target_focused,
                 )
             }
             Ok(Ok(outcome)) => {
@@ -480,6 +481,7 @@ impl Tool for TypeTextTool {
                     delivered_chars,
                     destination_resolved,
                     normalized,
+                    target_focused: _,
                 } = outcome;
                 // SURFACE-AWARE VERIFICATION. On any web-content surface —
                 // Chromium/WebKit/Electron — AXValue is not independent renderer
@@ -881,6 +883,14 @@ fn no_destination_note(pid: i32, window_id: Option<u32>) -> String {
 /// The undelivered remainder is spelled out. A caller that is told only to
 /// "retry the remaining suffix" has to slice the request by codepoint and
 /// guess where the caret stopped; the driver already knows both.
+///
+/// Zero characters at an element that never took keyboard focus is a
+/// different finding wearing the same shape. Nothing landed, and re-sending
+/// the same call cannot change that: the keystrokes went wherever the
+/// window's real first responder is, and a row that only displays text has
+/// no editor to send them to. So no remainder is offered — the reply states
+/// what the focus probe observed and names the routes that do not need
+/// focus, in the words `set_value` already uses for the same state.
 fn incomplete_result(
     text: &str,
     requested_chars: usize,
@@ -888,7 +898,35 @@ fn incomplete_result(
     detail: &str,
     path: &'static str,
     caret_placed: Option<&CaretPlacement>,
+    target_focused: Option<bool>,
 ) -> ToolResult {
+    let unfocusable = delivered_chars == 0 && target_focused == Some(false);
+    let mut structured = serde_json::json!({
+        "code": "type_text_incomplete",
+        "path": path,
+        // Contract 0.10 `effect` vocabulary: an insert that delivered part of
+        // its payload is `partial`; one that dispatched and left the target
+        // exactly as it was is `suspected_noop`, never `partial`.
+        "effect": if unfocusable { "suspected_noop" } else { "partial" },
+        "requested_chars": requested_chars,
+        "delivered_chars": delivered_chars,
+        "retryable": !unfocusable,
+    });
+    if let Some(focused) = target_focused {
+        structured["target_focused"] = serde_json::json!(focused);
+    }
+    if let Some(placement) = caret_placed {
+        placement.attach_evidence(&mut structured);
+    }
+    if unfocusable {
+        return ToolResult::error(format!(
+            "type_text incomplete: delivered 0 of {requested_chars} character(s){detail}; the \
+             addressed element did not take keyboard focus, so typed keystrokes cannot be proven \
+             to reach it: click the control first, write it with set_value, or retry with \
+             delivery_mode \"foreground\". A row that only displays text is not an editor"
+        ))
+        .with_structured(structured);
+    }
     let remainder: String = text.chars().skip(delivered_chars).collect();
     // A placed caret now sits after the delivered prefix; re-sending the
     // same anchor would put the remainder in front of it.
@@ -897,19 +935,8 @@ fn incomplete_result(
     } else {
         ""
     };
-    let mut structured = serde_json::json!({
-        "code": "type_text_incomplete",
-        "path": path,
-        "effect": "partial",
-        "requested_chars": requested_chars,
-        "delivered_chars": delivered_chars,
-        "retryable": true,
-        "retry_from_character": delivered_chars,
-        "retry_text": remainder,
-    });
-    if let Some(placement) = caret_placed {
-        placement.attach_evidence(&mut structured);
-    }
+    structured["retry_from_character"] = serde_json::json!(delivered_chars);
+    structured["retry_text"] = serde_json::json!(remainder);
     ToolResult::error(format!(
         "type_text incomplete: delivered {delivered_chars} of {requested_chars} \
          character(s){detail}; retry with text: {remainder:?}{caret_note}"
@@ -1210,10 +1237,39 @@ fn web_readback_next_rung(is_electron: bool, used_pixel_focus: bool) -> Option<&
 const DELIVERY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const DELIVERY_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Pause before the single `AXFocused` re-apply in the foreground rung. Covers
-/// an app that installs its own first responder just after activation is
+/// Pause before the single `AXFocused` re-apply every rung makes. Covers an
+/// app that installs its own first responder just after activation is
 /// observable, which would otherwise clobber the first write.
 const FOCUS_REAPPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Request keyboard focus for an addressed element and report whether the
+/// application actually gave it.
+///
+/// `AXFocused` is a request, not a fact: a display-only row — a list or table
+/// name cell — accepts the write and stays unfocused, and keystrokes then land
+/// wherever the window's real first responder is. AppKit can also install the
+/// window's remembered first responder just after the write, so one re-apply
+/// separates that race from a target that cannot take focus at all. Same two
+/// steps `set_value`'s retype route takes before it refuses.
+fn take_keyboard_focus(pid: i32, element_ptr: usize) -> bool {
+    let _ = crate::input::ax_actions::focus_element(element_ptr);
+    if crate::input::ax_actions::is_element_focused(pid, element_ptr) {
+        return true;
+    }
+    std::thread::sleep(FOCUS_REAPPLY_DELAY);
+    let _ = crate::input::ax_actions::focus_element(element_ptr);
+    crate::input::ax_actions::is_element_focused(pid, element_ptr)
+}
+
+/// What a keystroke rung did: the read-back it settled on, and whether the
+/// addressed element held keyboard focus while the keystrokes went out.
+/// `target_focused` is `None` when the call addressed no element, so focus
+/// was never requested and nothing observed it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct KeystrokeRung {
+    delivery: TypedDelivery,
+    target_focused: Option<bool>,
+}
 
 /// Keyboard-rung policy for one window-addressed background insert, decided
 /// once by the pure exact-target core before any input is posted.
@@ -1227,6 +1283,52 @@ enum BackgroundKeyboardPolicy {
     /// process-scoped CGEvent rung is refused with this refusal — carried so
     /// the exact reason is returned if the AX write does not land.
     SemanticOnly(BackgroundRefusal),
+}
+
+/// The refusal for a window-addressed insert whose only permitted rung — the
+/// semantic `AXSelectedText` write on the addressed element — did not land.
+///
+/// The gate's reason says why process-scoped keystrokes may not be posted and
+/// advises an exact element action, which is the call that just ran: returned
+/// verbatim it reads as advice to do what was already done (measured on a
+/// Save-panel search field, where the reply was the same sentence the caller
+/// had just followed). So the refusal also states what the attempt observed
+/// and names the element route that is still untried — `set_value`, which
+/// writes the element's own `AXValue` and fires the control's end-of-edit
+/// gesture instead of editing a field editor. `advice` is left exactly as the
+/// core decided it: the route class did not change, only what is known about
+/// it.
+fn semantic_only_refusal(
+    refusal: BackgroundRefusal,
+    ax_attempt: AxAttempt,
+    target_focused: Option<bool>,
+) -> BackgroundRefusal {
+    let observed = match (ax_attempt, target_focused) {
+        (AxAttempt::Rejected, _) => "the application rejected an AXSelectedText write at it",
+        (AxAttempt::Unchanged, _) => "an AXSelectedText write at it left the element's value unchanged",
+        (AxAttempt::Unverifiable, _) => {
+            "an AXSelectedText write at it was accepted and the element publishes no readable \
+             value to prove it"
+        }
+        // Nothing was written: the element never took keyboard focus, so the
+        // insert had no field editor to edit.
+        (AxAttempt::NotAttempted, Some(false)) => {
+            "the element did not take keyboard focus, so no insert was attempted"
+        }
+        // No element was addressed at all, so nothing about this element was
+        // tried and the gate's own reason is the whole story.
+        (AxAttempt::NotAttempted, _) => return refusal,
+    };
+    BackgroundRefusal {
+        code: refusal.code,
+        reason: format!(
+            "{} — the addressed element was already the target of this call: {observed}. The \
+             exact element action still untried is set_value, which writes that element's own \
+             AXValue",
+            refusal.reason
+        ),
+        advice: refusal.advice,
+    }
 }
 
 /// Delivery envelope for `type_text_blocking`: either an actuator ran
@@ -1299,6 +1401,10 @@ struct TypeTextOutcome {
     /// Whether a text destination resolved at all. `false` means the
     /// keystrokes were posted with nothing to focus and no value to read.
     destination_resolved: bool,
+    /// Whether the addressed element held keyboard focus when the text went
+    /// out. `None` when no element was addressed, so focus was never asked
+    /// for: zero delivered characters then say nothing about focus.
+    target_focused: Option<bool>,
     /// Every requested character arrived but the field holds something else:
     /// the application normalised the input.
     normalized: bool,
@@ -1427,15 +1533,24 @@ fn read_axvalue_bound(
 /// Read the addressed element and the window's focused element, then keep the
 /// stronger reading — focus can only contribute evidence when it provably
 /// resolves inside the requested window.
+///
+/// `focus_may_substitute` is false once the addressed element has been
+/// observed to refuse keyboard focus. The focused element is then provably
+/// some other control, not a field editor standing in for this one, and its
+/// value is evidence about it and nothing else: counting it reports a write
+/// as confirmed at a row that took none, which is how a Finder row-name cell
+/// answered a 0-of-8 insert with the text that had landed in a neighbouring
+/// editor.
 fn read_typed_value(
     pid: i32,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
     before: Option<&str>,
     text: &str,
+    focus_may_substitute: bool,
 ) -> Option<String> {
     let addressed = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
-    if element_ptr_and_idx.is_none() {
+    if element_ptr_and_idx.is_none() || !focus_may_substitute {
         return addressed;
     }
     if matches!(
@@ -1551,6 +1666,11 @@ pub(super) fn target_in_web_area(
 /// Type via CGEvent keystrokes at the current insertion point, then verify by
 /// read-back. `type_text` is deliberately non-idempotent: it must never clear
 /// an existing value merely because AX cannot read that value back.
+///
+/// `focus_known` is the focus the caller already observed on this element, so
+/// the AX rung's probe is not repeated: a target that refused focus there
+/// will refuse it here, and one that took it still holds it.
+#[allow(clippy::too_many_arguments)]
 fn cgevent_type_verified(
     pid: i32,
     text: &str,
@@ -1559,24 +1679,23 @@ fn cgevent_type_verified(
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
     window_id: Option<u32>,
-) -> anyhow::Result<TypedDelivery> {
+    focus_known: Option<bool>,
+) -> anyhow::Result<KeystrokeRung> {
     // Focus the target element so the keystrokes land in IT. Critical in
     // foreground mode: a freshly-fronted window's keyboard focus may be on the
     // search box or nowhere, so without this the text goes into the void (or the
-    // wrong field). AXFocused is best-effort — harmless when unsupported.
+    // wrong field). The request can be declined, and whether it was is the
+    // whole difference between an insertion that stopped part-way and one that
+    // never had anywhere to go, so the answer is carried out of here.
     //
     // Ordering matters as much as the write itself. `with_foreground_assist` has
     // already waited for the activation to land, so AppKit has installed the
     // window's remembered first responder by now and this write lands *after*
     // it rather than being clobbered by it. Re-applying once on a failed
     // read-back covers apps that install their responder slightly late.
-    if let Some((ptr, _)) = element_ptr_and_idx {
-        let _ = crate::input::ax_actions::focus_element(ptr);
-        if settle_ms > 0 && !crate::input::ax_actions::is_element_focused(pid, ptr) {
-            std::thread::sleep(FOCUS_REAPPLY_DELAY);
-            let _ = crate::input::ax_actions::focus_element(ptr);
-        }
-    }
+    let target_focused = focus_known.or_else(|| {
+        element_ptr_and_idx.map(|(ptr, _)| take_keyboard_focus(pid, ptr))
+    });
     // First-keystroke settle (foreground rung only — caller passes `settle_ms > 0`).
     // Even once the window is front and the element focused, the surface isn't
     // ready to accept input for a few tens of ms, so the FIRST synthesized
@@ -1586,12 +1705,24 @@ fn cgevent_type_verified(
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
-    type_and_drain(pid, text, delay_ms, before, element_ptr_and_idx, window_id)
+    Ok(KeystrokeRung {
+        delivery: type_and_drain_from(
+            pid,
+            text,
+            delay_ms,
+            before,
+            element_ptr_and_idx,
+            window_id,
+            /*focus_may_substitute=*/ target_focused != Some(false),
+        )?,
+        target_focused,
+    })
 }
 
 /// Post the keystrokes and wait for the target's read-back to settle. Shared
 /// with `set_value`, which establishes focus and the replaced selection itself
-/// and must not have either re-applied underneath it.
+/// and must not have either re-applied underneath it — and which therefore
+/// always reads back with the field editor allowed to stand in for the field.
 pub(super) fn type_and_drain(
     pid: i32,
     text: &str,
@@ -1599,6 +1730,27 @@ pub(super) fn type_and_drain(
     before: Option<&str>,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
+) -> anyhow::Result<TypedDelivery> {
+    type_and_drain_from(
+        pid,
+        text,
+        delay_ms,
+        before,
+        element_ptr_and_idx,
+        window_id,
+        /*focus_may_substitute=*/ true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_and_drain_from(
+    pid: i32,
+    text: &str,
+    delay_ms: u64,
+    before: Option<&str>,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    window_id: Option<u32>,
+    focus_may_substitute: bool,
 ) -> anyhow::Result<TypedDelivery> {
     crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
 
@@ -1609,7 +1761,14 @@ pub(super) fn type_and_drain(
     // expires after observable growth, surface the exact partial count.
     let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
     Ok(await_typed_delivery(before, text, deadline, || {
-        read_typed_value(pid, element_ptr_and_idx, window_id, before, text)
+        read_typed_value(
+            pid,
+            element_ptr_and_idx,
+            window_id,
+            before,
+            text,
+            focus_may_substitute,
+        )
     }))
 }
 
@@ -1801,9 +1960,10 @@ fn type_text_blocking(
                 destination,
                 foreground_settle_ms,
                 window_id,
+                /*focus_known=*/ None,
             )
         };
-        let (delivery, fronted) = match window_id {
+        let (rung, fronted) = match window_id {
             Some(wid) if screen_sharing_target => {
                 // Screen Sharing forwards physical HID transitions to the
                 // guest. PID-routed Unicode events all carry keycode 0 (the A
@@ -1823,14 +1983,14 @@ fn type_text_blocking(
                         crate::input::keyboard::type_text_physical_global(text, delay_ms)
                     },
                 )?;
-                (TypedDelivery::default(), true)
+                (KeystrokeRung::default(), true)
             }
             Some(wid) => {
                 // Front → type → restore. The closure returns the read-back
                 // result; with_foreground_assist returns whether it actually
                 // fronted (Ok(false) when the fronting SPIs are unavailable —
                 // the keystrokes still ran, just as background input).
-                let mut typed_delivery = TypedDelivery::default();
+                let mut typed_delivery = KeystrokeRung::default();
                 let fronted = crate::input::skylight::with_foreground_assist(
                     pid as libc::pid_t,
                     wid,
@@ -1854,10 +2014,11 @@ fn type_text_blocking(
             } else {
                 PATH_KEY_EVENTS
             },
-            delivered_chars: delivery.delivered,
-            verified: delivery.verified,
-            normalized: delivery.normalized,
+            delivered_chars: rung.delivery.delivered,
+            verified: rung.delivery.verified,
+            normalized: rung.delivery.normalized,
             destination_resolved: destination.is_some(),
+            target_focused: rung.target_focused,
         }));
     }
 
@@ -1884,7 +2045,7 @@ fn type_text_blocking(
             "type_text: pid {pid} is a terminal emulator; skipping AX value-set, \
              using CGEvent key-event synthesis"
         );
-        let delivery = cgevent_type_verified(
+        let rung = cgevent_type_verified(
             pid,
             text,
             delay_ms,
@@ -1892,14 +2053,16 @@ fn type_text_blocking(
             target,
             /*settle_ms=*/ 0,
             window_id,
+            /*focus_known=*/ None,
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
             path: PATH_KEY_EVENTS,
-            verified: delivery.verified,
-            delivered_chars: delivery.delivered,
-            normalized: delivery.normalized,
+            verified: rung.delivery.verified,
+            delivered_chars: rung.delivery.delivered,
+            normalized: rung.delivery.normalized,
             destination_resolved,
+            target_focused: rung.target_focused,
         }));
     }
 
@@ -1907,7 +2070,16 @@ fn type_text_blocking(
     let ax_target: Option<(AXUIElementRef, Option<usize>)> =
         target.map(|(ptr, idx)| (ptr as AXUIElementRef, idx));
     let mut ax_attempt = AxAttempt::NotAttempted;
-    if let Some((element, idx_opt)) = ax_target {
+    // `AXSelectedText` edits the field editor the application installs around
+    // whichever control holds keyboard focus. Written at an unfocused element
+    // it either replaces a selection in a field the app is not editing — so
+    // the app's own change and end-of-edit notifications never run, and a
+    // search field ends up holding a query it never executed — or it is
+    // refused outright. Take focus first, exactly as the keystroke rung does,
+    // for every text role: a target that will not take focus gets no write at
+    // all, and the keystroke rung below reports where the keystrokes went.
+    let target_focused = ax_target.map(|(element, _)| take_keyboard_focus(pid, element as usize));
+    if let (Some((element, idx_opt)), Some(true)) = (ax_target, target_focused) {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
@@ -1934,6 +2106,9 @@ fn type_text_blocking(
                         window_id,
                         before.as_deref(),
                         text,
+                        // This rung only runs on a target that took focus, so
+                        // the field editor standing in for it is this field.
+                        /*focus_may_substitute=*/ true,
                     )
                 },
             ))
@@ -1954,6 +2129,7 @@ fn type_text_blocking(
                 delivered_chars: Some(text.chars().count()),
                 destination_resolved: true,
                 normalized: false,
+                target_focused,
             }));
         }
         if let Some(TypedProgress::Normalized(delivered_chars)) = ax_progress {
@@ -1964,6 +2140,7 @@ fn type_text_blocking(
                 delivered_chars: Some(delivered_chars),
                 destination_resolved: true,
                 normalized: true,
+                target_focused,
             }));
         }
         if let Some(TypedProgress::Partial(delivered_chars)) = ax_progress {
@@ -1974,6 +2151,7 @@ fn type_text_blocking(
                 delivered_chars: Some(delivered_chars),
                 destination_resolved: true,
                 normalized: false,
+                target_focused,
             }));
         }
         ax_attempt = match ax_progress {
@@ -1989,15 +2167,27 @@ fn type_text_blocking(
             "AX write did not land for {role} \"{title}\" (err={err}); \
              falling back to CGEvent keystrokes"
         );
-    } else {
+    } else if ax_target.is_none() {
         tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
+    } else {
+        tracing::debug!(
+            "the addressed element did not take keyboard focus; skipping the AX write \
+             and falling through to CGEvent keystrokes"
+        );
     }
 
     // The semantic AX rung did not land and this request is restricted to it:
     // the process-scoped CGEvent rung could reach a sibling window, so return
-    // the structured refusal instead of escalating.
+    // the structured refusal instead of escalating. The gate's own reason says
+    // why keystrokes may not be posted and advises the exact element action —
+    // which is the call that just ran, so the refusal also states what that
+    // attempt observed and names the element route that is still untried.
     if let BackgroundKeyboardPolicy::SemanticOnly(refusal) = keyboard_policy {
-        return Ok(TypeTextDelivery::Refused(refusal));
+        return Ok(TypeTextDelivery::Refused(semantic_only_refusal(
+            refusal,
+            ax_attempt,
+            target_focused,
+        )));
     }
 
     if let Some(refusal) = synthesis_preflight(
@@ -2015,7 +2205,7 @@ fn type_text_blocking(
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
-    let delivery = cgevent_type_verified(
+    let rung = cgevent_type_verified(
         pid,
         text,
         delay_ms,
@@ -2023,14 +2213,16 @@ fn type_text_blocking(
         target,
         /*settle_ms=*/ 0,
         window_id,
+        target_focused,
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
         path: PATH_KEY_EVENTS,
-        verified: delivery.verified,
-        delivered_chars: delivery.delivered,
-        normalized: delivery.normalized,
+        verified: rung.delivery.verified,
+        delivered_chars: rung.delivery.delivered,
+        normalized: rung.delivery.normalized,
         destination_resolved,
+        target_focused: rung.target_focused,
     }))
 }
 
@@ -2542,8 +2734,15 @@ mod tests {
     #[test]
     fn an_incomplete_insertion_spells_the_undelivered_remainder() {
         let text = "(408) 961-1560";
-        let result =
-            incomplete_result(text, text.chars().count(), 6, " via CGEvent", PATH_AX, None);
+        let result = incomplete_result(
+            text,
+            text.chars().count(),
+            6,
+            " via CGEvent",
+            PATH_AX,
+            None,
+            Some(true),
+        );
         let structured = result
             .structured_content
             .clone()
@@ -2565,10 +2764,164 @@ mod tests {
     #[test]
     fn the_remainder_is_sliced_by_character() {
         let text = "Ωcafé-tail";
-        let result = incomplete_result(text, text.chars().count(), 5, "", PATH_KEY_EVENTS, None);
+        let result = incomplete_result(
+            text,
+            text.chars().count(),
+            5,
+            "",
+            PATH_KEY_EVENTS,
+            None,
+            Some(true),
+        );
         assert_eq!(
             result.structured_content.expect("payload")["retry_text"],
             serde_json::json!("-tail")
+        );
+    }
+
+    fn incomplete_payload(
+        requested: usize,
+        delivered: usize,
+        target_focused: Option<bool>,
+    ) -> (Value, String) {
+        let text = "Invoices";
+        assert_eq!(text.chars().count(), requested, "fixture length");
+        let result = incomplete_result(
+            text,
+            requested,
+            delivered,
+            " via foreground keystrokes (0ms delay)",
+            PATH_KEY_EVENTS_FG,
+            None,
+            target_focused,
+        );
+        let message = match &result.content[0] {
+            cua_driver_core::protocol::Content::Text { text, .. } => text.clone(),
+            other => panic!("expected a text reply, got {other:?}"),
+        };
+        (
+            result.structured_content.expect("incomplete payload"),
+            message,
+        )
+    }
+
+    /// Nothing landed at an element the focus probe watched refuse focus:
+    /// the keystrokes went to whatever the window's real first responder is,
+    /// so the same call cannot land either. Measured on a Finder row name
+    /// cell, where `retryable: true` plus a remainder bought two identical
+    /// retries of a 0-of-8 insert before the run gave up on the route.
+    #[test]
+    fn zero_delivered_at_an_element_that_refused_focus_is_not_retryable() {
+        let (payload, message) = incomplete_payload(8, 0, Some(false));
+        assert_eq!(payload["retryable"], serde_json::json!(false));
+        assert_eq!(payload["target_focused"], serde_json::json!(false));
+        assert_eq!(payload["effect"], serde_json::json!("suspected_noop"));
+        assert!(
+            payload["retry_text"].is_null() && payload["retry_from_character"].is_null(),
+            "a route that cannot land must offer no remainder: {payload}"
+        );
+        assert!(
+            message.contains("did not take keyboard focus"),
+            "the reply must say what the focus probe observed: {message}"
+        );
+        assert!(
+            message.contains("set_value") && message.contains("not an editor"),
+            "the reply must name the routes that need no focus: {message}"
+        );
+        assert!(
+            message.contains("delivered 0 of 8 character(s)"),
+            "the count stays honest: {message}"
+        );
+    }
+
+    /// Characters that did arrive make a retry meaningful whatever the focus
+    /// probe said, so the remainder is still spelled out.
+    #[test]
+    fn a_partial_delivery_stays_retryable_even_at_an_unfocused_element() {
+        let (payload, message) = incomplete_payload(8, 3, Some(false));
+        assert_eq!(payload["retryable"], serde_json::json!(true));
+        assert_eq!(payload["retry_text"], serde_json::json!("oices"));
+        assert_eq!(payload["effect"], serde_json::json!("partial"));
+        assert!(message.contains("oices"), "{message}");
+    }
+
+    /// A focused element that took nothing is a different state: the field is
+    /// the app's own editing target, so re-sending the text can still land.
+    #[test]
+    fn zero_delivered_at_a_focused_element_keeps_the_retry() {
+        let (payload, _) = incomplete_payload(8, 0, Some(true));
+        assert_eq!(payload["retryable"], serde_json::json!(true));
+        assert_eq!(payload["retry_text"], serde_json::json!("Invoices"));
+        assert_eq!(payload["target_focused"], serde_json::json!(true));
+    }
+
+    /// A pid-addressed insert requested no focus, so nothing observed it and
+    /// the reply claims nothing about it.
+    #[test]
+    fn zero_delivered_with_no_addressed_element_claims_nothing_about_focus() {
+        let (payload, _) = incomplete_payload(8, 0, None);
+        assert_eq!(payload["retryable"], serde_json::json!(true));
+        assert_eq!(payload["retry_text"], serde_json::json!("Invoices"));
+        assert!(
+            payload["target_focused"].is_null(),
+            "unrequested focus is not a fact: {payload}"
+        );
+    }
+
+    fn ambiguity_refusal() -> BackgroundRefusal {
+        BackgroundRefusal {
+            code: cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+            reason: "pid 76392 owns 1 other eligible top-level window(s); process-scoped key \
+                     events cannot be proven to reach window 30712. Address the field itself \
+                     with an exact element action, or request foreground delivery"
+                .into(),
+            advice: Some(cua_driver_core::background_input::BackgroundAdvice::Element),
+        }
+    }
+
+    /// The gate advises an exact element action, which is the call that just
+    /// ran. Returned verbatim it told a Save-panel search field to do what it
+    /// had already done; the refusal has to add what the attempt observed and
+    /// which element route is still untried.
+    #[test]
+    fn a_rejected_ax_write_names_what_was_tried_and_the_set_value_route() {
+        let refusal = semantic_only_refusal(ambiguity_refusal(), AxAttempt::Rejected, Some(true));
+        assert_eq!(refusal.code, ambiguity_refusal().code);
+        assert_eq!(refusal.advice, ambiguity_refusal().advice);
+        assert!(
+            refusal.reason.contains("rejected an AXSelectedText write"),
+            "{}",
+            refusal.reason
+        );
+        assert!(refusal.reason.contains("set_value"), "{}", refusal.reason);
+        assert!(
+            refusal.reason.starts_with(&ambiguity_refusal().reason),
+            "the gate's own cause survives verbatim: {}",
+            refusal.reason
+        );
+    }
+
+    /// No write was attempted because the element never took focus: say that,
+    /// not that the application rejected something.
+    #[test]
+    fn an_unfocusable_target_says_no_insert_was_attempted() {
+        let refusal =
+            semantic_only_refusal(ambiguity_refusal(), AxAttempt::NotAttempted, Some(false));
+        assert!(
+            refusal.reason.contains("did not take keyboard focus")
+                && refusal.reason.contains("no insert was attempted"),
+            "{}",
+            refusal.reason
+        );
+    }
+
+    /// Nothing was addressed, so nothing about an element was tried and the
+    /// gate's reason is the whole story.
+    #[test]
+    fn a_refusal_with_no_attempt_behind_it_is_unchanged() {
+        assert_eq!(
+            semantic_only_refusal(ambiguity_refusal(), AxAttempt::NotAttempted, None),
+            ambiguity_refusal()
         );
     }
 
