@@ -7,6 +7,12 @@ pub const SYSTEM_OVERLAY_KIND: &str = "system_overlay";
 /// application window, but a surface a caller may read through
 /// `get_window_state`.
 pub const DESKTOP_KIND: &str = "desktop";
+/// A window the application reports modal (`AXModal`): while it is up, no
+/// other window of that process accepts input, so a caller addressing one of
+/// them is addressing a window that cannot answer. Read from the
+/// accessibility roster, so it appears only when accessibility metadata was
+/// requested — a CGWindow row alone cannot say whether a window is modal.
+pub const APP_MODAL_KIND: &str = "app-modal";
 
 const INDICATOR_PROVIDER_EXECUTABLE: &str = "/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService";
 

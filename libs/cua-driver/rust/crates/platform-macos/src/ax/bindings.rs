@@ -476,10 +476,61 @@ pub unsafe fn copy_binary_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// and the wider structured control-state response.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StringishAttrValue {
-    /// Present only when the source value was a CFString.
+    /// Present when the value has a faithful textual form of its own: a
+    /// CFString as-is, or a CFDate as its local ISO-8601 date-time. A number
+    /// or a boolean has no text the application itself displays, so it stays
+    /// out of the string-only surfaces.
     pub string_value: Option<String>,
-    /// CFString as-is, CFNumber as text, or CFBoolean as `"1"` / `"0"`.
+    /// CFString as-is, CFDate as local ISO-8601, CFNumber as text, or
+    /// CFBoolean as `"1"` / `"0"`.
     pub state_value: String,
+}
+
+/// CFDate's epoch — 2001-01-01 00:00:00 UTC — as Unix seconds.
+const CF_ABSOLUTE_TIME_UNIX_EPOCH: i64 = 978_307_200;
+
+/// Whole Unix seconds for a `CFAbsoluteTime`, floored so a fractional second
+/// never reports the following one. `None` for a value no calendar can hold.
+fn unix_seconds_for_absolute_time(absolute: f64) -> Option<i64> {
+    let seconds = absolute.floor();
+    if !seconds.is_finite() || seconds.abs() > 9.0e15 {
+        return None;
+    }
+    Some(seconds as i64 + CF_ABSOLUTE_TIME_UNIX_EPOCH)
+}
+
+/// The instant a date-bearing control holds, rendered as the local wall-clock
+/// date-time the control itself displays plus the UTC offset that makes it
+/// unambiguous (ISO 8601 / RFC 3339).
+///
+/// `AXDateTimeArea`, `AXDateField` and `AXTimeField` publish their value only
+/// as a `CFDate`: there is no `AXValue` string and commonly no
+/// `AXValueDescription`, so without this the control renders with no value at
+/// all and an agent cannot read the date it is about to change.
+fn local_iso8601(unix_seconds: i64) -> Option<String> {
+    let mut components: libc::tm = unsafe { std::mem::zeroed() };
+    let seconds = unix_seconds as libc::time_t;
+    if unsafe { libc::localtime_r(&seconds, &mut components) }.is_null() {
+        return None;
+    }
+    Some(format_local_iso8601(&components))
+}
+
+fn format_local_iso8601(components: &libc::tm) -> String {
+    let offset_minutes = components.tm_gmtoff / 60;
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let offset_minutes = offset_minutes.abs();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
+        components.tm_year + 1900,
+        components.tm_mon + 1,
+        components.tm_mday,
+        components.tm_hour,
+        components.tm_min,
+        components.tm_sec,
+        offset_minutes / 60,
+        offset_minutes % 60
+    )
 }
 
 /// Convert a borrowed CF value without taking ownership of it.
@@ -505,6 +556,14 @@ unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue>
         return Some(StringishAttrValue {
             string_value: None,
             state_value,
+        });
+    }
+    if type_id == core_foundation::date::CFDate::type_id() {
+        let date = core_foundation::date::CFDate::wrap_under_get_rule(value as _);
+        let rendered = unix_seconds_for_absolute_time(date.abs_time()).and_then(local_iso8601)?;
+        return Some(StringishAttrValue {
+            string_value: Some(rendered.clone()),
+            state_value: rendered,
         });
     }
     if type_id == CFBoolean::type_id() {
@@ -1340,6 +1399,67 @@ mod tests {
         let false_result = unsafe { coerce_stringish_value(false_value.as_CFTypeRef()) }.unwrap();
         assert_eq!(false_result.string_value, None);
         assert_eq!(false_result.state_value, "0");
+    }
+
+    /// A date-bearing control publishes its value only as a `CFDate`. The
+    /// coerced form is the local wall-clock date-time the control displays,
+    /// with its offset — and it counts as the value's own text, so the
+    /// string-only tree row shows it too.
+    #[test]
+    fn stringish_value_coerces_a_cfdate_to_a_local_iso8601_date_time() {
+        // 2026-09-25 00:00:00 UTC.
+        let date = core_foundation::date::CFDate::new(1_790_640_000.0 - 978_307_200.0 + 0.0);
+        let coerced = unsafe { coerce_stringish_value(date.as_CFTypeRef()) }.unwrap();
+        assert_eq!(coerced.string_value.as_deref(), Some(&*coerced.state_value));
+        let rendered = coerced.state_value;
+        assert_eq!(
+            rendered,
+            local_iso8601(1_790_640_000).unwrap(),
+            "the coerced value is the same instant the formatter renders"
+        );
+        assert!(
+            rendered.len() == "2026-09-25T00:00:00+00:00".len()
+                && rendered.as_bytes()[10] == b'T'
+                && (rendered.contains('+') || rendered[1..].contains('-')),
+            "not an offset-qualified ISO-8601 date-time: {rendered}"
+        );
+    }
+
+    /// The wall-clock fields and the offset are rendered exactly, zero-padded,
+    /// with the sign of a negative offset preserved: this string is what an
+    /// agent reads a date picker's value from.
+    #[test]
+    fn a_local_date_time_renders_zero_padded_with_its_offset() {
+        let mut components: libc::tm = unsafe { std::mem::zeroed() };
+        components.tm_year = 126; // 2026
+        components.tm_mon = 8; // September
+        components.tm_mday = 5;
+        components.tm_hour = 7;
+        components.tm_min = 3;
+        components.tm_sec = 9;
+        components.tm_gmtoff = -7 * 3600;
+        assert_eq!(
+            format_local_iso8601(&components),
+            "2026-09-05T07:03:09-07:00"
+        );
+
+        components.tm_gmtoff = 5 * 3600 + 30 * 60;
+        assert_eq!(
+            format_local_iso8601(&components),
+            "2026-09-05T07:03:09+05:30"
+        );
+    }
+
+    /// A `CFAbsoluteTime` is seconds since 2001, and a fractional second
+    /// belongs to the second it is inside — never the next one.
+    #[test]
+    fn absolute_time_converts_on_the_cfdate_epoch_and_floors() {
+        assert_eq!(unix_seconds_for_absolute_time(0.0), Some(978_307_200));
+        assert_eq!(unix_seconds_for_absolute_time(0.99), Some(978_307_200));
+        assert_eq!(unix_seconds_for_absolute_time(-1.0), Some(978_307_199));
+        assert_eq!(unix_seconds_for_absolute_time(-0.25), Some(978_307_199));
+        assert_eq!(unix_seconds_for_absolute_time(f64::NAN), None);
+        assert_eq!(unix_seconds_for_absolute_time(f64::INFINITY), None);
     }
 
     /// An element that reports no children is not the same as an element

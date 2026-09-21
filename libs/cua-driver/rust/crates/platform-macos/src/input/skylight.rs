@@ -752,26 +752,41 @@ pub fn with_foreground_assist(
 }
 
 /// Upper bound on how long [`with_foreground_assist`] waits for a requested
-/// activation to become observable. Chosen to cover a Catalyst app's activation
-/// plus key-window install; past this the caller proceeds anyway so a stubborn
-/// target degrades to the old behavior instead of hanging.
-const ACTIVATION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+/// activation to become observable, and how long a caller may give that same
+/// activation to re-enable a key-window-sensitive control. Chosen to cover a
+/// Catalyst app's activation plus key-window install; past this the caller
+/// proceeds anyway so a stubborn target degrades to the old behavior instead
+/// of hanging.
+pub const ACTIVATION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Poll interval for [`await_window_focused`]. Short enough that a fast native
 /// app pays roughly one tick, long enough not to spin on the WindowServer.
-const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+pub const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Block until `target_wid` is the application's focused AX window, or the
+/// Block until `target_wid` is observably the application's key window, or the
 /// timeout expires. Returns whether that state was observed.
 ///
-/// The predicate is deliberately `AXFocusedWindow` and not
-/// `NSWorkspace.frontmostApplication`. The latter does not observe a
-/// SkyLight-level front-process change at all: polling it every 15ms across a
-/// full foreground `type_text` against WhatsApp showed zero transitions while
-/// the target was demonstrably being fronted, so a frontmost-based wait always
-/// burns its whole timeout and never actually gates on anything. `AXFocusedWindow`
-/// is the same proof [`preserves_exact_existing_focus`] already trusts to decide
-/// whether a window is focused.
+/// The predicate is a conjunction and both halves are load-bearing:
+///
+/// - WindowServer's own front-process answer ([`front_process_matches`]). This
+///   is the half that observes the `set_front` above. It is deliberately not
+///   `NSWorkspace.frontmostApplication`, which does not observe a
+///   SkyLight-level front-process change at all: polling it every 15 ms across
+///   a full foreground `type_text` against WhatsApp showed zero transitions
+///   while the target was demonstrably being fronted. `None` means the SPI is
+///   unavailable — no evidence either way — so the AX half then decides alone.
+/// - `AXFocusedWindow == target`, the same proof
+///   [`preserves_exact_existing_focus`] already trusts to decide whether a
+///   window is focused.
+///
+/// Waiting on the AX half alone returns at once in the case this wait exists
+/// for: a window that already *was* its process's focused window while that
+/// process was not frontmost — the ordinary state of a backgrounded app's
+/// front window. `body()` then ran before AppKit installed the key window, so
+/// the body's `AXFocused` write raced the activation it was ordered behind and
+/// a key-window-sensitive control still read `AXEnabled=false`. Requiring the
+/// front-process transition makes the wait gate on the activation actually
+/// having happened.
 ///
 /// A `false` return is not fatal: the caller proceeds with delivery regardless,
 /// because a target that never reports focus is exactly the case the pre-existing
@@ -779,7 +794,7 @@ const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
     let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
     loop {
-        if crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id) {
+        if key_window_observable(pid, window_id) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -787,6 +802,14 @@ fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
         }
         std::thread::sleep(ACTIVATION_POLL_INTERVAL);
     }
+}
+
+/// Both halves of a landed activation, read now: the target's process is
+/// WindowServer-frontmost and the process publishes the target as its focused
+/// window.
+fn key_window_observable(pid: libc::pid_t, window_id: u32) -> bool {
+    front_process_matches(pid, window_id) != Some(false)
+        && crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

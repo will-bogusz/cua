@@ -112,9 +112,14 @@ pub struct AXNode {
     /// walk time. `None` when AX didn't report a usable position+size.
     pub frame: Option<[f64; 4]>,
     /// AXValue coerced to a string for ALL CF types (CFNumber → "8",
-    /// CFBoolean → "1"/"0", CFString as-is). Kept separate from `value`
-    /// (string-only); only the structured `elements` array consumes this.
+    /// CFBoolean → "1"/"0", CFDate → local ISO-8601, CFString as-is). Kept
+    /// separate from `value` (string-only); only the structured `elements`
+    /// array consumes this.
     pub value_state: Option<String>,
+    /// `AXUIElementIsAttributeSettable(AXValue)` for the value-control family
+    /// ([`role_supports_value_addressing`]): whether `set_value` can write
+    /// this control at all. `false` elsewhere — not probed is not "read-only".
+    pub value_settable: bool,
     /// AXValueDescription — human-readable value form (e.g. "8 dB").
     pub value_description: Option<String>,
     /// AXMinValue / AXMaxValue for range controls (sliders, steppers).
@@ -156,6 +161,16 @@ where
     }
 }
 
+/// The control family whose `AXValue` a caller writes rather than types into.
+/// Membership decides two things: that an action-less control with a writable
+/// value is still addressable, and that the walk probes `AXValue`
+/// writability so a caller can tell `set_value` from `type_text` without a
+/// failed attempt.
+///
+/// The date/time roles are here because their value is a `CFDate` no
+/// keystroke sequence reproduces reliably: writing them is the only route,
+/// and their `AXIncrement`/`AXDecrement` actions do not say whether a direct
+/// write is accepted.
 fn role_supports_value_addressing(role: &str) -> bool {
     matches!(
         role,
@@ -166,6 +181,9 @@ fn role_supports_value_addressing(role: &str) -> bool {
             | "AXStepper"
             | "AXCheckBox"
             | "AXRadioButton"
+            | "AXDateTimeArea"
+            | "AXDateField"
+            | "AXTimeField"
     )
 }
 
@@ -185,6 +203,7 @@ struct WalkScope {
     pid: i32,
     window_id: Option<u32>,
     related_windows: Vec<RelatedWindow>,
+    modal_windows: Vec<RelatedWindow>,
     background_open_restricted: std::collections::HashSet<usize>,
 }
 
@@ -193,6 +212,11 @@ pub struct TreeWalkResult {
     pub background_open_restricted: std::collections::HashSet<usize>,
     /// Separate attached surfaces discovered while walking this exact window.
     pub related_windows: Vec<RelatedWindow>,
+    /// Same-process windows the application reports modal, which block this
+    /// one without being attached to it. Their controls are in `nodes`: they
+    /// are walked into this observation, because while one of these is up it
+    /// is the only thing in the process that can be acted on.
+    pub modal_windows: Vec<RelatedWindow>,
     pub tree_markdown: String,
     pub nodes: Vec<AXNode>,
     /// True when the walk did not enumerate its whole scope: an element or
@@ -285,6 +309,7 @@ pub(crate) fn walk_tree_with_timeout(
         pid,
         window_id,
         related_windows: Vec::new(),
+        modal_windows: Vec::new(),
         background_open_restricted: std::collections::HashSet::new(),
     };
     let mut nodes: Vec<AXNode> = Vec::new();
@@ -306,6 +331,7 @@ pub(crate) fn walk_tree_with_timeout(
             return TreeWalkResult {
                 background_open_restricted: std::collections::HashSet::new(),
                 related_windows: Vec::new(),
+                modal_windows: Vec::new(),
                 tree_markdown: String::new(),
                 nodes,
                 truncated: false,
@@ -430,11 +456,21 @@ pub(crate) fn walk_tree_with_timeout(
                     } else {
                         None
                     };
-                    TopLevelCandidate {
+                    let candidate = TopLevelCandidate {
                         role,
                         subrole,
                         identifier,
                         ax_window_id,
+                        modal: None,
+                    };
+                    // Modality is only asked of the windows that could be
+                    // dialogs, so an app with twenty document windows pays
+                    // nothing for the question.
+                    if candidate.is_dialog_like() {
+                        let modal = copy_bool_attr(child, "AXModal");
+                        TopLevelCandidate { modal, ..candidate }
+                    } else {
+                        candidate
                     }
                 })
                 .collect();
@@ -487,6 +523,7 @@ pub(crate) fn walk_tree_with_timeout(
                 .iter()
                 .map(|&index| top_level[index])
                 .collect();
+            modal_dialogs = std::mem::take(&mut decision.modal);
             window_scope = Some(decision.scope);
             // Document state of the exact target window: two AX reads on ONE
             // element (never the whole walk), so the cost is per-window, not
@@ -511,6 +548,61 @@ pub(crate) fn walk_tree_with_timeout(
             walk_element(
                 child,
                 0,
+                None,
+                false,
+                &mut nodes,
+                &mut lines,
+                &mut index_counter,
+                &mut visited_count,
+                &mut truncation,
+                &mut scope,
+                max_elements,
+                max_depth,
+            );
+        }
+
+        // A modal dialog of this process blocks the requested window whether or
+        // not it is attached to it: while it is up, every action addressed at
+        // the window below it is refused or ignored. So it is walked into this
+        // observation — one line naming the relation, then the dialog's own
+        // subtree, which is what makes its buttons addressable in the same
+        // snapshot. Attached sheets reach the same place from inside the walk
+        // (`is_related_sheet`); this is the top-level dialog case, which no
+        // parent window's child list contains.
+        for index in modal_dialogs {
+            if super::budget::exhausted() {
+                truncation.limit = true;
+                break;
+            }
+            let dialog = top_level[index];
+            let Some(dialog_id) = ax_get_window_id(dialog) else {
+                continue;
+            };
+            let title = copy_string_attr(dialog, "AXTitle")
+                .filter(|title| !title.is_empty())
+                .or_else(|| copy_string_attr(dialog, "AXDescription"))
+                .unwrap_or_default();
+            lines.push((
+                1,
+                format!(
+                    "- Modal dialog: pid={pid} window_id={dialog_id} title={title:?} — the \
+                     application reports it modal, so no other window of pid {pid} accepts input \
+                     until it is dismissed. Its own controls follow."
+                ),
+            ));
+            // Reported apart from `related_windows`: that list is the surfaces
+            // attached to this window (sheets), and a consumer that walks each
+            // of them would walk this dialog a second time — its controls are
+            // already in this observation's own rows.
+            scope.modal_windows.push(RelatedWindow {
+                pid,
+                window_id: dialog_id,
+                title,
+                relation: super::window_scope::MODAL_RELATION,
+            });
+            walk_element(
+                dialog,
+                1,
                 None,
                 false,
                 &mut nodes,
@@ -573,6 +665,7 @@ pub(crate) fn walk_tree_with_timeout(
     TreeWalkResult {
         background_open_restricted: scope.background_open_restricted,
         related_windows: scope.related_windows,
+        modal_windows: scope.modal_windows,
         tree_markdown,
         nodes,
         truncated: truncated_flag,
@@ -763,15 +856,22 @@ unsafe fn walk_element(
         );
         return;
     }
-    // Some native controls expose no AX action names but do expose a writable
-    // AXValue. Finder's transient inline-rename field is the important case:
-    // rendering it without an element_index leaves an agent able to see the
-    // field but unable to call set_value on it. Probe writability only for the
-    // small family of value controls so arbitrary display nodes do not pay an
-    // extra AX round trip.
-    let value_settable = advertised.is_empty()
-        && role_supports_value_addressing(&role)
-        && is_attribute_settable(element, "AXValue");
+    // Whether `set_value` can write this control at all, asked of the small
+    // family of value controls so arbitrary display nodes pay no extra AX
+    // round trip. Two things need the answer.
+    //
+    // A control that exposes no AX action names but does expose a writable
+    // AXValue is still addressable: Finder's transient inline-rename field is
+    // the important case, and rendering it without an element_index leaves an
+    // agent able to see the field but unable to write it.
+    //
+    // A control that *does* advertise actions needs it published: an
+    // `AXDateTimeArea` advertises AXIncrement/AXDecrement, which say nothing
+    // about whether the date can be written directly, and its value is a
+    // CFDate no keystroke sequence reproduces. Without the flag the only way
+    // to learn the route is a failed write.
+    let value_settable =
+        role_supports_value_addressing(&role) && is_attribute_settable(element, "AXValue");
     let visual_target = role == "AXImage" && has_content;
     let is_actionable = is_addressable(!advertised.is_empty(), value_settable || visual_target);
 
@@ -855,6 +955,7 @@ unsafe fn walk_element(
             parent_element_index: parent_index,
             frame,
             value_state: control_state.value_state.clone(),
+            value_settable,
             value_description: control_state.value_description.clone(),
             min_value: control_state.min_value,
             max_value: control_state.max_value,
@@ -889,6 +990,7 @@ unsafe fn walk_element(
             parent_element_index: parent_index,
             frame,
             value_state: control_state.value_state.clone(),
+            value_settable,
             value_description: control_state.value_description.clone(),
             min_value: control_state.min_value,
             max_value: control_state.max_value,
@@ -1146,6 +1248,11 @@ fn format_node_line(node: &AXNode) -> String {
                 .join(",");
             attrs.push(format!("custom_actions=[{}]", action_str));
         }
+        // What `set_value` can write, said before the attempt. A control whose
+        // value is not a string (a date area) has nothing else that says so.
+        if node.value_settable {
+            attrs.push("settable".to_owned());
+        }
         if node.enabled == Some(false) {
             attrs.push("enabled=false".to_owned());
         }
@@ -1270,6 +1377,7 @@ mod tests {
             parent_element_index: None,
             frame: None,
             value_state: None,
+            value_settable: false,
             value_description: None,
             min_value: None,
             max_value: None,
@@ -1323,6 +1431,36 @@ mod tests {
             ..node
         };
         assert!(!format_node_line(&unreported).contains("enabled"));
+    }
+
+    /// A date control's value is a `CFDate` rendered as a local date-time, and
+    /// its `AXIncrement`/`AXDecrement` actions say nothing about whether that
+    /// value can be written. The row carries both the value and the answer, so
+    /// a caller picks `set_value` or a step without attempting one.
+    #[test]
+    fn a_writable_value_control_says_so_beside_its_value() {
+        let date_area = AXNode {
+            value: Some("2026-09-25T17:00:00-07:00".into()),
+            value_state: Some("2026-09-25T17:00:00-07:00".into()),
+            value_settable: true,
+            actions: vec!["AXIncrement".into(), "AXDecrement".into()],
+            ..indexed_node("AXDateTimeArea")
+        };
+        assert_eq!(
+            format_node_line(&date_area),
+            "- [0] AXDateTimeArea = \"2026-09-25T17:00:00-07:00\" \
+             [actions=[increment,decrement] settable]"
+        );
+
+        let read_only = AXNode {
+            value_settable: false,
+            ..date_area
+        };
+        assert!(
+            !format_node_line(&read_only).contains("settable"),
+            "a control whose value is not writable must not claim it is: {}",
+            format_node_line(&read_only)
+        );
     }
 
     #[test]

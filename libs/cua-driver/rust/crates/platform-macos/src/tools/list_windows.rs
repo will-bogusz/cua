@@ -35,9 +35,14 @@ fn def() -> &'static ToolDef {
             display's desktop surface — the window Finder draws the desktop icons on, owned by \
             Finder, sized to its display and behind every application window (it is not a \
             layer-0 window; it is listed because get_window_state can read it: the desktop's \
-            icons come back as that window's tree). Callers enumerating an application's own \
-            windows will usually want to filter out every record that carries a kind. Ordinary \
-            windows omit the key entirely.".into(),
+            icons come back as that window's tree). \"app-modal\" is a window the application \
+            reports modal (AXModal): while it is up no other window of that process accepts \
+            input, so act on it — or dismiss it — before addressing anything else of that pid. \
+            Modality is an accessibility fact, so this kind requires \
+            include_accessibility_metadata and an explicit pid. Callers enumerating an \
+            application's own windows will usually want to filter out system_overlay and \
+            desktop rows; an app-modal row is the application's own window and the only one \
+            worth addressing while it is up. Ordinary windows omit the key entirely.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -102,6 +107,11 @@ impl Tool for ListWindowsTool {
                     Some(crate::window_kind::SYSTEM_OVERLAY_KIND)
                 } else if crate::windows::is_desktop_surface(w) {
                     Some(crate::window_kind::DESKTOP_KIND)
+                } else if roster
+                    .as_ref()
+                    .is_some_and(|roster| roster.is_app_modal(w.window_id))
+                {
+                    Some(crate::window_kind::APP_MODAL_KIND)
                 } else {
                     None
                 };
@@ -128,6 +138,10 @@ const AX_WINDOW_MESSAGING_TIMEOUT: f32 = 0.25;
 struct AccessibilityRoster {
     complete: bool,
     window_ids: std::collections::HashSet<u32>,
+    /// Windows the application reports modal. A modal window blocks every
+    /// other window of its process, so a roster that does not say so invites
+    /// a caller to address one that cannot answer.
+    modal_window_ids: std::collections::HashSet<u32>,
     json: Value,
 }
 
@@ -136,6 +150,7 @@ impl AccessibilityRoster {
         Self {
             complete: false,
             window_ids: std::collections::HashSet::new(),
+            modal_window_ids: std::collections::HashSet::new(),
             json: serde_json::json!({
                 "pid": pid,
                 "complete": false,
@@ -143,6 +158,10 @@ impl AccessibilityRoster {
                 "error": error,
             }),
         }
+    }
+
+    fn is_app_modal(&self, window_id: u32) -> bool {
+        self.modal_window_ids.contains(&window_id)
     }
 
     fn ax_backed(&self, window_id: u32) -> Option<bool> {
@@ -217,6 +236,7 @@ fn accessibility_roster(pid: i32) -> AccessibilityRoster {
         let mut complete = windows.len() <= AX_ROSTER_MAX_WINDOWS;
         let deadline = std::time::Instant::now() + AX_ROSTER_BUDGET;
         let mut window_ids = std::collections::HashSet::new();
+        let mut modal_window_ids = std::collections::HashSet::new();
         let mut records = Vec::new();
         for (index, window) in windows.into_iter().enumerate() {
             if index < AX_ROSTER_MAX_WINDOWS && std::time::Instant::now() < deadline {
@@ -224,12 +244,20 @@ fn accessibility_roster(pid: i32) -> AccessibilityRoster {
                 match (ax_get_window_id(window), copy_string_attr(window, "AXRole")) {
                     (Some(window_id), Some(role)) if role == "AXWindow" => {
                         window_ids.insert(window_id);
+                        // The application's own report that this window blocks
+                        // every other window of its process. Unreadable is
+                        // unknown, never "not modal".
+                        let modal = copy_bool_attr(window, "AXModal");
+                        if modal == Some(true) {
+                            modal_window_ids.insert(window_id);
+                        }
                         records.push(serde_json::json!({
                             "window_id": window_id,
                             "role": role,
                             "subrole": copy_string_attr(window, "AXSubrole"),
                             "minimized": copy_bool_attr(window, "AXMinimized"),
                             "main": copy_bool_attr(window, "AXMain"),
+                            "modal": modal,
                         }))
                     }
                     (mapped, role) => {
@@ -246,6 +274,7 @@ fn accessibility_roster(pid: i32) -> AccessibilityRoster {
         AccessibilityRoster {
             complete,
             window_ids,
+            modal_window_ids,
             json: serde_json::json!({"pid": pid, "complete": complete, "windows": records}),
         }
     }
@@ -351,11 +380,33 @@ mod tests {
     }
 
     fn roster(complete: bool, window_ids: &[u32]) -> AccessibilityRoster {
+        modal_roster(complete, window_ids, &[])
+    }
+
+    fn modal_roster(complete: bool, window_ids: &[u32], modal: &[u32]) -> AccessibilityRoster {
         AccessibilityRoster {
             complete,
             window_ids: window_ids.iter().copied().collect(),
+            modal_window_ids: modal.iter().copied().collect(),
             json: serde_json::json!({}),
         }
+    }
+
+    /// A modal window blocks every other window of its process, so the roster
+    /// says which one it is. Nothing else the roster knows changes a row's
+    /// kind into a claim about modality.
+    #[test]
+    fn only_the_window_the_app_calls_modal_is_labelled_app_modal() {
+        let roster = modal_roster(true, &[42, 43], &[43]);
+        assert!(roster.is_app_modal(43));
+        assert!(!roster.is_app_modal(42), "an ordinary window is not modal");
+        assert!(!roster.is_app_modal(58), "an unlisted window is not modal");
+
+        let window = sample_window();
+        assert_eq!(
+            window_record_json(&window, Some(crate::window_kind::APP_MODAL_KIND), None)["kind"],
+            serde_json::json!("app-modal")
+        );
     }
 
     #[test]

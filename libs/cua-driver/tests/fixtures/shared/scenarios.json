@@ -425,6 +425,41 @@
     }
    },
    {
+    "id": "key_gated_toolbar",
+    "kind": "key_window_gated_control",
+    "description": "A control the application reports AXEnabled=false until its window is key, in a real NSToolbar. With CUA_APPKIT_KEY_GATED_TOOLBAR=1 the window gets the toolbar; paired with CUA_APPKIT_SECOND_KEY_WINDOW=1 the harness window starts on screen and front in its own process but not key, so search-toolbar reads disabled — the Notes toolbar-search shape. Tests that a background click is refused with element_disabled and that a foreground click succeeds instead of refusing on an enabled read taken before the activation landed.",
+    "controls": {
+     "search_field_aid": "search-toolbar",
+     "search_field_label": "Toolbar search",
+     "toolbar_env": "CUA_APPKIT_KEY_GATED_TOOLBAR",
+     "not_key_env": "CUA_APPKIT_SECOND_KEY_WINDOW"
+    }
+   },
+   {
+    "id": "date_picker",
+    "kind": "date_time_value",
+    "description": "NSDatePicker (CUA_APPKIT_DATE_PICKER=1), seeded from local calendar components to 2026-09-25 17:00 so the wall clock it shows is identical on every machine. Its AXValue is a CFDate, not a string, and it advertises AXIncrement/AXDecrement: tests that the tree renders the date as a local ISO-8601 date-time and says whether AXValue is settable, so a caller can tell a write from a step without attempting one. date_value= label publishes what the app itself reads.",
+    "controls": {
+     "date_picker_aid": "date-picker",
+     "value_label_aid": "lbl-date-value",
+     "expected_value_prefix": "2026-09-25T17:00:00",
+     "date_picker_env": "CUA_APPKIT_DATE_PICKER"
+    }
+   },
+   {
+    "id": "modal_alert",
+    "kind": "app_modal_alert",
+    "description": "A button that puts an app-modal NSAlert up on the next turn of the run loop (CUA_APPKIT_MODAL_ALERT=1). The alert is a top-level AXWindow with subrole AXDialog that reports AXModal=true, not a sheet attached to the harness window, so nothing in the process accepts input until it is dismissed. Tests that the observation of the blocked window contains the dialog and its buttons, and that the window roster labels the dialog kind app-modal. modal_alert= label records which button dismissed it.",
+    "controls": {
+     "open_button_aid": "btn-modal-alert",
+     "state_label_aid": "lbl-modal-alert",
+     "expected_message": "Harness modal alert",
+     "keep_button_title": "Keep",
+     "discard_button_title": "Discard",
+     "modal_alert_env": "CUA_APPKIT_MODAL_ALERT"
+    }
+   },
+   {
     "id": "menu_popover",
     "kind": "menu_and_popover",
     "description": "CUA_APPKIT_MENU_POPOVER=1 adds an NSPopUpButton whose AXPress opens a native NSMenu, and a button that shows a 320x460 NSPopover anchored at the window's trailing edge so the popover hangs past the window's right edge. The menu is an accessory window outside the window's AX subtree and the popover is a same-process window the window server draws with the window: tests that a press that opened a menu is reported as delivery instead of suspected_noop and that the menu is in the window's tree, and that a capture taken while the popover is open reports the rect its pixels actually cover instead of the window's own frame. popup_choice= label records the option chosen.",

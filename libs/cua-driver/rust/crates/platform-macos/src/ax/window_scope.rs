@@ -68,6 +68,10 @@ pub struct TopLevelCandidate {
     pub identifier: Option<String>,
     /// `_AXUIElementGetWindow` result for an AXWindow or attached AXSheet.
     pub ax_window_id: Option<u32>,
+    /// `AXModal` — the application's own report that this window blocks every
+    /// other window of its process. `None` when it was not read or not
+    /// answered, which is unknown, never "not modal".
+    pub modal: Option<bool>,
 }
 
 impl TopLevelCandidate {
@@ -77,6 +81,7 @@ impl TopLevelCandidate {
             subrole: None,
             identifier: None,
             ax_window_id,
+            modal: None,
         }
     }
 
@@ -90,7 +95,12 @@ impl TopLevelCandidate {
         self
     }
 
-    fn is_dialog_like(&self) -> bool {
+    pub fn with_modal(mut self, modal: bool) -> Self {
+        self.modal = Some(modal);
+        self
+    }
+
+    pub fn is_dialog_like(&self) -> bool {
         self.role == "AXSheet"
             || self
                 .subrole
@@ -101,6 +111,15 @@ impl TopLevelCandidate {
                 .as_deref()
                 .is_some_and(|id| matches!(id, "open-panel" | "save-panel"))
     }
+
+    /// A top-level dialog window the application reports modal: while it is
+    /// up, no window of that process — including the one being observed — can
+    /// accept input, so it belongs to that window's observation. Attached
+    /// sheets keep their own related-surface path ([`is_related_sheet`]), so
+    /// this is deliberately the top-level case only.
+    pub fn is_app_modal_dialog(&self) -> bool {
+        self.role == "AXWindow" && self.modal == Some(true) && self.is_dialog_like()
+    }
 }
 
 /// The scope conclusion plus which candidates to walk at depth 0.
@@ -109,6 +128,10 @@ pub struct ScopeDecision {
     pub scope: WindowScope,
     /// Indices into the candidate slice. Empty for every non-`Matched` scope.
     pub walk: Vec<usize>,
+    /// Same-pid top-level dialog windows the application reports modal, which
+    /// are not the requested window. Empty for every non-`Matched` scope: an
+    /// unresolved request describes nothing.
+    pub modal: Vec<usize>,
 }
 
 /// The scope conclusion reachable from CGWindowList alone, before any AX work.
@@ -131,6 +154,10 @@ pub fn scope_from_owner(owner: &WindowOwner) -> Option<WindowScope> {
 }
 
 pub const SHEET_RELATION: &str = "sheet";
+
+/// A same-pid modal dialog is not attached to the observed window, but it
+/// owns every input the process can accept while it is up.
+pub const MODAL_RELATION: &str = "app-modal";
 
 /// An independently mapped attached sheet has its own control scope. Its
 /// subtree must not mint tokens for the document window being observed.
@@ -171,6 +198,7 @@ where
         return ScopeDecision {
             scope,
             walk: Vec::new(),
+            modal: Vec::new(),
         };
     }
 
@@ -196,9 +224,20 @@ where
         })
         .map(|(i, _)| i)
         .collect();
+    // A modal dialog of this process blocks the requested window whether or
+    // not it is attached to it, so the observation has to show it: an agent
+    // that cannot see it reads an unchanging window and calls its own landed
+    // actions no-ops.
+    let modal = candidates
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| !matched.contains(i) && c.is_app_modal_dialog())
+        .map(|(i, _)| i)
+        .collect();
     ScopeDecision {
         scope: WindowScope::Matched,
         walk,
+        modal,
     }
 }
 
@@ -269,6 +308,7 @@ where
                 ax_window_count: candidates.iter().filter(|c| c.role == "AXWindow").count(),
             },
             walk: Vec::new(),
+            modal: Vec::new(),
         };
     }
     // Content plus the menu bar, in candidate order — the same process-scoped
@@ -285,6 +325,7 @@ where
             content_children: content.len(),
         },
         walk,
+        modal: Vec::new(),
     }
 }
 
@@ -356,6 +397,77 @@ mod tests {
             vec![2],
             "AppKit file-panel snapshot must not carry AXMenuBar"
         );
+    }
+
+    /// A modal dialog of the same process blocks the observed window, so it
+    /// comes back beside it. The observation of a window that cannot accept
+    /// input must name what is holding it.
+    #[test]
+    fn a_same_pid_modal_dialog_accompanies_the_observed_window() {
+        let candidates = [
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXWindow", Some(22)),
+            TopLevelCandidate::new("AXWindow", Some(31))
+                .with_subrole("AXDialog")
+                .with_modal(true),
+        ];
+        let d = decide_window_scope(&candidates, 22, never_called);
+        assert_eq!(d.scope, WindowScope::Matched);
+        assert_eq!(d.walk, vec![0, 1], "the dialog is not part of the scope");
+        assert_eq!(d.modal, vec![2]);
+    }
+
+    /// Modality is the application's own report, and only a dialog-shaped
+    /// top-level window carries it here: an ordinary sibling window, a dialog
+    /// the app does not call modal, and an attached sheet (which has its own
+    /// related-surface path) are all left alone.
+    #[test]
+    fn only_a_window_the_app_calls_modal_is_carried_along() {
+        let candidates = [
+            TopLevelCandidate::new("AXWindow", Some(22)),
+            TopLevelCandidate::new("AXWindow", Some(30)),
+            TopLevelCandidate::new("AXWindow", Some(31)).with_subrole("AXDialog"),
+            TopLevelCandidate::new("AXWindow", Some(32))
+                .with_subrole("AXDialog")
+                .with_modal(false),
+            TopLevelCandidate::new("AXSheet", Some(33)).with_modal(true),
+            TopLevelCandidate::new("AXWindow", Some(34))
+                .with_subrole("AXStandardWindow")
+                .with_identifier("save-panel")
+                .with_modal(true),
+        ];
+        let d = decide_window_scope(&candidates, 22, never_called);
+        assert_eq!(
+            d.modal,
+            vec![5],
+            "a modal file panel blocks the process just as a modal alert does"
+        );
+    }
+
+    /// The dialog itself may be the requested window. It is then the scope,
+    /// never also its own blocker.
+    #[test]
+    fn the_requested_modal_dialog_is_not_reported_beside_itself() {
+        let candidates = [
+            TopLevelCandidate::new("AXWindow", Some(22)),
+            TopLevelCandidate::new("AXWindow", Some(31))
+                .with_subrole("AXDialog")
+                .with_modal(true),
+        ];
+        let d = decide_window_scope(&candidates, 31, never_called);
+        assert_eq!(d.walk, vec![1]);
+        assert!(d.modal.is_empty(), "{:?}", d.modal);
+    }
+
+    /// An unresolved request describes nothing — including what is modal.
+    #[test]
+    fn an_unresolved_request_reports_no_modal_dialog() {
+        let candidates = [TopLevelCandidate::new("AXWindow", Some(31))
+            .with_subrole("AXDialog")
+            .with_modal(true)];
+        let d = decide_window_scope(&candidates, 22, panel_service_owner);
+        assert!(d.walk.is_empty());
+        assert!(d.modal.is_empty(), "{:?}", d.modal);
     }
 
     /// Issue #2237's headline defect: an id nothing claims used to fall through

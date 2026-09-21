@@ -45,9 +45,22 @@ fn def() -> &'static ToolDef {
             `custom_actions` (the application's own secondary actions, each \
             `{name, raw}`: `name` is the label a person reads, `raw` is the \
             string to pass back as `click`'s `action` to perform it), \
-            `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown \
+            `frame: {x,y,w,h}`, `parent_index`, `depth`, and `value_settable` \
+            (present only when true: the element's AXValue accepts a write, so \
+            `set_value` is a route to it — a date/time control publishes its \
+            value as a date and advertises AXIncrement/AXDecrement, neither of \
+            which says whether the value itself can be written)). The markdown \
             `tree_markdown` stays available for text consumers, with raw string \
-            values quoted and escaped and placeholders identified separately.\n\n\
+            values quoted and escaped and placeholders identified separately; a \
+            date/time value renders as a local ISO-8601 date-time.\n\n\
+            A same-process window the application reports modal (AXModal) blocks \
+            the requested window without being attached to it, so it is walked \
+            into this observation: its rows are in `elements` under a \
+            \"Modal dialog:\" line in the markdown, and `modal_windows` lists it \
+            as `{pid, window_id, title, relation: \"app-modal\"}`. Act on it, or \
+            dismiss it, before addressing the window beneath. Sheets attached to \
+            the requested window stay in `related_windows` and are snapshotted \
+            separately by their own window_id.\n\n\
             Always returns BOTH the element tree AND a screenshot — ground on \
             both and cross-check (the tree lies on some surfaces: Electron \
             echo-confirms, Catalyst null values, virtualized off-viewport rows \
@@ -680,6 +693,7 @@ impl Tool for GetWindowStateTool {
             "tree_markdown": tree_md,
             "elements": elements_json,
             "related_windows": tree_result.as_ref().map(|r| &r.related_windows),
+            "modal_windows": tree_result.as_ref().map(|r| &r.modal_windows),
             "_note": "Prefer `elements` — `tree_markdown` will continue to work \
                 but new fields will only be added to the structured side. \
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
@@ -1116,6 +1130,14 @@ fn build_elements_array_with_policy(
             if let Some(value) = node.value_state.clone().or_else(|| node.value.clone()) {
                 entry["value"] = serde_json::Value::String(value);
             }
+            // Whether `set_value` can write this control, for the value-control
+            // family the walk probes. A date/time area's value is a CFDate: the
+            // rendered ISO-8601 string is not what a write accepts, so the flag
+            // is the only thing that separates "write it" from "step it with
+            // AXIncrement/AXDecrement".
+            if node.value_settable {
+                entry["value_settable"] = serde_json::Value::Bool(true);
+            }
             if let Some(placeholder) = &node.placeholder {
                 entry["placeholder"] = serde_json::Value::String(placeholder.clone());
             }
@@ -1436,6 +1458,7 @@ mod tests {
             parent_element_index: parent,
             frame,
             value_state: None,
+            value_settable: false,
             value_description: None,
             min_value: None,
             max_value: None,

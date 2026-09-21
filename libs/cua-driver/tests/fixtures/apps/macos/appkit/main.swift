@@ -81,6 +81,26 @@ let kNonBmpPlaceholder = "Non-BMP seed"
 /// covers three of them and leaves the "B" for typed text to be appended to.
 let kNonBmpSeedValue = "\u{1F600}AB"
 let kEndOfEditStateAID = "lbl-end-of-edit"
+/// key_gated_toolbar — a toolbar control the application reports disabled
+/// until its window is key (`CUA_APPKIT_KEY_GATED_TOOLBAR=1`).
+let kToolbarSearchAID = "search-toolbar"
+let kToolbarSearchLabel = "Toolbar search"
+let kToolbarItemIdentifier = NSToolbarItem.Identifier("harness-toolbar-search")
+/// date_picker — an NSDatePicker whose AXValue is a CFDate
+/// (`CUA_APPKIT_DATE_PICKER=1`). Seeded from local calendar components, so
+/// the wall clock it shows is the same on every machine.
+let kDatePickerAID = "date-picker"
+let kDatePickerStateAID = "lbl-date-value"
+let kDatePickerYear = 2026
+let kDatePickerMonth = 9
+let kDatePickerDay = 25
+let kDatePickerHour = 17
+/// modal_alert — an app-modal NSAlert window (`CUA_APPKIT_MODAL_ALERT=1`).
+let kModalAlertButtonAID = "btn-modal-alert"
+let kModalAlertStateAID = "lbl-modal-alert"
+let kModalAlertMessage = "Harness modal alert"
+let kModalAlertKeepTitle = "Keep"
+let kModalAlertDiscardTitle = "Discard"
 let kRowNameCellAID = "txt-row-name"
 let kRowNameCellValue = "row name cell"
 let kFirstResponderAID = "lbl-first-responder"
@@ -98,6 +118,9 @@ let kPopoverBodyAID = "lbl-popover-body"
 let kPopoverBodyText = "POPOVER_BODY_MARKER_v1"
 /// Taller than the distance from the button to the window's bottom edge, so
 /// AppKit places it overflowing the window rather than inside it.
+/// How long after its button's press the modal alert goes up; longer than the
+/// press highlight's nested run loop (see `onShowModalAlert`).
+let kModalAlertDelay: TimeInterval = 0.4
 let kPopoverContentSize = NSSize(width: 320, height: 460)
 /// How far inside the window's trailing edge the popover is anchored (points).
 let kPopoverOverlap: CGFloat = 40
@@ -265,6 +288,63 @@ final class HarnessWindow: NSWindow {
         let accepted = super.makeFirstResponder(responder)
         onFirstResponderChange?()
         return accepted
+    }
+}
+
+/// The toolbar-search shape: a control the application reports
+/// `AXEnabled=false` until its window is key, and enabled the moment it is.
+///
+/// AppKit does this itself for controls whose validation depends on the key
+/// window's responder chain (`NSToolbarItem.validate`), and Notes' toolbar
+/// search field is the measured case: it publishes `AXEnabled=false` in a
+/// window that is not key, so a background click on it is refused and a
+/// foreground one has to work. Reproduced explicitly rather than by hoping a
+/// stock `NSSearchToolbarItem` validates the same way on every AppKit build:
+/// the state under test is what the *application* reports, and here it says
+/// exactly one thing — key window or not.
+///
+/// Only `AXEnabled` is gated. The field keeps accepting focus once the window
+/// is key, which is what a click on a text control does.
+final class KeyWindowGatedSearchField: NSSearchField {
+    override func isAccessibilityEnabled() -> Bool { window?.isKeyWindow == true }
+}
+
+/// Hosts [`KeyWindowGatedSearchField`] in a real `NSToolbar`, so the control
+/// sits where a toolbar control sits in the AX tree (under the window's
+/// `AXToolbar`) instead of in the content view.
+final class KeyGatedToolbarController: NSObject, NSToolbarDelegate {
+    let field = KeyWindowGatedSearchField()
+
+    func install(on window: NSWindow) {
+        field.setAccessibilityIdentifier(kToolbarSearchAID)
+        field.setAccessibilityLabel(kToolbarSearchLabel)
+        field.placeholderString = kToolbarSearchLabel
+        field.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([field.widthAnchor.constraint(equalToConstant: 200)])
+        let toolbar = NSToolbar(identifier: "harness-toolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        window.toolbar = toolbar
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier identifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        guard identifier == kToolbarItemIdentifier else { return nil }
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.label = kToolbarSearchLabel
+        item.view = field
+        return item
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [kToolbarItemIdentifier]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [kToolbarItemIdentifier]
     }
 }
 
@@ -486,6 +566,9 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     var keyMonitor: Any?
     let rowNameCell = RowNameCellField(string: kRowNameCellValue)
     let firstResponderLabel = NSTextField(labelWithString: "first_responder=none")
+    let datePicker = NSDatePicker()
+    let datePickerStateLabel = NSTextField(labelWithString: "date_value=none")
+    let modalAlertStateLabel = NSTextField(labelWithString: "modal_alert=none")
     let popupButton = NSPopUpButton()
     let popupChoiceLabel = NSTextField(labelWithString: "popup_choice=none")
     let popoverButton = NSButton(title: "Show popover", target: nil, action: nil)
@@ -494,6 +577,9 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     /// its window with it, and the capture geometry this fixture exists to
     /// exercise is only there while the popover is on screen.
     let popover = NSPopover()
+    /// Retained for as long as the window: `NSToolbar` holds its delegate
+    /// weakly, and a released delegate stops answering for its items.
+    var toolbarController: KeyGatedToolbarController?
     /// The inline-editor scenario's child window and its mirrors. Opened
     /// after [`show`] has centered the main window, so it is placed inside
     /// the frame the window actually ends up with.
@@ -527,6 +613,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         buildContent()
         installKeyboardMonitor()
         installRememberedResponder()
+        installKeyGatedToolbar()
     }
 
     func show() {
@@ -823,7 +910,56 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         content.addArrangedSubview(focusRow)
         window.onFirstResponderChange = { [weak self] in self?.publishFirstResponder() }
         publishFirstResponder()
+
+        // date_picker and modal_alert — appended last, and only when asked
+        // for, so every other launch stays byte-for-byte what it was. Both
+        // grow the window: the content is sized to fit it, so a taller window
+        // is the only way to add a row without clipping the one below.
         var extraHeight: CGFloat = 0
+        if HarnessWindowController.envFlag("CUA_APPKIT_DATE_PICKER") {
+            content.addArrangedSubview(sectionLabel("date_picker"))
+            datePicker.setAccessibilityIdentifier(kDatePickerAID)
+            datePicker.datePickerStyle = .textFieldAndStepper
+            datePicker.datePickerElements = [.yearMonthDay, .hourMinute]
+            datePicker.target = self
+            datePicker.action = #selector(onDatePicker(_:))
+            // Local calendar components, not an absolute instant: the wall
+            // clock the control shows — and therefore the date-time the
+            // driver renders from its CFDate — is then the same everywhere.
+            var seed = DateComponents()
+            seed.year = kDatePickerYear
+            seed.month = kDatePickerMonth
+            seed.day = kDatePickerDay
+            seed.hour = kDatePickerHour
+            seed.minute = 0
+            seed.second = 0
+            datePicker.dateValue = Calendar.current.date(from: seed) ?? Date()
+            datePickerStateLabel.setAccessibilityIdentifier(kDatePickerStateAID)
+            datePickerStateLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            publishDateValue()
+            let dateRow = NSStackView()
+            dateRow.orientation = .horizontal
+            dateRow.spacing = 12
+            dateRow.addArrangedSubview(datePicker)
+            dateRow.addArrangedSubview(datePickerStateLabel)
+            content.addArrangedSubview(dateRow)
+            extraHeight += 60
+        }
+        if HarnessWindowController.envFlag("CUA_APPKIT_MODAL_ALERT") {
+            content.addArrangedSubview(sectionLabel("modal_alert"))
+            let alertButton = NSButton(
+                title: "Show modal alert", target: self, action: #selector(onShowModalAlert))
+            alertButton.setAccessibilityIdentifier(kModalAlertButtonAID)
+            modalAlertStateLabel.setAccessibilityIdentifier(kModalAlertStateAID)
+            modalAlertStateLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            let alertRow = NSStackView()
+            alertRow.orientation = .horizontal
+            alertRow.spacing = 12
+            alertRow.addArrangedSubview(alertButton)
+            alertRow.addArrangedSubview(modalAlertStateLabel)
+            content.addArrangedSubview(alertRow)
+            extraHeight += 60
+        }
         if HarnessWindowController.envFlag("CUA_APPKIT_MENU_POPOVER") {
             content.addArrangedSubview(sectionLabel("menu_popover"))
             popupButton.setAccessibilityIdentifier(kPopupMenuAID)
@@ -954,6 +1090,60 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         }
     }
 
+    /// With `CUA_APPKIT_KEY_GATED_TOOLBAR=1`, the window gets a real
+    /// `NSToolbar` holding a search field the application reports disabled
+    /// until the window is key. Paired with `CUA_APPKIT_SECOND_KEY_WINDOW=1`
+    /// the harness window starts on screen, front in its own process and not
+    /// key, which is the state a background click on that field is refused in
+    /// and a foreground click has to recover from.
+    private func installKeyGatedToolbar() {
+        guard HarnessWindowController.envFlag("CUA_APPKIT_KEY_GATED_TOOLBAR") else { return }
+        let controller = KeyGatedToolbarController()
+        controller.install(on: window)
+        toolbarController = controller
+    }
+
+    /// The picker's own value, as the app reads it — `date_value=` in the
+    /// local calendar, so a write through `AXValue` is observable without
+    /// reading the control that was written.
+    private func publishDateValue() {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        datePickerStateLabel.stringValue = "date_value=\(formatter.string(from: datePicker.dateValue))"
+    }
+
+    @objc private func onDatePicker(_ sender: NSDatePicker) {
+        publishDateValue()
+    }
+
+    /// Put an app-modal alert up — a top-level window that blocks every other
+    /// window of this process until it is dismissed.
+    ///
+    /// Deferred past the press on purpose. `runModal` does not return until
+    /// the alert is dismissed, so running it inside the AX action handler
+    /// would hold the driver's own press reply open for as long as the alert
+    /// is up. The handler outlives the action: `performClick` keeps the button
+    /// highlighted through a brief nested run loop, and a block enqueued on
+    /// the main queue — or a timer a few tens of milliseconds out — fires
+    /// inside that loop, so the modal session began before the reply left
+    /// (measured: the press timed out with kAXErrorCannotComplete while the
+    /// alert stood open, from the driver and from System Events alike). The
+    /// deferral has to outlast the highlight. Real applications put their
+    /// alerts up from a later turn than the one that handled the click.
+    @objc private func onShowModalAlert() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + kModalAlertDelay) { [weak self] in
+            let alert = NSAlert()
+            alert.messageText = kModalAlertMessage
+            alert.informativeText = "This alert is app-modal."
+            alert.addButton(withTitle: kModalAlertKeepTitle)
+            alert.addButton(withTitle: kModalAlertDiscardTitle)
+            let response = alert.runModal()
+            let choice =
+                response == .alertFirstButtonReturn ? kModalAlertKeepTitle : kModalAlertDiscardTitle
+            self?.modalAlertStateLabel.stringValue = "modal_alert=\(choice)"
+        }
+    }
 
     @objc private func onPopupChoice(_ sender: NSPopUpButton) {
         popupChoiceLabel.stringValue = "popup_choice=\(sender.titleOfSelectedItem ?? "none")"

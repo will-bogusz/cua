@@ -330,6 +330,7 @@ enum DisabledCause<'a> {
     MenuItem,
     OwnedPanelInFront(&'a super::ObscuringWindow),
     WindowNotKey(String),
+    ForegroundDidNotMakeKey(String),
     ApplicationState,
 }
 
@@ -341,13 +342,35 @@ impl ElementDisabled {
         if let Some(obscuring) = &self.obscuring_window {
             return DisabledCause::OwnedPanelInFront(obscuring);
         }
-        match self
-            .key_window
-            .denial(self.pid, self.window_id)
-            .filter(|_| !self.foreground)
-        {
+        match self.key_window.denial(self.pid, self.window_id) {
+            // The foreground rung is already in force and the activation it
+            // requested has not landed: the control was read in the state the
+            // rung was supposed to leave behind, not in the state the
+            // application chose for it.
+            Some(denial) if self.foreground => DisabledCause::ForegroundDidNotMakeKey(denial),
             Some(denial) => DisabledCause::WindowNotKey(denial),
             None => DisabledCause::ApplicationState,
+        }
+    }
+
+    /// Where the target sits in its process's window order, as one clause:
+    /// front, behind a named window, or with nothing of its process in front.
+    fn order(&self) -> String {
+        let Self {
+            window_id, pid, ..
+        } = self;
+        match &self.obscuring_window {
+            Some(front) => format!(
+                "Window {} — pid {pid}'s own front window, {} — is drawn in front of window \
+                 {window_id}",
+                front.window_id,
+                front.describe()
+            ),
+            None if self.front_in_process => format!(
+                "Window {window_id} is already pid {pid}'s front window and no window of pid \
+                 {pid} is drawn in front of it"
+            ),
+            None => format!("No window of pid {pid} is drawn in front of window {window_id}"),
         }
     }
 
@@ -360,6 +383,7 @@ impl ElementDisabled {
             pid,
             ..
         } = self;
+        let order = self.order();
         match self.cause() {
             DisabledCause::MenuItem => format!(
                 "{action} was not dispatched: the {role} \"{label}\" of an open menu reports \
@@ -384,14 +408,6 @@ impl ElementDisabled {
                 )
             }
             DisabledCause::WindowNotKey(denial) => {
-                let order = if self.front_in_process {
-                    format!(
-                        "Window {window_id} is already pid {pid}'s front window and no window of \
-                         pid {pid} is drawn in front of it"
-                    )
-                } else {
-                    format!("No window of pid {pid} is drawn in front of window {window_id}")
-                };
                 format!(
                     "{action} was not dispatched: {role} \"{label}\" of window {window_id} \
                      reports AXEnabled=false. {order}, but window {window_id} is not pid {pid}'s \
@@ -400,12 +416,16 @@ impl ElementDisabled {
                      key first."
                 )
             }
+            DisabledCause::ForegroundDidNotMakeKey(denial) => {
+                format!(
+                    "{action} was not dispatched: {role} \"{label}\" of window {window_id} \
+                     reports AXEnabled=false. {order}, but the foreground rung did not make \
+                     window {window_id} pid {pid}'s key window within its wait — {denial} — so \
+                     this control was read while its window was still not key. Re-observe: the \
+                     control enables once its window is key."
+                )
+            }
             DisabledCause::ApplicationState => {
-                let order = if self.front_in_process {
-                    format!("Window {window_id} is already pid {pid}'s front window")
-                } else {
-                    format!("No window of pid {pid} is drawn in front of window {window_id}")
-                };
                 format!(
                     "{action} was not dispatched: {role} \"{label}\" of window {window_id} reports \
                      AXEnabled=false. {order} — the application disabled this control, and neither \
@@ -2234,6 +2254,59 @@ fn focus_text_entry(
     })
 }
 
+/// Whether the application reports the addressed control disabled, giving a
+/// requested activation the time it needs to land before answering.
+///
+/// This is the same mechanism `hotkey::dispatch_as_menu_command`
+/// already documents for menu items: what a closed control reports is
+/// whatever the application last validated, and for a window that has just
+/// become key that is the stale pre-key value — measured on Notes, a menu
+/// item still read disabled ~170 ms after its window was key while the item
+/// pressed fine. The menu path re-triggers validation instead of waiting,
+/// because opening each menu on the way is itself what makes AppKit validate
+/// the item. A click has no equivalent move — nothing about pressing a
+/// toolbar control re-validates it — so it re-reads within the activation's
+/// own budget ([`crate::input::skylight::ACTIVATION_WAIT_TIMEOUT`], which
+/// already bounds how long that activation is waited for, and covers the
+/// measured staleness), at the same poll interval, and answers as soon as the
+/// control enables. Without this, the single read right after the rung
+/// refused a control the activation was about to enable: measured on a
+/// toolbar search field, where the identical foreground call succeeded when
+/// the read happened later.
+///
+/// A background dispatch has no activation pending, so its first read is the
+/// whole answer. An unreadable attribute (`None`) is unknown, never disabled.
+fn reads_disabled(foreground: bool, enabled: impl FnMut() -> Option<bool>) -> bool {
+    reads_disabled_within(
+        foreground,
+        crate::input::skylight::ACTIVATION_WAIT_TIMEOUT,
+        crate::input::skylight::ACTIVATION_POLL_INTERVAL,
+        enabled,
+    )
+}
+
+fn reads_disabled_within(
+    foreground: bool,
+    budget: std::time::Duration,
+    tick: std::time::Duration,
+    mut enabled: impl FnMut() -> Option<bool>,
+) -> bool {
+    if enabled() != Some(false) {
+        return false;
+    }
+    if !foreground {
+        return true;
+    }
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(tick);
+        if enabled() != Some(false) {
+            return false;
+        }
+    }
+    true
+}
+
 fn perform_ax_click(
     element_ptr: usize,
     idx: usize,
@@ -2265,7 +2338,9 @@ fn perform_ax_click(
     // enable menu items that were disabled in the cached snapshot, while a
     // background transition can disable them after that snapshot. macOS may
     // otherwise return success for a disabled action that did nothing.
-    if crate::input::ax_actions::ax_element_enabled(element_ptr) == Some(false) {
+    if reads_disabled(foreground, || {
+        crate::input::ax_actions::ax_element_enabled(element_ptr)
+    }) {
         let order = super::process_front_order(pid, window_id);
         return Err(anyhow::Error::new(ElementDisabled {
             action: ax_action.clone(),
@@ -3387,26 +3462,119 @@ mod tests {
         );
     }
 
-    /// The rung is only real while it is unspent: a refusal composed inside
-    /// the foreground assist has no activation left to offer.
+    /// A refusal composed inside the foreground assist has no activation left
+    /// to offer — but it is not the application's own verdict either. The
+    /// rung's activation had not made the window key by the time the control
+    /// was read, and that is what the reply says, with no escalation to a rung
+    /// that is already in force.
     #[test]
-    fn the_foreground_rung_is_not_named_once_it_is_in_force() {
+    fn a_spent_foreground_rung_reports_the_activation_that_did_not_land() {
         let mut state = not_key(true);
         state.foreground = true;
         let reason = state.reason();
-        assert!(
-            reason.contains(
-                "the application disabled this control, and neither delivery mode \
-                             nor activation changes that"
-            ),
-            "{reason}"
+        assert_eq!(
+            reason,
+            "AXPress was not dispatched: AXTextField \"\" of window 19080 reports \
+             AXEnabled=false. Window 19080 is already pid 84264's front window and no window of \
+             pid 84264 is drawn in front of it, but the foreground rung did not make window \
+             19080 pid 84264's key window within its wait — pid 84264 is not the frontmost \
+             application — so this control was read while its window was still not key. \
+             Re-observe: the control enables once its window is key."
         );
-        assert!(!reason.contains("foreground"), "{reason}");
+        assert!(
+            !reason.contains("neither delivery mode nor activation changes that"),
+            "an unlanded activation is not the application's own verdict: {reason}"
+        );
         assert!(
             state.payload().get("escalation").is_none(),
             "{}",
             state.payload()
         );
+    }
+
+    /// The activation *did* land — the window is key and the control is still
+    /// disabled. That, and only that, is the application's own verdict.
+    #[test]
+    fn a_landed_activation_leaves_only_the_application_s_own_state() {
+        let mut state = disabled("AXButton", true);
+        state.foreground = true;
+        let reason = state.reason();
+        assert!(
+            reason.contains(
+                "the application disabled this control, and neither delivery mode nor \
+                 activation changes that"
+            ),
+            "{reason}"
+        );
+        assert!(
+            state.payload().get("escalation").is_none(),
+            "{}",
+            state.payload()
+        );
+    }
+
+    /// The pre-dispatch enabled read is the whole answer for a background
+    /// dispatch: there is no activation pending that could change it.
+    #[test]
+    fn a_background_dispatch_answers_the_first_enabled_read() {
+        let mut reads = 0;
+        let disabled = reads_disabled_within(
+            false,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(5),
+            || {
+                reads += 1;
+                Some(false)
+            },
+        );
+        assert!(disabled);
+        assert_eq!(reads, 1, "a background dispatch waited for an activation");
+    }
+
+    /// Under `foreground` the read is retried until the activation the rung
+    /// requested re-enables the control: AppKit re-validates a
+    /// key-window-sensitive control only once it installs the key window.
+    #[test]
+    fn a_foreground_dispatch_lets_the_activation_enable_the_control() {
+        let mut reads = 0;
+        let disabled = reads_disabled_within(
+            true,
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_millis(5),
+            || {
+                reads += 1;
+                Some(reads >= 3)
+            },
+        );
+        assert!(!disabled, "the control enabled on read {reads}");
+        assert_eq!(reads, 3);
+    }
+
+    /// A control the activation never enables is still refused, and the wait
+    /// is bounded.
+    #[test]
+    fn a_control_the_activation_never_enables_is_refused() {
+        let started = std::time::Instant::now();
+        let disabled = reads_disabled_within(
+            true,
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_millis(5),
+            || Some(false),
+        );
+        assert!(disabled);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "the wait outran its budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An application that reports no `AXEnabled` at all reports nothing about
+    /// this control: unknown is never disabled.
+    #[test]
+    fn an_unreported_enabled_attribute_is_not_a_disabled_control() {
+        assert!(!reads_disabled(false, || None));
+        assert!(!reads_disabled(true, || None));
     }
 
     /// A key window's disabled control and a menu row keep their own arms, and

@@ -2849,6 +2849,312 @@ fn harness_appkit_slider_drag_px_background() {
     });
 }
 
+/// A control the application disables until its window is key is the state
+/// the foreground rung exists for, and the rung used to lose to it: the
+/// driver read `AXEnabled` once, immediately after requesting the activation,
+/// and refused `element_disabled` while AppKit was still installing the key
+/// window and re-validating the control. Measured on Notes' toolbar search
+/// field, where the identical foreground call succeeded on the next run.
+///
+/// So both halves are asserted on the same control: the background click is
+/// refused and names the rung, and the foreground click through it dispatches.
+#[test]
+#[ignore]
+fn harness_appkit_foreground_click_waits_for_the_activation_to_enable_the_control() {
+    run_case_with_env(
+        native_foreground_case(
+            "appkit",
+            "click_disabled_until_key",
+            Targeting::Ax,
+            DriverRoute::MacosAxAction,
+        ),
+        &[
+            ("CUA_APPKIT_KEY_GATED_TOOLBAR", "1"),
+            ("CUA_APPKIT_SECOND_KEY_WINDOW", "1"),
+        ],
+        |pid, wid, driver| {
+            let (second, _) = driver
+                .find_window(pid as i64, "Second Key Window")
+                .expect("second key window not found");
+            assert_ne!(second, wid);
+            let before = snapshot_elements(driver, pid, wid);
+            let field = element_by_id(&before, "search-toolbar");
+            assert_eq!(
+                field["enabled"],
+                serde_json::json!(false),
+                "the fixture must report the toolbar field disabled while its window is not key: \
+                 {field}"
+            );
+            let index = field["element_index"]
+                .as_u64()
+                .expect("toolbar field element_index");
+
+            let refused = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_index": index,
+                    "snapshot_id": before.snapshot_id(),
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(
+                refused.is_error(),
+                "a background click on a control disabled until its window is key was accepted: {}",
+                refused.text()
+            );
+            assert_eq!(
+                refused.structured()["code"].as_str(),
+                Some("element_disabled"),
+                "wrong refusal for a control that is disabled until its window is key: {}",
+                refused.raw
+            );
+            assert_eq!(
+                refused.structured()["escalation"]["target"].as_str(),
+                Some("foreground"),
+                "the refusal must name the rung that makes the window key: {}",
+                refused.raw
+            );
+
+            let clicked = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_index": index,
+                    "snapshot_id": before.snapshot_id(),
+                    "delivery_mode": "foreground"
+                }),
+            );
+            assert!(
+                !clicked.is_error(),
+                "the foreground rung refused the control its own activation enables: {}",
+                clicked.text()
+            );
+            assert_ne!(
+                clicked.structured()["code"].as_str(),
+                Some("element_disabled"),
+                "the enabled read still raced the activation: {}",
+                clicked.raw
+            );
+            assert_ne!(
+                clicked.structured()["effect"].as_str(),
+                Some("not_dispatched"),
+                "the foreground click never reached the control: {}",
+                clicked.raw
+            );
+            assert!(
+                !clicked.text().contains("AXEnabled=false"),
+                "the reply still reports the pre-activation enabled state: {}",
+                clicked.text()
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
+/// A date control publishes its value as a `CFDate` and nothing else: no
+/// `AXValue` string, and its advertised `AXIncrement`/`AXDecrement` say
+/// nothing about whether the date can be written. The tree used to render it
+/// with no value at all and no writability, so an agent could neither read
+/// the date it was about to change nor tell `set_value` from a step.
+#[test]
+#[ignore]
+fn harness_appkit_date_picker_carries_its_value_and_whether_it_is_settable() {
+    run_case_with_env(
+        native_readonly_case(
+            "appkit",
+            "date_time_value",
+            Targeting::Ax,
+            DriverRoute::AxRead,
+            vec![OracleKind::AxState],
+        ),
+        &[("CUA_APPKIT_DATE_PICKER", "1")],
+        |pid, wid, driver| {
+            let snap = snapshot_elements(driver, pid, wid);
+            assert!(
+                snap.tree_text().contains("date_value=2026-09-25 17:00"),
+                "the fixture did not seed its date picker:\n{}",
+                snap.tree_text()
+            );
+            let date_area = element_where(&snap, |element| {
+                matches!(
+                    element["role"].as_str(),
+                    Some("AXDateTimeArea") | Some("AXDateField") | Some("AXTimeField")
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no date/time element in the snapshot:\n{}",
+                    snap.tree_text()
+                )
+            });
+            let value = date_area["value"].as_str().unwrap_or_default();
+            assert!(
+                value.starts_with("2026-09-25T17:00:00"),
+                "a date control's value must render as its own local date-time: {date_area}"
+            );
+            assert_eq!(
+                date_area["value_settable"],
+                serde_json::json!(true),
+                "the control accepts an AXValue write and the row does not say so: {date_area}"
+            );
+            let actions: Vec<&str> = date_area["actions"]
+                .as_array()
+                .map(|actions| actions.iter().filter_map(|a| a.as_str()).collect())
+                .unwrap_or_default();
+            for action in ["AXIncrement", "AXDecrement"] {
+                assert!(
+                    actions.contains(&action),
+                    "the probe cost the control its own actions: {date_area}"
+                );
+            }
+            assert!(
+                snap.tree_text().contains("settable"),
+                "the markdown row must carry the settable marker too:\n{}",
+                snap.tree_text()
+            );
+            Observation::delivered(vec![OracleKind::AxState], Evidence::default())
+        },
+    );
+}
+
+/// An app-modal alert is a separate top-level window, not a sheet attached to
+/// the window it blocks, so no parent's child list contains it: the
+/// observation of the blocked window used to show nothing at all while every
+/// action addressed at it was swallowed. It now comes back inside that
+/// observation, with its buttons addressable, and the roster says which window
+/// is holding the process.
+#[test]
+#[ignore]
+fn harness_appkit_an_app_modal_alert_is_in_the_blocked_window_s_observation() {
+    run_case_with_env(
+        native_foreground_case(
+            "appkit",
+            "app_modal_alert",
+            Targeting::Ax,
+            DriverRoute::MacosAxAction,
+        ),
+        &[("CUA_APPKIT_MODAL_ALERT", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("modal_alert=none"),
+                "the fixture did not start without an alert:\n{}",
+                before.tree_text()
+            );
+            let opened = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_index": element_by_id(&before, "btn-modal-alert")["element_index"],
+                    "snapshot_id": before.snapshot_id(),
+                    "action": "press",
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(!opened.is_error(), "alert press failed: {}", opened.text());
+            // The fixture puts the alert up from a later turn of its run loop
+            // than the press, the way an application does (and past the press
+            // highlight's nested loop, so the press reply is out first).
+            std::thread::sleep(Duration::from_millis(1000));
+
+            let roster = driver.call(
+                "list_windows",
+                serde_json::json!({ "pid": pid as i64, "include_accessibility_metadata": true }),
+            );
+            let ax_rows = roster.structured()["accessibility_windows"]["windows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                ax_rows
+                    .iter()
+                    .any(|row| row["modal"] == serde_json::json!(true)),
+                "the application never reported a modal window; everything below reads from \
+                 AXModal: {}",
+                roster.raw
+            );
+            let modal_rows: Vec<&serde_json::Value> = roster.structured()["windows"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|row| row["kind"] == serde_json::json!("app-modal"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                modal_rows.len(),
+                1,
+                "the roster must label exactly the modal window: {}",
+                roster.raw
+            );
+            assert_ne!(
+                modal_rows[0]["window_id"].as_u64(),
+                Some(wid),
+                "the blocked window was labelled as the modal one: {}",
+                roster.raw
+            );
+
+            let after = snapshot_elements(driver, pid, wid);
+            let tree = after.tree_text().to_owned();
+            assert!(
+                tree.contains("Modal dialog:"),
+                "the blocked window's observation never named what is blocking it:\n{tree}"
+            );
+            assert!(
+                tree.contains("Harness modal alert"),
+                "the dialog's own text is missing from the observation:\n{tree}"
+            );
+            let keep = element_where(&after, |element| {
+                element["label"].as_str() == Some("Keep")
+                    && element["role"].as_str() == Some("AXButton")
+            })
+            .unwrap_or_else(|| panic!("the dialog's buttons are not addressable:\n{tree}"));
+            assert!(
+                element_where(&after, |element| element["label"].as_str()
+                    == Some("Discard"))
+                .is_some(),
+                "only part of the dialog came back:\n{tree}"
+            );
+
+            // Pressing the dialog's own row proves the element was real, and
+            // leaves the application unblocked for teardown.
+            let dismissed = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_index": keep["element_index"],
+                    "snapshot_id": after.snapshot_id(),
+                    "action": "press",
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(
+                !dismissed.is_error(),
+                "the dialog's button was not pressable: {}",
+                dismissed.text()
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            let settled = snapshot_elements(driver, pid, wid);
+            assert!(
+                settled.tree_text().contains("modal_alert=Keep"),
+                "the press never reached the live alert:\n{}",
+                settled.tree_text()
+            );
+            assert!(
+                !settled.tree_text().contains("Modal dialog:"),
+                "the dismissed dialog is still reported as blocking the window:\n{}",
+                settled.tree_text()
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
 /// A press that opened a menu is delivery.
 ///
 /// The menu an `AXPopUpButton` opens is an accessory window of the process,

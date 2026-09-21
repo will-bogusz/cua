@@ -386,6 +386,9 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
     harness_appkit_an_attached_sheet_still_competes_for_the_keyboard \
     harness_appkit_type_takes_focus_before_it_writes \
     harness_appkit_type_at_a_row_that_cannot_focus_is_not_retryable \
+    harness_appkit_foreground_click_waits_for_the_activation_to_enable_the_control \
+    harness_appkit_date_picker_carries_its_value_and_whether_it_is_settable \
+    harness_appkit_an_app_modal_alert_is_in_the_blocked_window_s_observation \
     harness_appkit_press_that_opens_a_menu_is_delivery_with_the_menu_in_the_tree \
     harness_appkit_capture_with_an_open_popover_reports_the_rect_it_covers \
     harness_appkit_a_plain_window_capture_stays_point_for_point \

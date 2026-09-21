@@ -1729,6 +1729,7 @@ mod tests {
             parent_element_index: None,
             frame: None,
             value_state: None,
+            value_settable: false,
             value_description: None,
             min_value: None,
             max_value: None,
@@ -1750,6 +1751,7 @@ mod tests {
         TreeWalkResult {
             background_open_restricted: std::collections::HashSet::new(),
             related_windows: Vec::new(),
+            modal_windows: Vec::new(),
             tree_markdown: String::new(),
             nodes,
             truncated: false,
@@ -1885,6 +1887,7 @@ mod tests {
         let truncated = TreeWalkResult {
             background_open_restricted: std::collections::HashSet::new(),
             related_windows: Vec::new(),
+            modal_windows: Vec::new(),
             tree_markdown: String::new(),
             nodes: Vec::new(),
             truncated: true,
