@@ -400,6 +400,20 @@
     }
    },
    {
+    "id": "menu_popover",
+    "kind": "menu_and_popover",
+    "description": "CUA_APPKIT_MENU_POPOVER=1 adds an NSPopUpButton whose AXPress opens a native NSMenu, and a button that shows a 320x460 NSPopover anchored at the window's trailing edge so the popover hangs past the window's right edge. The menu is an accessory window outside the window's AX subtree and the popover is a same-process window the window server draws with the window: tests that a press that opened a menu is reported as delivery instead of suspected_noop and that the menu is in the window's tree, and that a capture taken while the popover is open reports the rect its pixels actually cover instead of the window's own frame. popup_choice= label records the option chosen.",
+    "controls": {
+     "popup_button_aid": "pop-menu",
+     "popup_choice_label_aid": "lbl-popup-choice",
+     "popup_option_titles": ["None", "5 minutes before", "15 minutes before"],
+     "popover_button_aid": "btn-popover",
+     "popover_body_aid": "lbl-popover-body",
+     "popover_body_text": "POPOVER_BODY_MARKER_v1",
+     "menu_popover_env": "CUA_APPKIT_MENU_POPOVER"
+    }
+   },
+   {
     "id": "child_editor",
     "kind": "child_window_editor",
     "description": "CUA_APPKIT_CHILD_EDITOR=1 opens a borderless child window drawn inside the main window's frame, holding a text field that takes key at launch; =sheet also begins an attached sheet. Accessibility publishes the child window AS ITS TEXT FIELD (role AXTextField, mapped by _AXUIElementGetWindow, no AXWindow/AXTopLevelUIElement attribute, AXParent = the application), which is Finder's inline rename editor shape: nothing can address, activate or make that surface key, and making the main window key dismisses it. Tests that a window-scoped background type and press_key at the MAIN window reach the editor instead of being refused as a second keyboard destination, that a foreground chord at the main window does not dismiss it, that a set_value on the editor element addressed at the main window is not refused as outside that window, and — with =sheet — that an attached sheet is still counted as a keyboard destination of its own. The editor is not in the main window's subtree, so child_editor= / child_value= / child_committed= labels in the main window publish its state; Return commits and closes it.",

@@ -62,6 +62,23 @@ let kSheetWindowTitle = "CuaTestHarness AppKit Sheet"
 let kFloatingWindowTitle = "CuaTestHarness AppKit Floating"
 /// Not a `kWindowTitle` substring: the harness finds its main window by that.
 let kSecondKeyWindowTitle = "CuaTestHarness Second Key Window"
+/// menu_popover — a popup button whose press opens a native NSMenu, and a
+/// button that shows an NSPopover tall enough to hang past the window's
+/// bottom edge (`CUA_APPKIT_MENU_POPOVER=1`). Both are the shapes a
+/// window-scoped observation and a window capture have to account for: the
+/// menu is an accessory window outside the window's subtree, the popover is
+/// a same-process window the capture is drawn with.
+let kPopupMenuAID = "pop-menu"
+let kPopupChoiceAID = "lbl-popup-choice"
+let kPopupOptionTitles = ["None", "5 minutes before", "15 minutes before"]
+let kPopoverButtonAID = "btn-popover"
+let kPopoverBodyAID = "lbl-popover-body"
+let kPopoverBodyText = "POPOVER_BODY_MARKER_v1"
+/// Taller than the distance from the button to the window's bottom edge, so
+/// AppKit places it overflowing the window rather than inside it.
+let kPopoverContentSize = NSSize(width: 320, height: 460)
+/// How far inside the window's trailing edge the popover is anchored (points).
+let kPopoverOverlap: CGFloat = 40
 /// child_editor — the inline-editor shape (`CUA_APPKIT_CHILD_EDITOR=1`, or
 /// `=sheet` to also open an attached sheet at launch). The application edits
 /// in a separate borderless WindowServer window drawn inside the window it
@@ -376,6 +393,14 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let accelCountLabel = NSTextField(labelWithString: "accel_fired=0")
     var accelCount = 0
     var keyMonitor: Any?
+    let popupButton = NSPopUpButton()
+    let popupChoiceLabel = NSTextField(labelWithString: "popup_choice=none")
+    let popoverButton = NSButton(title: "Show popover", target: nil, action: nil)
+    let popoverBodyLabel = NSTextField(labelWithString: kPopoverBodyText)
+    /// Retained for the window's life: an `NSPopover` that goes away takes
+    /// its window with it, and the capture geometry this fixture exists to
+    /// exercise is only there while the popover is on screen.
+    let popover = NSPopover()
     /// The inline-editor scenario's child window and its mirrors. Opened
     /// after [`show`] has centered the main window, so it is placed inside
     /// the frame the window actually ends up with.
@@ -656,6 +681,27 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         content.addArrangedSubview(pressableRowStack)
 
         var extraHeight: CGFloat = 0
+        if HarnessWindowController.envFlag("CUA_APPKIT_MENU_POPOVER") {
+            content.addArrangedSubview(sectionLabel("menu_popover"))
+            popupButton.setAccessibilityIdentifier(kPopupMenuAID)
+            popupButton.removeAllItems()
+            popupButton.addItems(withTitles: kPopupOptionTitles)
+            popupButton.target = self
+            popupButton.action = #selector(onPopupChoice(_:))
+            popupChoiceLabel.setAccessibilityIdentifier(kPopupChoiceAID)
+            popupChoiceLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            popoverButton.setAccessibilityIdentifier(kPopoverButtonAID)
+            popoverButton.target = self
+            popoverButton.action = #selector(onShowPopover)
+            let popoverRow = NSStackView()
+            popoverRow.orientation = .horizontal
+            popoverRow.spacing = 12
+            popoverRow.addArrangedSubview(popupButton)
+            popoverRow.addArrangedSubview(popupChoiceLabel)
+            popoverRow.addArrangedSubview(popoverButton)
+            content.addArrangedSubview(popoverRow)
+            extraHeight += 60
+        }
         if let mode = ProcessInfo.processInfo.environment["CUA_APPKIT_CHILD_EDITOR"],
            mode == "1" || mode == "sheet" {
             content.addArrangedSubview(sectionLabel("child_editor"))
@@ -743,6 +789,51 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         }
     }
 
+
+    @objc private func onPopupChoice(_ sender: NSPopUpButton) {
+        popupChoiceLabel.stringValue = "popup_choice=\(sender.titleOfSelectedItem ?? "none")"
+    }
+
+    /// Show a popover anchored at the window's trailing edge, so it is drawn
+    /// past the window's right edge.
+    ///
+    /// A popover is a window of this process that the window server draws
+    /// with the window it is anchored to, so a capture of the window covers
+    /// both — and the rect those pixels cover is the union, not the window's
+    /// own frame. The scenario only tests something while that union differs
+    /// from the frame, so the popover must leave the window: anchored to its
+    /// button it opens inside the frame (above it — `.maxY` is the top edge of
+    /// an unflipped view), and below the window there is no screen left, so
+    /// AppKit would fold it back in. `.semitransient` keeps it up while the
+    /// application is in the background, which is when the driver observes it.
+    @objc private func onShowPopover() {
+        guard !popover.isShown else { return }
+        popoverBodyLabel.setAccessibilityIdentifier(kPopoverBodyAID)
+        popoverBodyLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let body = NSViewController()
+        let container = NSView(frame: NSRect(origin: .zero, size: kPopoverContentSize))
+        popoverBodyLabel.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(popoverBodyLabel)
+        NSLayoutConstraint.activate([
+            popoverBodyLabel.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            popoverBodyLabel.bottomAnchor.constraint(
+                equalTo: container.bottomAnchor, constant: -16),
+        ])
+        body.view = container
+        popover.contentViewController = body
+        popover.contentSize = kPopoverContentSize
+        popover.behavior = .semitransient
+        // Anchored a little inside the edge: a popover opens flush against
+        // its anchor rect's far side, and a surface that merely touches the
+        // window is not over it — the overlap is what a real popover has by
+        // way of the control it hangs from.
+        let content = window.contentView!
+        let anchor = content.convert(popoverButton.bounds, from: popoverButton)
+        let trailing = NSRect(
+            x: content.bounds.maxX - kPopoverOverlap, y: anchor.midY, width: 1, height: 1)
+        popover.show(relativeTo: trailing, of: content, preferredEdge: .maxX)
+    }
+
     deinit {
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
@@ -767,6 +858,12 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         DispatchQueue.main.asyncAfter(deadline: .now() + latency) { [weak counterLabel] in
             counterLabel?.stringValue = published
         }
+    }
+
+    /// Whether an opt-in surface was asked for. Only `"1"` turns one on, so a
+    /// stray empty value never changes a launch.
+    static func envFlag(_ name: String) -> Bool {
+        ProcessInfo.processInfo.environment[name] == "1"
     }
 
     /// Milliseconds from `name`, as seconds. Absent or unparseable is 0.

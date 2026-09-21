@@ -14,23 +14,32 @@ use cua_driver_core::protocol::ToolResult;
 
 use crate::windows::WindowBounds;
 
-/// A window's screen origin plus the physical-pixels-per-logical-point scale
-/// of its `screencapture` output.
+/// A window's screen origin, the rect its capture covers, and the
+/// physical-pixels-per-logical-point scale of that capture.
 #[derive(Debug, Clone)]
 pub struct WindowPxFrame {
+    /// The window's own frame. What a window-local point is relative to.
     pub bounds: WindowBounds,
+    /// The screen rect the capture's pixels cover. Equal to `bounds` unless
+    /// the application has a popover or menu hanging over the window, which
+    /// the window server renders into the same capture — the image then
+    /// starts above or to the left of the window, and a pixel counted from
+    /// its top-left is not a pixel counted from the window's.
+    pub content: WindowBounds,
     /// Physical capture pixels per logical point (1.0 non-Retina, 2.0 Retina).
     pub scale: f64,
 }
 
 impl WindowPxFrame {
-    /// Window-local capture pixels → `(screen_x, screen_y, local_pt_x,
-    /// local_pt_y)`. The local-point pair is what
-    /// `CGEventSetWindowLocation` needs for background delivery.
+    /// Capture pixels → `(screen_x, screen_y, local_pt_x, local_pt_y)`. The
+    /// local-point pair is relative to the window, which is what
+    /// `CGEventSetWindowLocation` needs for background delivery; a pixel
+    /// over a popover that hangs outside the window is legitimately negative
+    /// there.
     pub fn to_screen(&self, cx: f64, cy: f64) -> (f64, f64, f64, f64) {
-        let lx = cx / self.scale;
-        let ly = cy / self.scale;
-        (self.bounds.x + lx, self.bounds.y + ly, lx, ly)
+        let sx = self.content.x + cx / self.scale;
+        let sy = self.content.y + cy / self.scale;
+        (sx, sy, sx - self.bounds.x, sy - self.bounds.y)
     }
 }
 
@@ -64,8 +73,14 @@ pub enum PxFrameError {
     },
 }
 
-/// Validate that a raw window capture and its WindowServer bounds describe one
+/// Validate that a raw window capture and the rect it covers describe one
 /// coordinate frame, returning the physical-pixels-per-point backing scale.
+///
+/// `bounds` is the rect the pixels are of, which is the window's own frame
+/// only while nothing is hanging over it — a popover or menu the application
+/// draws over the window is rendered into the same capture, and the rect
+/// then has to be the union or this check measures a squeezed picture as a
+/// clean 1× one.
 ///
 /// macOS window captures are 1× or 2×. Small rounding differences are allowed,
 /// but arbitrary ratios are not: the original #2237 failure paired a parent
@@ -109,25 +124,36 @@ pub fn validate_capture_frame(
 
 /// Resolve `window_id`'s screen origin and capture scale. Blocking: enumerates
 /// CGWindowList and takes one window capture to measure the scale.
+///
+/// The frame a window-local pixel is relative to stays the window's own
+/// origin: what a capture covers may be wider than the window, but the
+/// coordinate an action is given is still "so many capture pixels into this
+/// window".
 pub fn resolve_window_px_frame(window_id: u32) -> Result<WindowPxFrame, PxFrameError> {
     let bounds = crate::windows::window_bounds_by_id(window_id)
         .filter(|b| b.width > 0.0 && b.height > 0.0)
         .ok_or(PxFrameError::WindowNotFound { window_id })?;
     // A window-local point is meaningful only when the current capture proves
     // the same frame and scale. Never guess 1× on capture failure.
-    let png = crate::capture::screenshot_window_bytes(window_id).map_err(|e| {
+    let captured =
+        crate::capture::capture_window_image(window_id).map_err(|e| {
+            PxFrameError::CaptureUnavailable {
+                window_id,
+                reason: e.to_string(),
+            }
+        })?;
+    let (pw, ph) = crate::capture::png_dimensions(&captured.png).map_err(|e| {
         PxFrameError::CaptureUnavailable {
             window_id,
             reason: e.to_string(),
         }
     })?;
-    let (pw, ph) =
-        crate::capture::png_dimensions(&png).map_err(|e| PxFrameError::CaptureUnavailable {
-            window_id,
-            reason: e.to_string(),
-        })?;
-    let scale = validate_capture_frame(window_id, &bounds, pw, ph)?;
-    Ok(WindowPxFrame { bounds, scale })
+    let scale = validate_capture_frame(window_id, &captured.content, pw, ph)?;
+    Ok(WindowPxFrame {
+        bounds,
+        content: captured.content,
+        scale,
+    })
 }
 
 /// The shared refusal for a pixel action whose window cannot be framed.
@@ -243,14 +269,19 @@ pub async fn resolve_or_refuse(window_id: u32) -> Result<WindowPxFrame, ToolResu
 mod tests {
     use super::*;
 
+    fn bounds(x: f64, y: f64, width: f64, height: f64) -> WindowBounds {
+        WindowBounds {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
     fn frame(scale: f64) -> WindowPxFrame {
         WindowPxFrame {
-            bounds: WindowBounds {
-                x: 100.0,
-                y: 580.0,
-                width: 500.0,
-                height: 500.0,
-            },
+            bounds: bounds(100.0, 580.0, 500.0, 500.0),
+            content: bounds(100.0, 580.0, 500.0, 500.0),
             scale,
         }
     }
@@ -268,6 +299,27 @@ mod tests {
         let (sx, sy, lx, ly) = frame(2.0).to_screen(60.0, 80.0);
         assert_eq!((sx, sy), (130.0, 620.0));
         assert_eq!((lx, ly), (30.0, 40.0));
+    }
+
+    /// A capture that also holds a popover starts above and to the left of
+    /// the window. A pixel counted from the image's top-left is then not a
+    /// pixel counted from the window's, and reading it as one is what put
+    /// every escalated click on the wrong control.
+    #[test]
+    fn a_capture_wider_than_the_window_counts_from_its_own_origin() {
+        let frame = WindowPxFrame {
+            bounds: bounds(100.0, 580.0, 500.0, 500.0),
+            content: bounds(40.0, 500.0, 700.0, 700.0),
+            scale: 1.0,
+        };
+        // The window's own top-left is 60 px right and 80 px down in this image.
+        let (sx, sy, lx, ly) = frame.to_screen(60.0, 80.0);
+        assert_eq!((sx, sy), (100.0, 580.0));
+        assert_eq!((lx, ly), (0.0, 0.0));
+        // And a pixel over the part of the popover that hangs outside the
+        // window is a negative window-local point, not a point inside it.
+        let (_, _, lx, ly) = frame.to_screen(10.0, 10.0);
+        assert_eq!((lx, ly), (-50.0, -70.0));
     }
 
     #[test]

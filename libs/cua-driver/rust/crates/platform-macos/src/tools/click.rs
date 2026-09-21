@@ -552,7 +552,10 @@ impl NextRung {
             NextRung::PixelForeground => {
                 "An AX press never carries pointer events, and fronting the app does not change \
                  that. To deliver a real click, take a fresh get_window_state screenshot and \
-                 click this control's pixel center with delivery_mode:\"foreground\"."
+                 click this control's pixel center with delivery_mode:\"foreground\". Take that \
+                 centre from the control's own frame, not by eye off the image: a capture that \
+                 also holds an open popover or menu covers more than the window, so its pixels \
+                 are not the window's points."
             }
             NextRung::Foreground => {
                 "A PID-routed click carries no trusted pointer events. Re-run this same pixel \
@@ -568,6 +571,49 @@ fn watched_signals(polled: bool) -> &'static str {
     } else {
         "element state, app focus, window contents"
     }
+}
+
+/// One option of a popup/select control, as the reply lists it.
+///
+/// # Safety
+/// `element` must be a live AX element.
+unsafe fn popup_option_label(element: AXUIElementRef) -> Option<String> {
+    let title = copy_string_attr(element, "AXTitle").unwrap_or_default();
+    let value = copy_string_attr(element, "AXValue").unwrap_or_default();
+    if title.is_empty() && value.is_empty() {
+        return None;
+    }
+    Some(if value.is_empty() || value == title {
+        format!("\"{title}\"")
+    } else {
+        format!("\"{title}\" (value: {value})")
+    })
+}
+
+/// The options an `AXPopUpButton` offers.
+///
+/// A popup's options are the items of its `AXMenu`, not its direct children:
+/// once the menu is open the button has exactly one child, a titleless
+/// `AXMenu`, and reading only direct children reported no options at all —
+/// so the advice that names them never reached a caller who had just opened
+/// one.
+///
+/// # Safety
+/// `element` must be a live AX element; every child copied here is released.
+unsafe fn popup_option_labels(element: AXUIElementRef) -> Vec<String> {
+    let mut options = Vec::new();
+    for child in copy_children(element) {
+        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
+            for item in copy_children(child) {
+                options.extend(popup_option_label(item));
+                CFRelease(item as _);
+            }
+        } else {
+            options.extend(popup_option_label(child));
+        }
+        CFRelease(child as _);
+    }
+    options
 }
 
 fn noop_reason(chromium_family: bool, signals: &str) -> String {
@@ -2447,42 +2493,22 @@ fn perform_ax_click(
         }
     }
 
-    // AXPopUpButton: list available options, redirect to set_value.
+    // AXPopUpButton: name the options and the route that does not depend on
+    // a menu staying open.
     if role == "AXPopUpButton" {
-        let children = unsafe { copy_children(element) };
-        if !children.is_empty() {
-            let options: Vec<String> = children
-                .iter()
-                .filter_map(|&child| {
-                    let t = unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_default();
-                    let v = unsafe { copy_string_attr(child, "AXValue") }.unwrap_or_default();
-                    if t.is_empty() && v.is_empty() {
-                        return None;
-                    }
-                    Some(if v.is_empty() || v == t {
-                        format!("\"{t}\"")
-                    } else {
-                        format!("\"{t}\" (value: {v})")
-                    })
-                })
-                .collect();
-            for &child in &children {
-                unsafe {
-                    CFRelease(child as _);
-                }
-            }
-
-            if !options.is_empty() {
-                let opt_list = options.join(", ");
-                summary.push_str(
-                    "\n\n⚠️ This is a popup/select button. The native macOS menu closes \
-                     immediately when the window is in the background. Do NOT use click \
-                     again — instead, use:\n  set_value(pid, window_id, element_index, value)\n\
-                     Available options: [",
-                );
-                summary.push_str(&opt_list);
-                summary.push(']');
-            }
+        summary.push_str(
+            "\n\n⚠️ This is a popup/select button. Its menu is a surface of its own rather \
+             than part of this window's subtree, and a native macOS menu closes as soon as \
+             the window stops being key. To choose an option without depending on an open \
+             menu, use:\n  set_value(pid, window_id, element_index, value)\n\
+             To work inside the menu instead, re-observe this window: an open menu is \
+             rendered under this control.",
+        );
+        let options = unsafe { popup_option_labels(element) };
+        if !options.is_empty() {
+            summary.push_str("\nAvailable options: [");
+            summary.push_str(&options.join(", "));
+            summary.push(']');
         }
     }
 

@@ -379,6 +379,9 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
     harness_appkit_foreground_chord_does_not_dismiss_the_child_editor \
     harness_appkit_set_value_on_the_child_editor_is_inside_its_window \
     harness_appkit_an_attached_sheet_still_competes_for_the_keyboard \
+    harness_appkit_press_that_opens_a_menu_is_delivery_with_the_menu_in_the_tree \
+    harness_appkit_capture_with_an_open_popover_reports_the_rect_it_covers \
+    harness_appkit_a_plain_window_capture_stays_point_for_point \
       harness_appkit_slider_drag_px_background; do
       run_test "appkit-${appkit_test}" cargo test -p cua-driver --test harness_appkit_test -- \
         --ignored --exact "${appkit_test}" --nocapture --test-threads=1

@@ -215,6 +215,76 @@ pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXU
     (error == kAXErrorSuccess && !element.is_null()).then_some(element)
 }
 
+/// How far the menu search climbs before giving up. Menus nest a few levels
+/// (submenu → item → menu); anything deeper is not a menu chain.
+const MENU_ANCESTRY_DEPTH: usize = 12;
+
+/// The root `AXMenu` open at a screen point, when the walk of `window_id`
+/// would not reach it anyway.
+///
+/// An open `NSMenu` is a window of the application in its own right. AppKit
+/// exposes it as a child of the control that opened it only sometimes — a
+/// menu popped up detached, or opened from a control in a surface that is
+/// not AX-mapped to the observed window, has no edge into that window's
+/// subtree at all, so a window-scoped walk cannot see it while the user
+/// plainly can. Hit-testing the menu's own window and climbing to the
+/// outermost `AXMenu` is the route that does not depend on that edge.
+///
+/// `None` when the point is over no menu, or over one the walk already
+/// renders: a menu whose ancestry reaches the requested window, or the menu
+/// bar, is reached by the ordinary descent and must not be walked twice.
+///
+/// # Safety
+///
+/// The caller must release any returned element exactly once with `CFRelease`.
+pub unsafe fn copy_unreachable_menu_root_at(
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+) -> Option<AXUIElementRef> {
+    let mut current = element_at_screen_position(pid, x, y)?;
+    let mut menu: Option<AXUIElementRef> = None;
+    let mut reachable = false;
+    for _ in 0..MENU_ANCESTRY_DEPTH {
+        let role = copy_string_attr(current, "AXRole").unwrap_or_default();
+        match role.as_str() {
+            "AXMenu" => {
+                // Keep climbing: a submenu's root is the menu above it, and
+                // the outermost one is what the caller can render.
+                if let Some(inner) = menu.replace(current) {
+                    CFRelease(inner as CFTypeRef);
+                }
+                CFRetain(current as CFTypeRef);
+            }
+            "AXMenuBar" => reachable = true,
+            "AXWindow" | "AXSheet" => {
+                reachable = reachable
+                    || (window_id.is_some() && ax_get_window_id(current) == window_id);
+            }
+            _ => {}
+        }
+        let parent = copy_element_attr(current, "AXParent");
+        CFRelease(current as CFTypeRef);
+        match parent {
+            Some(parent) => current = parent,
+            None => {
+                current = std::ptr::null_mut();
+                break;
+            }
+        }
+    }
+    if !current.is_null() {
+        CFRelease(current as CFTypeRef);
+    }
+    let menu = menu?;
+    if reachable {
+        CFRelease(menu as CFTypeRef);
+        return None;
+    }
+    Some(menu)
+}
+
 // ── AXValue functions ────────────────────────────────────────────────────────
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {

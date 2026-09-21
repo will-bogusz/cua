@@ -543,6 +543,12 @@ pub enum ActionEvidenceKind {
 /// Which post-dispatch observation a platform probe named. The coarse
 /// [`ActionEvidenceKind::WindowChange`] says the target reacted; this says
 /// what was watched when it did.
+///
+/// `MenuOpened` is 0.10's addition: a menu or popover the application put on
+/// screen is a reaction the other four signals cannot see — it lives in an
+/// accessory window outside the target window's own subtree. It refutes "the
+/// target did not react"; like every other signal it never claims the action
+/// did what the caller wanted.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionEvidenceSignal {
@@ -550,6 +556,7 @@ pub enum ActionEvidenceSignal {
     AppFocus,
     WindowTree,
     WindowChange,
+    MenuOpened,
 }
 
 impl ActionEvidenceSignal {
@@ -561,17 +568,19 @@ impl ActionEvidenceSignal {
             Self::AppFocus => "app_focus",
             Self::WindowTree => "window_tree",
             Self::WindowChange => "window_change",
+            Self::MenuOpened => "menu_opened",
         }
     }
 
-    /// Only the four published signals are accepted; an unknown spelling
-    /// yields `None` rather than a claim about what the target did.
+    /// Only the published signals are accepted; an unknown spelling yields
+    /// `None` rather than a claim about what the target did.
     pub fn from_wire(raw: &str) -> Option<Self> {
         match raw {
             "element_state" => Some(Self::ElementState),
             "app_focus" => Some(Self::AppFocus),
             "window_tree" => Some(Self::WindowTree),
             "window_change" => Some(Self::WindowChange),
+            "menu_opened" => Some(Self::MenuOpened),
             _ => None,
         }
     }
@@ -947,9 +956,10 @@ mod tests {
                 "app_focus",
                 "window_tree",
                 "window_change",
+                "menu_opened",
                 null
             ]),
-            "an optional signal is absent or one of the four published names"
+            "an optional signal is absent or one of the five published names"
         );
 
         let escalation = object_variant(&properties["escalation"]);
@@ -1069,6 +1079,7 @@ mod tests {
             ActionEvidenceSignal::AppFocus,
             ActionEvidenceSignal::WindowTree,
             ActionEvidenceSignal::WindowChange,
+            ActionEvidenceSignal::MenuOpened,
         ] {
             let mut result = confirmed_result();
             result.evidence = Some(vec![ActionEvidence {

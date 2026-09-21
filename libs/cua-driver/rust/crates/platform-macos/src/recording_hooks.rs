@@ -63,9 +63,12 @@ pub fn element_window_local_xy(
             let frame =
                 crate::tools::px_frame::resolve_window_px_frame(u32::try_from(window_id).ok()?)
                     .ok()?;
+            // Capture pixels are counted from the rect the capture covers,
+            // which is the window's own frame only while nothing is hanging
+            // over it.
             Some((
-                (sx - frame.bounds.x) * frame.scale,
-                (sy - frame.bounds.y) * frame.scale,
+                (sx - frame.content.x) * frame.scale,
+                (sy - frame.content.y) * frame.scale,
             ))
         });
     Some((window_id, point))

@@ -111,6 +111,14 @@ pub struct Signals {
     pub focus: Option<String>,
     /// Digest of the target window's capped AX subtree.
     pub tree: Option<u64>,
+    /// CGWindowIDs of the accessory surfaces the application has on screen.
+    ///
+    /// An open `NSMenu` is one of them, and so is a popover: both are drawn
+    /// in their own window outside the target window's AX subtree, so none
+    /// of the three signals above moves when one appears. Compared in one
+    /// direction only — a surface gained is a reaction, a surface lost is
+    /// not, because the driver's own foreground handling can dismiss one.
+    pub menus: Vec<u32>,
 }
 
 /// What the probe observed after the dispatch; a reaction names the signal
@@ -143,6 +151,10 @@ pub const ELEMENT_SIGNAL: &str = "element_state";
 pub const FOCUS_SIGNAL: &str = "app_focus";
 /// The target window's capped subtree digest differed.
 pub const TREE_SIGNAL: &str = "window_tree";
+/// The application put a menu or popover on screen. Additive over contract
+/// 0.10's four signals; like them it refutes "the target did not react" and
+/// claims nothing about the caller's intended postcondition.
+pub const MENU_SIGNAL: &str = "menu_opened";
 
 impl Evidence {
     pub fn signal(self) -> &'static str {
@@ -273,6 +285,7 @@ impl DeliveryProbe {
             .as_ref()
             .map_or(ElementRead::Unreadable, element_state);
         let focus = focus_state(pid);
+        let menus = menu_state(pid);
         let first = tree_digest(pid, window_id);
         let second = tree_digest(pid, window_id);
         let quiescent = matches!((first, second), (Some(a), Some(b)) if a == b);
@@ -284,6 +297,7 @@ impl DeliveryProbe {
                 element: state,
                 focus,
                 tree: second,
+                menus,
             },
             quiescent,
             elapsed: start.elapsed(),
@@ -343,6 +357,9 @@ impl DeliveryProbe {
             Evidence::Changed(ELEMENT_SIGNAL) => {
                 Some(now.element.state()? == reacted.element.state()?)
             }
+            Evidence::Changed(MENU_SIGNAL) => {
+                Some(!gained_menus(&self.before.menus, &now.menus).is_empty())
+            }
             Evidence::ElementGone => Some(now.element == ElementRead::Gone),
             _ => None,
         }
@@ -378,6 +395,7 @@ impl DeliveryProbe {
             } else {
                 None
             },
+            menus: menu_state(self.pid),
         }
     }
 
@@ -412,6 +430,11 @@ fn settle_budget(before: &Signals) -> Duration {
 /// it; an unreadable half is unknown, never a change. The one exception is an
 /// element that was readable before and reports itself destroyed after: that
 /// is the reaction, not a missing read.
+///
+/// The accessory-surface set is checked last and one-way: it can only add a
+/// reaction, never turn [`Evidence::Unusable`] into [`Evidence::Unchanged`].
+/// "No menu appeared" is not evidence that nothing happened, so it must not
+/// buy the probe the right to say `suspected_noop`.
 pub fn classify(before: &Signals, after: &Signals, quiescent: bool) -> Evidence {
     let mut usable = false;
     match (&before.element, &after.element) {
@@ -437,6 +460,9 @@ pub fn classify(before: &Signals, after: &Signals, quiescent: bool) -> Evidence 
                 return Evidence::Changed(TREE_SIGNAL);
             }
         }
+    }
+    if !gained_menus(&before.menus, &after.menus).is_empty() {
+        return Evidence::Changed(MENU_SIGNAL);
     }
     if usable {
         Evidence::Unchanged
@@ -515,6 +541,24 @@ fn tree_digest(pid: i32, window_id: u32) -> Option<u64> {
     Some(std::hash::Hasher::finish(&hash))
 }
 
+/// The accessory windows `pid` currently shows. An open `NSMenu` is one of
+/// them; so is a popover's own backing window once it is on screen above the
+/// application's normal layer. Read from WindowServer rather than AX because
+/// neither surface is reliably reachable from the target window's subtree —
+/// which is exactly why the other three signals miss it.
+fn menu_state(pid: i32) -> Vec<u32> {
+    crate::windows::accessory_window_ids(pid)
+}
+
+/// Accessory windows present after the dispatch that were not present before.
+fn gained_menus(before: &[u32], after: &[u32]) -> Vec<u32> {
+    after
+        .iter()
+        .copied()
+        .filter(|window_id| !before.contains(window_id))
+        .collect()
+}
+
 pub struct NoopReport<'a> {
     pub signals: &'a str,
     pub escalation: Option<serde_json::Value>,
@@ -589,12 +633,16 @@ pub fn apply_evidence(
     }
 }
 
-/// How a reaction reads in the reply. Every signal but one is a state that
+/// How a reaction reads in the reply. Every signal but two is a state that
 /// differs; a destroyed element is an absence, and "element_state changed"
-/// would leave the agent looking for a control that no longer exists.
+/// would leave the agent looking for a control that no longer exists, while
+/// "menu_opened changed" would say nothing about what is now on screen.
 fn reaction_phrase(evidence: Evidence) -> String {
     match evidence {
         Evidence::ElementGone => "the element the probe watched is gone".to_owned(),
+        Evidence::Changed(MENU_SIGNAL) => {
+            "the application opened a menu or popover".to_owned()
+        }
         other => format!("{} changed", other.signal()),
     }
 }
@@ -613,7 +661,13 @@ mod tests {
             element,
             focus: focus.map(str::to_owned),
             tree,
+            menus: Vec::new(),
         }
+    }
+
+    fn with_menus(mut signals: Signals, menus: &[u32]) -> Signals {
+        signals.menus = menus.to_vec();
+        signals
     }
 
     fn probe_over_a_pid_that_answers_nothing() -> DeliveryProbe {
@@ -800,6 +854,56 @@ mod tests {
         let before = signals(ElementRead::Unreadable, Some("AXWebArea|doc"), None);
         let after = signals(ElementRead::Unreadable, Some("AXWebArea|doc"), None);
         assert_eq!(classify(&before, &after, true), Evidence::Unchanged);
+    }
+
+    /// The shape this signal exists for: a popup button whose menu opened
+    /// keeps its role, title, value, focus, selection, enablement and frame,
+    /// the app's focused element does not move, and the menu is drawn in its
+    /// own accessory window outside the target window's subtree. Every signal
+    /// contract 0.10 published reads identical, and the press was reported as
+    /// a no-op while the menu stood open on screen.
+    #[test]
+    fn an_opened_menu_is_delivery_even_when_every_other_signal_holds() {
+        let steady = signals(state("AXPopUpButton|Alarm|None|"), Some("f"), Some(11));
+        let before = with_menus(steady.clone(), &[900]);
+        let after = with_menus(steady, &[900, 4211]);
+        let evidence = classify(&before, &after, true);
+        assert_eq!(evidence, Evidence::Changed(MENU_SIGNAL));
+        assert!(evidence.is_reaction());
+        assert_eq!(
+            reaction_phrase(evidence),
+            "the application opened a menu or popover"
+        );
+    }
+
+    #[test]
+    fn an_opened_menu_publishes_a_signal_the_action_contract_keeps() {
+        assert_eq!(
+            cua_driver_contract::ActionEvidenceSignal::from_wire(MENU_SIGNAL),
+            Some(cua_driver_contract::ActionEvidenceSignal::MenuOpened)
+        );
+    }
+
+    /// One direction only. A menu that was already open and then closed is
+    /// routinely the driver's own doing — a foreground restore dismisses it —
+    /// so a lost accessory window must not be sold as the app reacting.
+    #[test]
+    fn a_dismissed_menu_is_not_a_reaction_on_its_own() {
+        let steady = signals(state("AXPopUpButton|Alarm|None|"), Some("f"), Some(11));
+        let before = with_menus(steady.clone(), &[900, 4211]);
+        let after = with_menus(steady, &[900]);
+        assert_eq!(classify(&before, &after, true), Evidence::Unchanged);
+    }
+
+    /// Absence of a menu is not evidence that nothing happened. A probe with
+    /// nothing comparable must stay `Unusable` — which reports "delivery
+    /// unverified", not `suspected_noop` — even though the accessory-window
+    /// set was always readable.
+    #[test]
+    fn a_readable_but_empty_menu_set_never_buys_a_noop_verdict() {
+        let before = signals(ElementRead::Unreadable, None, None);
+        let after = signals(ElementRead::Unreadable, None, None);
+        assert_eq!(classify(&before, &after, true), Evidence::Unusable);
     }
 
     #[test]

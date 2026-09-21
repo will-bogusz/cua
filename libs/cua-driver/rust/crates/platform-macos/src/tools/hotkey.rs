@@ -649,8 +649,8 @@ impl Tool for HotkeyTool {
                     )?;
                     let frame = super::px_frame::resolve_window_px_frame(wid).ok()?;
                     Some((
-                        (screen_x - frame.bounds.x) * frame.scale,
-                        (screen_y - frame.bounds.y) * frame.scale,
+                        (screen_x - frame.content.x) * frame.scale,
+                        (screen_y - frame.content.y) * frame.scale,
                     ))
                 })
                 .await

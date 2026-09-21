@@ -396,15 +396,28 @@ pub fn window_info_by_id(window_id: u32) -> Option<WindowInfo> {
         .find(|w| w.window_id == window_id)
 }
 
-/// CGWindowIDs of the accessory (`layer != 0`) windows `pid` currently shows.
+/// The accessory (`layer != 0`) windows `pid` currently shows, front first.
 ///
-/// An open NSMenu is one of them, so sampling this set across an `AXShowMenu`
-/// answers whether a menu actually appeared: the action returns
-/// `kAXErrorSuccess` on controls that never open one.
-pub fn accessory_window_ids(pid: i32) -> Vec<u32> {
-    all_windows_any_layer()
+/// An open NSMenu is one of them, and its frame is where an accessibility
+/// hit-test can find the menu that nothing in the owning window's subtree
+/// points at.
+pub fn accessory_windows(pid: i32) -> Vec<WindowInfo> {
+    let mut windows: Vec<WindowInfo> = all_windows_any_layer()
         .into_iter()
         .filter(|window| window.pid == pid && window.layer != 0 && window.is_on_screen)
+        .collect();
+    windows.sort_by_key(|window| std::cmp::Reverse(window.z_index));
+    windows
+}
+
+/// CGWindowIDs of the accessory windows `pid` currently shows.
+///
+/// Sampling this set across an `AXShowMenu` answers whether a menu actually
+/// appeared: the action returns `kAXErrorSuccess` on controls that never
+/// open one.
+pub fn accessory_window_ids(pid: i32) -> Vec<u32> {
+    accessory_windows(pid)
+        .into_iter()
         .map(|window| window.window_id)
         .collect()
 }
@@ -427,6 +440,132 @@ pub fn menu_appeared_since(pid: i32, before: &[u32]) -> bool {
         }
         std::thread::sleep(MENU_APPEARANCE_POLL);
     }
+}
+
+/// How long the AX window inventory behind [`capture_content_bounds`] may
+/// take. A slow answer degrades to "no window is AX-mapped", which widens the
+/// captured rect rather than narrowing it — the safe direction, because a
+/// rect that is too small is the mislabel this exists to remove.
+const AX_WINDOW_INVENTORY_TIMEOUT_SECONDS: f32 = 0.25;
+
+/// The CGWindowIDs `pid` exposes as top-level `AXWindow`s.
+///
+/// A surface the application hangs over one of its windows — a popover, a
+/// menu, a tooltip, an autocomplete panel — has no `AXWindow` of its own, so
+/// membership here is what separates "another window of this application"
+/// from "part of this window's presentation".
+fn ax_mapped_window_ids(pid: i32) -> Vec<u32> {
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    // SAFETY: every element below is owned by this function — the application
+    // element is created here and each window comes from a `+1` copy — and
+    // each one is released exactly once.
+    unsafe {
+        let app = crate::ax::bindings::AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return Vec::new();
+        }
+        crate::ax::bindings::AXUIElementSetMessagingTimeout(
+            app,
+            AX_WINDOW_INVENTORY_TIMEOUT_SECONDS,
+        );
+        let ids = crate::ax::bindings::copy_ax_windows(app)
+            .into_iter()
+            .filter_map(|window| {
+                let id = crate::ax::bindings::ax_get_window_id(window);
+                CFRelease(window as CFTypeRef);
+                id
+            })
+            .collect();
+        CFRelease(app as CFTypeRef);
+        ids
+    }
+}
+
+fn rects_intersect(a: &WindowBounds, b: &WindowBounds) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+fn rect_union(a: &WindowBounds, b: &WindowBounds) -> WindowBounds {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    WindowBounds {
+        x,
+        y,
+        width: (a.x + a.width).max(b.x + b.width) - x,
+        height: (a.y + a.height).max(b.y + b.height) - y,
+    }
+}
+
+/// Whether `candidate` is part of how `target` is presented rather than a
+/// window in its own right: same process, on screen, drawn in front of the
+/// target, and carrying no `AXWindow` identity.
+fn is_attached_surface(target: &WindowInfo, candidate: &WindowInfo, ax_mapped: &[u32]) -> bool {
+    candidate.window_id != target.window_id
+        && candidate.pid == target.pid
+        && candidate.is_on_screen
+        && candidate.z_index > target.z_index
+        && candidate.bounds.width > 0.0
+        && candidate.bounds.height > 0.0
+        && !is_desktop_surface(candidate)
+        && !ax_mapped.contains(&candidate.window_id)
+}
+
+/// The screen rect a window capture covers: `target`'s own frame grown by
+/// every attached surface that touches it, transitively — a popover anchored
+/// to the window, and the menu that popover's own popup button opened.
+///
+/// ScreenCaptureKit's desktop-independent window filter renders those
+/// surfaces into the window's capture, so the window's frame is not the
+/// frame the pixels cover once one is open. Pure over an enumeration so the
+/// geometry is testable without a WindowServer.
+pub(crate) fn capture_content_union(
+    target: &WindowInfo,
+    windows: &[WindowInfo],
+    ax_mapped: &[u32],
+) -> WindowBounds {
+    let mut union = target.bounds.clone();
+    let mut absorbed: Vec<u32> = vec![target.window_id];
+    loop {
+        let mut grew = false;
+        for candidate in windows {
+            if absorbed.contains(&candidate.window_id)
+                || !is_attached_surface(target, candidate, ax_mapped)
+                || !rects_intersect(&union, &candidate.bounds)
+            {
+                continue;
+            }
+            union = rect_union(&union, &candidate.bounds);
+            absorbed.push(candidate.window_id);
+            grew = true;
+        }
+        if !grew {
+            return union;
+        }
+    }
+}
+
+/// [`capture_content_union`] against the live WindowServer. `None` when the
+/// requested window is no longer listed.
+///
+/// The AX inventory is only read once a same-process window is actually
+/// drawn in front of the target, so the ordinary capture — one window, no
+/// attached surface — pays nothing and reports the window's own frame.
+pub fn capture_content_bounds(window_id: u32) -> Option<WindowBounds> {
+    let windows = all_windows_any_layer();
+    let target = windows.iter().find(|w| w.window_id == window_id)?;
+    let has_candidate = windows.iter().any(|candidate| {
+        candidate.window_id != target.window_id
+            && candidate.pid == target.pid
+            && candidate.is_on_screen
+            && candidate.z_index > target.z_index
+            && !is_desktop_surface(candidate)
+            && rects_intersect(&target.bounds, &candidate.bounds)
+    });
+    if !has_candidate {
+        return Some(target.bounds.clone());
+    }
+    let ax_mapped = ax_mapped_window_ids(target.pid);
+    Some(capture_content_union(target, &windows, &ax_mapped))
 }
 
 /// Look up a window's bounds by its CGWindowID.
@@ -640,5 +779,93 @@ mod tests {
         surface.layer = desktop;
         assert!(is_desktop_surface(&surface));
         assert!(!is_desktop_surface(&window(42, 800, "Finder")));
+    }
+
+    fn surface(
+        window_id: u32,
+        pid: i32,
+        z_index: usize,
+        bounds: (f64, f64, f64, f64),
+    ) -> WindowInfo {
+        let mut info = window(window_id, pid, "Harness");
+        info.z_index = z_index;
+        info.bounds = WindowBounds {
+            x: bounds.0,
+            y: bounds.1,
+            width: bounds.2,
+            height: bounds.3,
+        };
+        info
+    }
+
+    fn rect(bounds: &WindowBounds) -> (f64, f64, f64, f64) {
+        (bounds.x, bounds.y, bounds.width, bounds.height)
+    }
+
+    /// One window, nothing hanging over it: the capture covers the window and
+    /// nothing else, so the 1:1 grid every pixel action rests on stays true.
+    #[test]
+    fn a_lone_window_is_captured_at_its_own_frame() {
+        let target = surface(10, 800, 1, (253., 34., 935., 598.));
+        let others = vec![surface(11, 900, 5, (0., 0., 1512., 900.))];
+        let windows = vec![target.clone(), others[0].clone()];
+        assert_eq!(
+            rect(&capture_content_union(&target, &windows, &[10])),
+            (253., 34., 935., 598.)
+        );
+    }
+
+    /// The measured shape: a 935x598 window with a 326x465 popover hanging
+    /// off its right edge and below its bottom. The capture the window server
+    /// renders is the 1171x776 union, and reporting the window's own frame is
+    /// what labelled a 0.77x image "1 px = 1 window point".
+    #[test]
+    fn a_popover_overflowing_the_window_grows_the_captured_rect() {
+        let target = surface(29973, 800, 3, (253., 34., 935., 598.));
+        let popover = surface(29979, 800, 4, (1098., 345., 326., 465.));
+        let windows = vec![target.clone(), popover];
+        let union = capture_content_union(&target, &windows, &[29973]);
+        assert_eq!(rect(&union), (253., 34., 1171., 776.));
+    }
+
+    /// A menu opened from a control inside that popover touches the popover,
+    /// not the window. The union has to close transitively or the menu's
+    /// pixels are in the image while the reported frame denies them.
+    #[test]
+    fn a_menu_hanging_off_the_popover_is_reached_transitively() {
+        let target = surface(29973, 800, 3, (0., 0., 900., 600.));
+        let popover = surface(29979, 800, 4, (850., 500., 300., 300.));
+        let menu = surface(30010, 800, 5, (1100., 700., 200., 400.));
+        let windows = vec![target.clone(), menu, popover];
+        let union = capture_content_union(&target, &windows, &[29973]);
+        assert_eq!(rect(&union), (0., 0., 1300., 1100.));
+    }
+
+    /// Another document window of the same application is a window in its own
+    /// right — it carries an `AXWindow` identity — and the desktop-independent
+    /// filter does not draw it into this window's capture. Absorbing it would
+    /// claim a frame the pixels never covered.
+    #[test]
+    fn another_window_of_the_same_app_is_not_part_of_this_capture() {
+        let target = surface(10, 800, 3, (0., 0., 900., 600.));
+        let sibling = surface(11, 800, 4, (400., 300., 900., 600.));
+        let windows = vec![target.clone(), sibling];
+        assert_eq!(
+            rect(&capture_content_union(&target, &windows, &[10, 11])),
+            (0., 0., 900., 600.)
+        );
+    }
+
+    /// Behind the target is behind the capture: a surface the window server
+    /// draws under the window contributes no pixels to it.
+    #[test]
+    fn a_surface_behind_the_target_is_not_part_of_this_capture() {
+        let target = surface(10, 800, 5, (0., 0., 900., 600.));
+        let behind = surface(11, 800, 2, (800., 500., 400., 400.));
+        let windows = vec![target.clone(), behind];
+        assert_eq!(
+            rect(&capture_content_union(&target, &windows, &[10])),
+            (0., 0., 900., 600.)
+        );
     }
 }

@@ -207,22 +207,22 @@ fn capture_window_with_backends<N, F>(
     window_id: u32,
     native: N,
     fallback: F,
-) -> anyhow::Result<Vec<u8>>
+) -> anyhow::Result<CapturedWindowFrame>
 where
-    N: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
-    F: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
+    N: FnOnce(u32) -> anyhow::Result<CapturedWindowFrame>,
+    F: FnOnce(u32) -> anyhow::Result<CapturedWindowFrame>,
 {
     match native(window_id) {
-        Ok(bytes) if !bytes.is_empty() => Ok(bytes),
+        Ok(frame) if !frame.png.is_empty() => Ok(frame),
         Ok(_) => match fallback(window_id) {
-            Ok(bytes) => Ok(bytes),
+            Ok(frame) => Ok(frame),
             Err(fallback_err) => Err(anyhow::anyhow!(
                 "window {window_id} capture failed: native produced empty bytes; \
                  shell fallback: {fallback_err:#}"
             )),
         },
         Err(native_err) => match fallback(window_id) {
-            Ok(bytes) => Ok(bytes),
+            Ok(frame) => Ok(frame),
             Err(fallback_err) => Err(anyhow::anyhow!(
                 "window {window_id} capture failed: native: {native_err:#}; \
                  shell fallback: {fallback_err:#}"
@@ -232,6 +232,10 @@ where
 }
 
 /// Shell compatibility path: `screencapture -l <id> -x -o <tmp.png>`.
+///
+/// `screencapture -l` renders the one window it is given, so its pixels cover
+/// that window's frame and nothing else — the content rect is filled in by
+/// the caller from the same WindowServer read the frame came from.
 fn screenshot_window_bytes_shell(window_id: u32) -> anyhow::Result<Vec<u8>> {
     let capture = SecureCapturePath::new("window.png")?;
     let tmp_path = capture.file.to_string_lossy().into_owned();
@@ -307,6 +311,10 @@ struct WindowCapturePlan {
     filter: screencapturekit::prelude::SCContentFilter,
     config: WindowScreenshotConfiguration,
     identity: WindowCaptureIdentity,
+    /// The screen rect, in points, the configured output covers. Equal to the
+    /// window's own frame unless the application has a popover or menu hanging
+    /// over it, which the desktop-independent filter draws into the capture.
+    content: crate::windows::WindowBounds,
 }
 
 enum WindowScreenshotConfiguration {
@@ -319,9 +327,21 @@ fn uses_modern_window_screenshot() -> bool {
     *AVAILABLE.get_or_init(|| objc2::runtime::AnyClass::get("SCScreenshotConfiguration").is_some())
 }
 
+/// Encoded pixels plus the screen rect, in points, that they cover.
+#[derive(Debug)]
+struct CapturedWindowFrame {
+    png: Vec<u8>,
+    content: crate::windows::WindowBounds,
+}
+
 pub struct CapturedWindowImage {
     pub png: Vec<u8>,
     pub backend: &'static str,
+    /// What the pixels are of, in screen points. A caller that turns image
+    /// pixels into coordinates must divide by this rect, never by the
+    /// window's frame: the two differ whenever the application has a surface
+    /// hanging over the window.
+    pub content: crate::windows::WindowBounds,
 }
 
 /// Cheap WindowServer fingerprint used to reject a cached filter after a
@@ -336,6 +356,16 @@ struct WindowCaptureIdentity {
     y: u64,
     width: u64,
     height: u64,
+    /// The rect the capture covers, which grows and shrinks as the
+    /// application shows and hides popovers and menus over this window. Part
+    /// of the identity because a plan built for the bare window renders the
+    /// larger content into the smaller output it was configured with, and
+    /// the delivered pixels are then a squeezed union that still measures as
+    /// a clean 1x capture of the window.
+    content_x: u64,
+    content_y: u64,
+    content_width: u64,
+    content_height: u64,
 }
 
 impl WindowCaptureIdentity {
@@ -347,6 +377,48 @@ impl WindowCaptureIdentity {
             y: y.to_bits(),
             width: width.to_bits(),
             height: height.to_bits(),
+            content_x: x.to_bits(),
+            content_y: y.to_bits(),
+            content_width: width.to_bits(),
+            content_height: height.to_bits(),
+        }
+    }
+
+    fn with_content(mut self, content: &crate::windows::WindowBounds) -> Self {
+        self.content_x = content.x.to_bits();
+        self.content_y = content.y.to_bits();
+        self.content_width = content.width.to_bits();
+        self.content_height = content.height.to_bits();
+        self
+    }
+
+    fn content(&self) -> crate::windows::WindowBounds {
+        crate::windows::WindowBounds {
+            x: f64::from_bits(self.content_x),
+            y: f64::from_bits(self.content_y),
+            width: f64::from_bits(self.content_width),
+            height: f64::from_bits(self.content_height),
+        }
+    }
+
+    fn window(&self) -> crate::windows::WindowBounds {
+        crate::windows::WindowBounds {
+            x: f64::from_bits(self.x),
+            y: f64::from_bits(self.y),
+            width: f64::from_bits(self.width),
+            height: f64::from_bits(self.height),
+        }
+    }
+
+    /// The identity with its content rect reset to the window's own frame —
+    /// what a source that only knows about the window can be compared with.
+    fn window_only(self) -> Self {
+        Self {
+            content_x: self.x,
+            content_y: self.y,
+            content_width: self.width,
+            content_height: self.height,
+            ..self
         }
     }
 }
@@ -354,14 +426,18 @@ impl WindowCaptureIdentity {
 fn current_window_capture_identity(window_id: u32) -> anyhow::Result<WindowCaptureIdentity> {
     let info = crate::windows::window_info_by_id(window_id)
         .ok_or_else(|| anyhow::anyhow!("WindowServer no longer lists window id {window_id}"))?;
-    Ok(WindowCaptureIdentity::new(
+    let identity = WindowCaptureIdentity::new(
         info.pid,
         info.layer,
         info.bounds.x,
         info.bounds.y,
         info.bounds.width,
         info.bounds.height,
-    ))
+    );
+    Ok(match crate::windows::capture_content_bounds(window_id) {
+        Some(content) => identity.with_content(&content),
+        None => identity,
+    })
 }
 
 const WINDOW_PLAN_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -542,7 +618,11 @@ fn build_window_capture_plan(
         frame.size.width,
         frame.size.height,
     );
-    if actual_identity != expected_identity {
+    // ScreenCaptureKit answers for the window, not for what the application
+    // has hanging over it, so only the window half of the identity is
+    // checkable here; the content half is re-checked against WindowServer
+    // once the bytes exist.
+    if actual_identity != expected_identity.window_only() {
         anyhow::bail!(
             "ScreenCaptureKit: window id {window_id} changed identity while capture was prepared"
         );
@@ -552,7 +632,7 @@ fn build_window_capture_plan(
     // https://developer.apple.com/documentation/screencapturekit/sccontentfilter/init(desktopindependentwindow:)
     let filter = SCContentFilter::create().with_window(&window).build();
 
-    // Pixel output size = content_rect * point_pixel_scale (macOS 14+ filter info).
+    // Pixel output size = content rect * point_pixel_scale (macOS 14+ filter info).
     // https://docs.rs/screencapturekit/6.0.1/screencapturekit/
     let scale = f64::from(filter.point_pixel_scale());
     let (width_pts, height_pts) = {
@@ -564,12 +644,34 @@ fn build_window_capture_plan(
         }
     };
 
-    let config = window_capture_configuration(width_pts, height_pts, scale)?;
+    // The filter reports the window's own rect while it renders the popovers
+    // and menus the application hangs over that window into the same frame.
+    // Asking for the window's pixel size then makes ScreenCaptureKit fit a
+    // larger picture into a smaller output: the delivered image is the union
+    // squeezed, and it measures as a clean 1x capture of the window. Ask for
+    // the union's own size instead, so the aspect ratio matches what is
+    // rendered, nothing is scaled or letterboxed, and the rect the pixels
+    // cover is the rect this plan can publish.
+    let captured = expected_identity.content();
+    let window_rect = expected_identity.window();
+    let content = if captured.width > width_pts || captured.height > height_pts {
+        captured
+    } else {
+        crate::windows::WindowBounds {
+            x: window_rect.x,
+            y: window_rect.y,
+            width: width_pts,
+            height: height_pts,
+        }
+    };
+
+    let config = window_capture_configuration(content.width, content.height, scale)?;
 
     Ok(std::sync::Arc::new(WindowCapturePlan {
         filter,
         config,
         identity: expected_identity,
+        content,
     }))
 }
 
@@ -629,21 +731,21 @@ fn encode_captured_image(
     cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)
 }
 
-enum CaptureIdentityValidation {
-    Matched(Vec<u8>),
+enum CaptureIdentityValidation<T> {
+    Matched(T),
     Changed(WindowCaptureIdentity),
 }
 
 /// Do not release bytes until WindowServer confirms that the window still has
 /// the identity the plan was built for. The injected form keeps the TOCTOU
 /// contract deterministic and independently testable.
-fn capture_then_validate_identity<C, I>(
+fn capture_then_validate_identity<T, C, I>(
     expected_identity: WindowCaptureIdentity,
     capture: C,
     current_identity: I,
-) -> anyhow::Result<CaptureIdentityValidation>
+) -> anyhow::Result<CaptureIdentityValidation<T>>
 where
-    C: FnOnce() -> anyhow::Result<Vec<u8>>,
+    C: FnOnce() -> anyhow::Result<T>,
     I: FnOnce() -> anyhow::Result<WindowCaptureIdentity>,
 {
     let bytes = capture()?;
@@ -658,10 +760,15 @@ where
 fn capture_window_from_plan_validated(
     window_id: u32,
     plan: &WindowCapturePlan,
-) -> anyhow::Result<CaptureIdentityValidation> {
+) -> anyhow::Result<CaptureIdentityValidation<CapturedWindowFrame>> {
     capture_then_validate_identity(
         plan.identity,
-        || capture_window_from_plan(window_id, plan),
+        || {
+            capture_window_from_plan(window_id, plan).map(|png| CapturedWindowFrame {
+                png,
+                content: plan.content.clone(),
+            })
+        },
         || current_window_capture_identity(window_id),
     )
 }
@@ -678,7 +785,7 @@ fn retry_after_identity_change(
     window_id: u32,
     stale_plan: &std::sync::Arc<WindowCapturePlan>,
     actual_identity: WindowCaptureIdentity,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<CapturedWindowFrame> {
     evict_window_capture_plan(window_id, stale_plan);
     let rebuilt = build_window_capture_plan(window_id, actual_identity)?;
     {
@@ -687,7 +794,7 @@ fn retry_after_identity_change(
     }
 
     match capture_window_from_plan_validated(window_id, &rebuilt) {
-        Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
+        Ok(CaptureIdentityValidation::Matched(frame)) => Ok(frame),
         Ok(CaptureIdentityValidation::Changed(_)) => {
             evict_window_capture_plan(window_id, &rebuilt);
             anyhow::bail!(
@@ -706,7 +813,7 @@ fn retry_after_identity_change(
 /// Uses a desktop-independent window filter and `SCScreenshotManager` —
 /// see module docs for Apple + crate source URLs. No subprocess/temp/base64.
 /// Warm hits reuse a bounded two-second filter/config plan cache.
-fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> {
+fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<CapturedWindowFrame> {
     let identity = current_window_capture_identity(window_id)?;
     let cached = {
         let mut cache = lock_window_plan_cache();
@@ -719,7 +826,7 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> 
             cache.remove_if(&window_id, |stored| std::sync::Arc::ptr_eq(stored, &plan));
         } else {
             match capture_window_from_plan_validated(window_id, &plan) {
-                Ok(CaptureIdentityValidation::Matched(bytes)) => return Ok(bytes),
+                Ok(CaptureIdentityValidation::Matched(frame)) => return Ok(frame),
                 Ok(CaptureIdentityValidation::Changed(actual_identity)) => {
                     return retry_after_identity_change(window_id, &plan, actual_identity);
                 }
@@ -743,7 +850,7 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> 
                     }
 
                     match capture_window_from_plan_validated(window_id, &rebuilt) {
-                        Ok(CaptureIdentityValidation::Matched(bytes)) => return Ok(bytes),
+                        Ok(CaptureIdentityValidation::Matched(frame)) => return Ok(frame),
                         Ok(CaptureIdentityValidation::Changed(_)) => {
                             evict_window_capture_plan(window_id, &rebuilt);
                             return Err(anyhow::anyhow!(
@@ -773,7 +880,7 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> 
         cache.insert_at(window_id, std::sync::Arc::clone(&plan), Instant::now());
     }
     match capture_window_from_plan_validated(window_id, &plan) {
-        Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
+        Ok(CaptureIdentityValidation::Matched(frame)) => Ok(frame),
         Ok(CaptureIdentityValidation::Changed(actual_identity)) => {
             retry_after_identity_change(window_id, &plan, actual_identity)
         }
@@ -787,7 +894,7 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> 
 /// Bound the dependency's synchronous callback wrappers without permitting an
 /// unbounded number of detached workers. Ownership of the gate permit and all
 /// ScreenCaptureKit/CF objects stays on the worker until it really returns.
-fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<Vec<u8>> {
+fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<CapturedWindowFrame> {
     run_native_capture_worker(
         native_capture_gate(),
         WINDOW_CAPTURE_NATIVE_TIMEOUT,
@@ -816,31 +923,35 @@ fn capture_window_selected_backend<N, F>(
     fallback: F,
 ) -> anyhow::Result<CapturedWindowImage>
 where
-    N: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
-    F: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
+    N: FnOnce(u32) -> anyhow::Result<CapturedWindowFrame>,
+    F: FnOnce(u32) -> anyhow::Result<CapturedWindowFrame>,
 {
     if modern_available {
-        let png = native(window_id)?;
-        if png.is_empty() {
+        let frame = native(window_id)?;
+        if frame.png.is_empty() {
             anyhow::bail!("modern screenshot capture returned empty bytes for window {window_id}");
         }
         return Ok(CapturedWindowImage {
-            png,
+            png: frame.png,
             backend: "sck_screenshot",
+            content: frame.content,
         });
     }
     let backend = std::cell::Cell::new("sck_legacy_image");
-    let png = capture_window_with_backends(window_id, native, |window_id| {
+    let frame = capture_window_with_backends(window_id, native, |window_id| {
         backend.set("screencapture_shadowless");
         fallback(window_id)
     })?;
     Ok(CapturedWindowImage {
-        png,
+        png: frame.png,
         backend: backend.get(),
+        content: frame.content,
     })
 }
 
-/// Captures bytes and reports the backend that actually produced them.
+/// Captures bytes and reports the backend that actually produced them, plus
+/// the screen rect those bytes cover.
+///
 /// Modern failures stay failures rather than quietly selecting a legacy
 /// capture with different coordinate semantics.
 pub fn capture_window_image(window_id: u32) -> anyhow::Result<CapturedWindowImage> {
@@ -848,7 +959,17 @@ pub fn capture_window_image(window_id: u32) -> anyhow::Result<CapturedWindowImag
         window_id,
         uses_modern_window_screenshot(),
         screenshot_window_bytes_sck,
-        screenshot_window_bytes_shell,
+        |window_id| {
+            // `screencapture -l` draws the one window it was given, so the
+            // rect its pixels cover is that window's own frame; a rect read
+            // after the capture is the only one WindowServer can still
+            // answer for, and a window that vanished has no frame at all.
+            let png = screenshot_window_bytes_shell(window_id)?;
+            let content = crate::windows::window_bounds_by_id(window_id).ok_or_else(|| {
+                anyhow::anyhow!("WindowServer no longer lists window id {window_id}")
+            })?;
+            Ok(CapturedWindowFrame { png, content })
+        },
     )
 }
 
@@ -946,6 +1067,21 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
+    /// Pixels plus the rect they cover. The backend-selection tests are
+    /// about which producer ran, not about geometry, so they all claim the
+    /// same nominal rect.
+    fn frame_of(png: Vec<u8>) -> CapturedWindowFrame {
+        CapturedWindowFrame {
+            png,
+            content: crate::windows::WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 640.0,
+                height: 292.0,
+            },
+        }
+    }
+
     #[test]
     fn window_capture_configuration_preserves_unpadded_retina_and_point_geometry() {
         for (scale, width, height) in [(1.0, 640, 292), (2.0, 1280, 584)] {
@@ -987,14 +1123,14 @@ mod tests {
                 true,
                 |_| {
                     if empty {
-                        Ok(Vec::new())
+                        Ok(frame_of(Vec::new()))
                     } else {
                         anyhow::bail!("modern capture failed")
                     }
                 },
                 |_| {
                     fallback_calls.set(fallback_calls.get() + 1);
-                    Ok(vec![1])
+                    Ok(frame_of(vec![1]))
                 },
             );
             assert!(result.is_err());
@@ -1016,9 +1152,9 @@ mod tests {
                     if native_fails {
                         anyhow::bail!("native failed")
                     }
-                    Ok(vec![1])
+                    Ok(frame_of(vec![1]))
                 },
-                |_| Ok(vec![2]),
+                |_| Ok(frame_of(vec![2])),
             )
             .unwrap();
             assert_eq!(capture.backend, expected);
@@ -1124,7 +1260,7 @@ mod tests {
             move |window_id| {
                 native_calls_n.set(native_calls_n.get() + 1);
                 native_window_id_n.set(Some(window_id));
-                Ok(png_n)
+                Ok(frame_of(png_n))
             },
             move |_window_id| {
                 fallback_calls_f.set(fallback_calls_f.get() + 1);
@@ -1140,19 +1276,19 @@ mod tests {
             "native backend receives window id 42"
         );
         assert_eq!(fallback_calls.get(), 0, "shell fallback must not run");
-        assert_eq!(got, png, "helper returns native PNG bytes verbatim");
+        assert_eq!(got.png, png, "helper returns native PNG bytes verbatim");
     }
 
     #[test]
     fn empty_native_capture_uses_shell_fallback() {
         let got = capture_window_with_backends(
             42,
-            |_| Ok(Vec::new()),
-            |window_id| Ok(format!("fallback-{window_id}").into_bytes()),
+            |_| Ok(frame_of(Vec::new())),
+            |window_id| Ok(frame_of(format!("fallback-{window_id}").into_bytes())),
         )
         .expect("empty native capture should fall back");
 
-        assert_eq!(got, b"fallback-42");
+        assert_eq!(got.png, b"fallback-42");
     }
 
     #[test]

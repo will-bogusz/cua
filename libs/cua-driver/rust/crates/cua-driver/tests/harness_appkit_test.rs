@@ -34,7 +34,7 @@ use cua_driver_testkit::e2e::{
     recording_evidence, DriverRoute, Evidence, Observation, OracleKind, RefusalCode, Targeting,
 };
 use cua_driver_testkit::observer::{NativeObserver, ObserverBackend, TargetWindow};
-use cua_driver_testkit::sentinel::run_with_background_oracles;
+use cua_driver_testkit::sentinel::{run_with_background_oracles, ForegroundSentinel};
 use cua_driver_testkit::{Driver, McpDriver, ToolResponse};
 
 #[path = "support/appkit_snapshot_publication.rs"]
@@ -2442,6 +2442,266 @@ fn harness_appkit_slider_drag_px_background() {
         )
     });
 }
+
+/// A press that opened a menu is delivery.
+///
+/// The menu an `AXPopUpButton` opens is an accessory window of the process,
+/// outside the target window's AX subtree: the button keeps its role, title,
+/// value, focus, selection, enablement and frame, the application's focused
+/// element does not move, and the window's own subtree digest is unchanged.
+/// Every signal the probe had said "nothing reacted", so the driver reported
+/// `suspected_noop` and sent the caller to a pixel rung while the menu stood
+/// open on screen (calendar-recur omp-1 L66 / omp-2 L60 against the L69/L63
+/// screenshots). The reply has to name the reaction, and the observation has
+/// to contain the menu.
+///
+/// The desktop contract here is the sentinel's, not the target's: measured on
+/// this fixture, AppKit orders a popup button's window to the front of its
+/// layer when its menu opens — with the process still not frontmost — so a
+/// window fully covered before the press is visible after it. That is the
+/// application's own behaviour on the action, not a leak of the delivery; the
+/// process is not activated, the foreground window keeps focus and the cursor
+/// does not move, and those are what this case holds.
+#[test]
+#[ignore]
+fn harness_appkit_press_that_opens_a_menu_is_delivery_with_the_menu_in_the_tree() {
+    let mut case = native_background_case(
+        "appkit",
+        "press_opens_menu",
+        Targeting::Ax,
+        DriverRoute::MacosAxAction,
+    );
+    case.oracles.retain(|oracle| *oracle != OracleKind::ZOrder);
+    run_case_with_env(
+        case,
+        &[("CUA_APPKIT_MENU_POPOVER", "1")],
+        |pid, wid, driver| {
+            let target = TargetWindow {
+                pid,
+                native_id: wid,
+            };
+            let sentinel = ForegroundSentinel::launch(driver);
+            sentinel
+                .assert_background_posture(target)
+                .unwrap_or_else(|error| panic!("background posture: {error}"));
+            driver.start_behavior_recording();
+            sentinel
+                .prepare_background_observation(driver, target)
+                .unwrap_or_else(|error| panic!("background observation: {error}"));
+            let (_, passed) = sentinel
+                .observe_desktop(|| {
+                    let pre = snapshot_elements(driver, pid, wid);
+                    let idx =
+                        element_index_by_id(pre.tree_text(), "pop-menu").unwrap_or_else(|| {
+                            panic!("pop-menu element_index not found:\n{}", pre.tree_text())
+                        });
+                    // The menu bar's own `AXMenu`s are always in the observation; the
+                    // popup's menu is told apart by the items only it carries.
+                    assert!(
+                        !pre.tree_text().contains("15 minutes before"),
+                        "the popup's menu was already open before the press:\n{}",
+                        pre.tree_text()
+                    );
+                    let response = driver.call(
+                        "click",
+                        serde_json::json!({
+                            "pid": pid as i64, "window_id": wid, "element_index": idx,
+                            "snapshot_id": pre.snapshot_id()
+                        }),
+                    );
+                    assert!(
+                        !response.is_error(),
+                        "AppKit click failed: {}",
+                        response.text()
+                    );
+                    assert_ne!(
+                        response.action_effect(),
+                        Some("suspected_noop"),
+                        "a press that opened a menu was reported as a no-op: {}",
+                        response.raw
+                    );
+                    assert!(
+                        response.text().contains("Delivered:"),
+                        "the reply must name the reaction it observed: {}",
+                        response.text()
+                    );
+
+                    let post = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+                    assert!(
+                post.contains("AXMenuItem \"15 minutes before\""),
+                "the open menu and its items are missing from the window's observation:\n{post}"
+            );
+                })
+                .unwrap_or_else(|error| panic!("desktop contract failed: {error}"));
+            Observation::delivered_with_fixture_state(passed)
+        },
+    );
+}
+
+/// A capture reports the rect its pixels cover.
+///
+/// ScreenCaptureKit's desktop-independent window filter renders the popovers
+/// and menus an application hangs over a window into that window's capture.
+/// Sizing the output from the window's own frame made the delivered image a
+/// squeezed union that still measured as a clean 1x capture of the window,
+/// and the frame was labelled "1 px = 1 window point" while the window was
+/// drawn at ~0.77x inside it (calendar-recur omp-1 L69/L78 against the window
+/// list at L81). Every coordinate read off such an image lands somewhere else.
+#[test]
+#[ignore]
+fn harness_appkit_capture_with_an_open_popover_reports_the_rect_it_covers() {
+    run_background_case_with_env(
+        "capture_with_popover",
+        Targeting::Ax,
+        DriverRoute::MacosAxAction,
+        &[("CUA_APPKIT_MENU_POPOVER", "1")],
+        |pid, wid, driver| {
+            let pre = snapshot_elements(driver, pid, wid);
+            let idx = element_index_by_id(pre.tree_text(), "btn-popover").unwrap_or_else(|| {
+                panic!("btn-popover element_index not found:\n{}", pre.tree_text())
+            });
+            let response = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid, "element_index": idx,
+                    "snapshot_id": pre.snapshot_id()
+                }),
+            );
+            assert!(
+                !response.is_error(),
+                "AppKit popover click failed: {}",
+                response.text()
+            );
+            std::thread::sleep(Duration::from_millis(600));
+
+            let shot = driver.call(
+                "get_window_state",
+                serde_json::json!({ "pid": pid as i64, "window_id": wid }),
+            );
+            assert!(!shot.is_error(), "window capture failed: {}", shot.text());
+            let state = shot.structured();
+            let window = state["window_bounds"].clone();
+            let content = state["screenshot_content_bounds"].clone();
+            assert!(
+                content.is_object(),
+                "the capture did not say what rect its pixels cover: {}",
+                shot.raw
+            );
+            let number = |value: &serde_json::Value, key: &str| -> f64 {
+                value[key]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("{key} missing from {value}"))
+            };
+            let (wx, wy) = (number(&window, "x"), number(&window, "y"));
+            let (ww, wh) = (number(&window, "width"), number(&window, "height"));
+            let (cx, cy) = (number(&content, "x"), number(&content, "y"));
+            let (cw, ch) = (number(&content, "width"), number(&content, "height"));
+            assert!(
+                cx <= wx + 1.0 && cy <= wy + 1.0 && cy + ch >= wy + wh - 1.0,
+                "the captured rect does not contain the window: {content} vs {window}"
+            );
+            assert!(
+                cx + cw > wx + ww + 1.0,
+                "the popover hangs past the window's right edge, so the captured rect has to \
+                 reach past it too: {content} vs {window}"
+            );
+
+            let sw = state["screenshot_width"]
+                .as_f64()
+                .expect("screenshot_width");
+            let sh = state["screenshot_height"]
+                .as_f64()
+                .expect("screenshot_height");
+            let scale_x = sw / cw;
+            let scale_y = sh / ch;
+            assert!(
+                (scale_x - scale_y).abs() <= 0.03,
+                "the capture's pixels per point differ by axis ({scale_x} vs {scale_y}), so no \
+                 single scale describes the image"
+            );
+            // The claim every coordinate rests on: the window's own right
+            // edge maps strictly inside the image, because the image covers
+            // more than the window. Under the old label it sat on the edge.
+            let right = (wx + ww - cx) * scale_x;
+            assert!(
+                right < sw - 1.0,
+                "the window's right edge maps to {right} in a {sw}x{sh} image that also holds \
+                 the popover"
+            );
+
+            // And a control the tree names maps onto the picture through the
+            // same two fields.
+            let button = element_by_id(&shot, "btn-popover");
+            let frame = button["frame"].clone();
+            let bx = (number(&frame, "x") + number(&frame, "w") / 2.0 - cx) * scale_x;
+            let by = (number(&frame, "y") + number(&frame, "h") / 2.0 - cy) * scale_y;
+            assert!(
+                bx > 0.0 && bx < sw && by > 0.0 && by < sh,
+                "the control's own frame maps to ({bx}, {by}), outside the {sw}x{sh} image the \
+                 reply says covers {content}"
+            );
+        },
+    );
+}
+
+/// Nothing hanging over the window: the capture covers the window's own
+/// frame, which is what every pixel action already rests on. The delivered
+/// image may be smaller than the raw capture (the session's long-edge cap),
+/// so the claim is about the rect, and about one scale describing both axes
+/// — never about `screenshot_scale`, which names the raw backing scale.
+#[test]
+#[ignore]
+fn harness_appkit_a_plain_window_capture_stays_point_for_point() {
+    run_case(
+        native_readonly_case(
+            "appkit",
+            "capture_without_popover",
+            Targeting::Px,
+            DriverRoute::WindowState,
+            vec![OracleKind::Pixels],
+        ),
+        |pid, wid, driver| {
+            let shot = driver.call(
+                "get_window_state",
+                serde_json::json!({ "pid": pid as i64, "window_id": wid }),
+            );
+            assert!(!shot.is_error(), "window capture failed: {}", shot.text());
+            let state = shot.structured();
+            let window = state["window_bounds"].clone();
+            let content = state["screenshot_content_bounds"].clone();
+            for key in ["x", "y", "width", "height"] {
+                assert_eq!(
+                    content[key], window[key],
+                    "a lone window's capture must cover exactly that window: {content} vs {window}"
+                );
+            }
+            let sw = state["screenshot_width"]
+                .as_f64()
+                .expect("screenshot_width");
+            let sh = state["screenshot_height"]
+                .as_f64()
+                .expect("screenshot_height");
+            let scale = state["screenshot_scale"]
+                .as_f64()
+                .expect("screenshot_scale");
+            let width = window["width"].as_f64().expect("window width");
+            let height = window["height"].as_f64().expect("window height");
+            let (scale_x, scale_y) = (sw / width, sh / height);
+            assert!(
+                (scale_x - scale_y).abs() <= 0.03,
+                "the capture's pixels per point differ by axis ({scale_x} vs {scale_y}), so no \
+                 single scale describes the image"
+            );
+            assert!(
+                scale_x <= scale + 0.01,
+                "a lone window's capture was upscaled past its {scale}x backing: {sw} px for \
+                 {width} pt"
+            );
+            Observation::delivered(vec![OracleKind::Pixels], Evidence::default())
+        },
+    );
+}
+
 // ── child-window ownership (child_editor scenario) ───────────────────────────
 //
 // The shape, measured in Finder's inline rename editor: the application edits

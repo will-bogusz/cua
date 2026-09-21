@@ -423,6 +423,7 @@ impl Tool for GetWindowStateTool {
                     u32,
                     Option<u32>,
                     crate::windows::WindowBounds,
+                    crate::windows::WindowBounds,
                     f64,
                     &'static str,
                     serde_json::Value,
@@ -467,8 +468,9 @@ impl Tool for GetWindowStateTool {
                         reason: e.to_string(),
                     }
                 })?;
+                let content = capture.content.clone();
                 let scale =
-                    super::px_frame::validate_capture_frame(window_id, &bounds, orig_w, orig_h)?;
+                    super::px_frame::validate_capture_frame(window_id, &content, orig_w, orig_h)?;
                 let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(|e| {
                     super::px_frame::PxFrameError::CaptureUnavailable {
                         window_id,
@@ -496,6 +498,7 @@ impl Tool for GetWindowStateTool {
                         h,
                         original_w,
                         bounds,
+                        content,
                         scale,
                         capture.backend,
                         lease_metadata,
@@ -508,6 +511,7 @@ impl Tool for GetWindowStateTool {
                         h,
                         original_w,
                         bounds,
+                        content,
                         scale,
                         capture.backend,
                         lease_metadata,
@@ -515,7 +519,18 @@ impl Tool for GetWindowStateTool {
                 }
             }).await;
             match res {
-                Ok(Ok((b64, file_path, w, h, orig_w, bounds, scale, backend, lease_metadata))) => {
+                Ok(Ok((
+                    b64,
+                    file_path,
+                    w,
+                    h,
+                    orig_w,
+                    bounds,
+                    content,
+                    scale,
+                    backend,
+                    lease_metadata,
+                ))) => {
                     screenshot_rendering_lease = Some(lease_metadata);
                     // Record resize ratio so ClickTool can scale coordinates back
                     // up. Keyed per window: two windows of one pid can carry
@@ -535,7 +550,7 @@ impl Tool for GetWindowStateTool {
                             self.state.resize_registry.clear_ratio(pid, window_id);
                         }
                     }
-                    Some((b64, file_path, w, h, bounds, scale, backend))
+                    Some((b64, file_path, w, h, bounds, content, scale, backend))
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(
@@ -557,18 +572,18 @@ impl Tool for GetWindowStateTool {
         };
 
         // Capture screenshot dimensions before consuming.
-        let screenshot_dims = screenshot.as_ref().map(|(_, _, w, h, _, _, _)| (*w, *h));
+        let screenshot_dims = screenshot.as_ref().map(|(_, _, w, h, _, _, _, _)| (*w, *h));
         let screenshot_file_path = screenshot
             .as_ref()
-            .and_then(|(_, fp, _, _, _, _, _)| fp.clone());
-        let screenshot_frame = screenshot
-            .as_ref()
-            .map(|(_, _, _, _, bounds, scale, backend)| (bounds.clone(), *scale, *backend));
+            .and_then(|(_, fp, _, _, _, _, _, _)| fp.clone());
+        let screenshot_frame = screenshot.as_ref().map(|(_, _, _, _, bounds, content, scale, backend)| {
+            (bounds.clone(), content.clone(), *scale, *backend)
+        });
 
         // Build response.
         let mut content: Vec<Content> = Vec::new();
 
-        if let Some((b64_opt, _file_path, w, h, _bounds, _scale, _backend)) = screenshot {
+        if let Some((b64_opt, _file_path, w, h, _bounds, _content, _scale, _backend)) = screenshot {
             if let Some(b64) = b64_opt {
                 content.push(Content::image_png(b64));
             }
@@ -772,12 +787,25 @@ impl Tool for GetWindowStateTool {
             // the structured side. Additive: keeps every existing field.
             structured["screenshot_mime_type"] = serde_json::json!("image/png");
         }
-        if let Some((bounds, scale, backend)) = screenshot_frame {
+        if let Some((bounds, content, scale, backend)) = screenshot_frame {
             structured["window_bounds"] = serde_json::json!({
                 "x": bounds.x,
                 "y": bounds.y,
                 "width": bounds.width,
                 "height": bounds.height
+            });
+            // What the pixels are of, which is the window's own frame only
+            // while nothing is hanging over it: a popover or menu the
+            // application draws over this window is rendered into the same
+            // capture. A consumer that turns image pixels into coordinates
+            // must divide by this rect and offset by its origin; dividing by
+            // `window_bounds` is what labelled a union capture "1 px = 1
+            // window point".
+            structured["screenshot_content_bounds"] = serde_json::json!({
+                "x": content.x,
+                "y": content.y,
+                "width": content.width,
+                "height": content.height
             });
             structured["screenshot_scale"] = serde_json::json!(scale);
             structured["screenshot_frame_valid"] = serde_json::json!(true);

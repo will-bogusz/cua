@@ -52,6 +52,12 @@ pub const DEFAULT_MAX_DEPTH: usize = 25;
 /// (issue #22865).
 pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
 
+/// How many of a process's accessory windows a window-scoped walk hit-tests
+/// for an open menu it could not otherwise reach. A process shows a menu and
+/// at most a submenu or two; probing beyond that buys nothing and each probe
+/// is a native round trip.
+const MAX_OPEN_MENU_PROBES: usize = 4;
+
 /// Roles whose own AX attributes are routinely empty while the text a person
 /// reads sits in display-only descendants. Only these get `descendant_text`.
 const LIST_ITEM_ROLES: &[&str] = &["AXRow", "AXCell", "AXMenuItem"];
@@ -355,6 +361,48 @@ pub(crate) fn walk_tree_with_timeout(
                 CFRelease(w as CFTypeRef);
             }
         }
+
+        // An open menu is a window of the application, not a node of the
+        // window being observed. AppKit hangs it off the control that opened
+        // it only sometimes — never when the control lives in a surface that
+        // is not AX-mapped to this window, and never for a menu popped up
+        // detached — so a window-scoped walk reported six popup buttons with
+        // no children while one of their menus stood open on screen. Admit
+        // the ones the descent below cannot reach, discovered from the
+        // window server rather than from an AX edge that may not exist.
+        // Capped: a process shows a menu and perhaps its submenu, never a
+        // list of them, and each probe is one hit-test.
+        if window_id.is_some() {
+            for accessory in crate::windows::accessory_windows(pid)
+                .into_iter()
+                .take(MAX_OPEN_MENU_PROBES)
+            {
+                if super::budget::exhausted() {
+                    break;
+                }
+                let Some(menu) = copy_unreachable_menu_root_at(
+                    pid,
+                    window_id,
+                    accessory.bounds.x + accessory.bounds.width / 2.0,
+                    accessory.bounds.y + accessory.bounds.height / 2.0,
+                ) else {
+                    continue;
+                };
+                if top_level
+                    .iter()
+                    .any(|&e| CFEqual(e as CFTypeRef, menu as CFTypeRef) != 0)
+                {
+                    CFRelease(menu as CFTypeRef);
+                    continue;
+                }
+                top_level.push(menu);
+            }
+        }
+
+        // Same-pid modal dialogs of this process, walked into the requested
+        // window's observation after the scope's own rows. Indices into
+        // `top_level`.
+        let mut modal_dialogs: Vec<usize> = Vec::new();
 
         // Scope: keep non-window children (menu bar) + the target window —
         // but ONLY once the target window has actually been identified. When
