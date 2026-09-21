@@ -2,6 +2,15 @@ use std::collections::HashMap;
 
 use crate::windows::{WindowBounds, WindowInfo};
 
+/// The small window-sharing indicator macOS draws inside an application while
+/// another process — this driver's own rendering lease, or any other capturer
+/// — holds a screen-capture lease on it. It carries the captured
+/// application's pid, sits on layer 0 and is on screen, so a WindowServer row
+/// alone cannot tell it from an app window; in the accessibility roster it is
+/// an `AXDialog` titled "Window", ~66×20 pt, whose single child is
+/// `AXButton "WindowSharingSessionButton"`. Listed so a caller can observe
+/// that the application is being captured, never part of that application's
+/// own UI.
 pub const SYSTEM_OVERLAY_KIND: &str = "system_overlay";
 /// The per-display window Finder draws the desktop icons on. Not an
 /// application window, but a surface a caller may read through

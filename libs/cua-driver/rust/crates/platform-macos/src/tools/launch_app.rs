@@ -264,14 +264,17 @@ impl Tool for LaunchAppTool {
                 }?;
                 unsafe { running.processIdentifier() }
             };
-            let windows = resolve_windows_for_pid(pid);
+            let LaunchedWindows {
+                windows,
+                system_overlays,
+            } = resolve_windows_for_pid(pid);
             let app_info = crate::apps::running_app_by_pid(pid);
-            Ok::<_, anyhow::Error>((pid, app_info, windows))
+            Ok::<_, anyhow::Error>((pid, app_info, windows, system_overlays))
         })
         .await;
 
         match launch_result {
-            Ok(Ok((pid, app_info, windows))) => {
+            Ok(Ok((pid, app_info, windows, system_overlays))) => {
                 if !returned_identity_matches(
                     app_info.as_ref(),
                     response_bundle_id.as_deref(),
@@ -297,9 +300,18 @@ impl Tool for LaunchAppTool {
                     format!("Using running {app_name} (pid {pid}); visibility unchanged.")
                 };
 
-                if !windows.is_empty() {
+                // A window-sharing indicator belongs to macOS, not to the
+                // application that just launched: it is published with its
+                // kind so a caller can see the app is being captured, and
+                // kept out of the summary, which lists the windows this
+                // launch offers to act on.
+                let listed: Vec<_> = windows
+                    .iter()
+                    .filter(|w| !system_overlays.contains(&w.window_id))
+                    .collect();
+                if !listed.is_empty() {
                     summary.push_str("\n\nWindows:");
-                    for w in &windows {
+                    for w in &listed {
                         let title = if w.title.is_empty() {
                             "(no title)".to_owned()
                         } else {
@@ -314,7 +326,12 @@ impl Tool for LaunchAppTool {
 
                 let windows_json: Vec<Value> = windows
                     .iter()
-                    .map(|w| super::list_windows::window_record_json(w, None, None))
+                    .map(|w| {
+                        let kind = system_overlays
+                            .contains(&w.window_id)
+                            .then_some(crate::window_kind::SYSTEM_OVERLAY_KIND);
+                        super::list_windows::window_record_json(w, kind, None)
+                    })
                     .collect();
 
                 let structured = serde_json::json!({
@@ -414,22 +431,39 @@ fn protected_host_launch_refusal() -> ToolResult {
 
 // ── Blocking helpers ──────────────────────────────────────────────────────────
 
+/// The launched application's windows, classified.
+///
+/// The kinds a roster publishes are not per-window facts: a window-sharing
+/// indicator is recognised by what it encloses, so it can only be named from
+/// the whole enumeration — which is in hand here, before the pid filter, and
+/// nowhere afterwards.
+#[derive(Default)]
+struct LaunchedWindows {
+    windows: Vec<crate::windows::WindowInfo>,
+    system_overlays: Vec<u32>,
+}
+
 /// Bound readiness waiting to five seconds; launching can finish before the UI exists.
-fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
+fn resolve_windows_for_pid(pid: i32) -> LaunchedWindows {
     for attempt in 0..50 {
-        let found: Vec<_> = crate::windows::all_windows()
-            .into_iter()
+        let enumeration = crate::windows::all_windows();
+        let windows: Vec<_> = enumeration
+            .iter()
             .filter(|w| w.pid == pid && w.layer == 0)
             .filter(|w| w.bounds.width > 1.0 && w.bounds.height > 1.0)
+            .cloned()
             .collect();
-        if !found.is_empty() {
-            return found;
+        if !windows.is_empty() {
+            return LaunchedWindows {
+                system_overlays: crate::window_kind::system_overlay_window_ids(&enumeration),
+                windows,
+            };
         }
         if attempt < 49 {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
-    vec![]
+    LaunchedWindows::default()
 }
 
 fn structured_launch_error(code: &str, message: String, details: serde_json::Value) -> ToolResult {
