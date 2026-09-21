@@ -149,13 +149,23 @@ const MENU_MODIFIER_SHIFT: i64 = 1;
 const MENU_MODIFIER_OPTION: i64 = 1 << 1;
 const MENU_MODIFIER_CONTROL: i64 = 1 << 2;
 const MENU_MODIFIER_NO_COMMAND: i64 = 1 << 3;
-/// Measured on Notes: `View > Enter Full Screen` (fn F) publishes `24`,
-/// `Window > Move & Resize > Return to Previous Size` (fn ⌃ R) `28`.
+/// Origin: measured on Notes, where `View > Enter Full Screen` (fn F)
+/// publishes `24` and `Window > Move & Resize > Return to Previous Size`
+/// (fn ⌃ R) publishes `28`. Pinned against an application-declared item by
+/// `harness_appkit_disabled_until_key_chord_lands_as_its_menu_command`: the
+/// fixture's `Window > Arrange > Halves > Left Half` declares
+/// `keyEquivalentModifierMask = [.function]`, so a chord that reaches it
+/// proves the bridge publishes this bit for an item nobody at Apple wrote.
 const MENU_MODIFIER_FN: i64 = 1 << 4;
 
 /// How many menu levels the key-equivalent walk descends below the menu bar.
 /// Every measured key equivalent sits at depth 2 or 3 (`Edit > Find > Find…`);
 /// the cap bounds a pathological menu, not a real one.
+///
+/// Pinned as a bound, not as "deep enough", by
+/// `harness_appkit_disabled_until_key_chord_lands_as_its_menu_command`: the
+/// fixture owns an equivalent at four titles, which the walk finds, and a
+/// second at five, which it must not.
 const KEY_EQUIVALENT_MAX_DEPTH: usize = 4;
 
 /// The `AXMenuItemCmdModifiers` mask a chord would carry as a menu key
@@ -287,6 +297,13 @@ fn menu_shortcut(cmd_char: Option<&str>, modifiers: Option<f64>) -> Option<Strin
     }
     let mask = modifiers.unwrap_or_default() as i64;
     let mut rendered = String::new();
+    // The fn bit is matched on the way in (`chord_modifier_mask`), so a
+    // listing that dropped it named a chord that does not exist: an item
+    // whose equivalent is fn-F was published to the model as "F", which is
+    // Find on most menu bars. Rendered first, as macOS orders it.
+    if mask & MENU_MODIFIER_FN != 0 {
+        rendered.push_str("fn ");
+    }
     if mask & MENU_MODIFIER_CONTROL != 0 {
         rendered.push('⌃');
     }
@@ -1021,6 +1038,14 @@ mod tests {
         );
         assert_eq!(menu_shortcut(Some("f"), Some(8.0)).as_deref(), Some("F"));
         assert_eq!(menu_shortcut(Some("f"), Some(12.0)).as_deref(), Some("⌃F"));
+        // The two masks `MENU_MODIFIER_FN`'s doc comment was measured from.
+        // The matcher has always accepted them; the renderer used to publish
+        // them as a bare letter, which names a chord that does not exist.
+        assert_eq!(menu_shortcut(Some("f"), Some(24.0)).as_deref(), Some("fn F"));
+        assert_eq!(
+            menu_shortcut(Some("r"), Some(28.0)).as_deref(),
+            Some("fn ⌃R")
+        );
         assert_eq!(menu_shortcut(Some("  "), Some(0.0)), None);
         assert_eq!(menu_shortcut(None, Some(0.0)), None);
     }

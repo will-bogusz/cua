@@ -2178,6 +2178,18 @@ fn harness_appkit_menu_key_equivalent_through_hotkey() {
 /// foreground rung to escalate to. A same-pid sibling window would have made
 /// the chord post itself refuse (`same_pid_keyboard_ambiguity`); the menu
 /// command is window-exact, so it is not gated by that.
+///
+/// The same state pins the two chord→menu constants, which until now were
+/// asserted only against themselves. `MENU_MODIFIER_FN = 1 << 4` rested on
+/// two Notes items whose flags Apple set; the fixture declares an
+/// fn-modified equivalent of its own at `Window > Arrange > Halves > Left
+/// Half`, so if the bridge published any other bit for `.function` the mask
+/// would not match, `find_key_equivalent` would answer `None`, the chord
+/// would stay a background post and `menu_path` would be absent — a loud
+/// failure. `KEY_EQUIVALENT_MAX_DEPTH = 4` was asserted nowhere at all;
+/// `Halves > Thirds > Left Third` sits one title further down, so the
+/// negative half makes the cap a bound instead of "deep enough" (without it
+/// the case passes at any cap ≥ 4).
 #[test]
 #[ignore]
 fn harness_appkit_disabled_until_key_chord_lands_as_its_menu_command() {
@@ -2216,6 +2228,33 @@ fn harness_appkit_disabled_until_key_chord_lands_as_its_menu_command() {
                         .any(|item| item["title"] == "Left" && item["enabled"] == false)),
                 "the fixture item must read disabled while the second window is key: {}",
                 listed.raw
+            );
+            assert!(
+                listed.structured()["items"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item["title"] == "Halves"
+                        && item["has_submenu"] == true)),
+                "the fn/depth submenu left the fixture's Arrange menu: {}",
+                listed.raw
+            );
+            let halves = driver.call(
+                "invoke_menu",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": second,
+                    "path": ["Window", "Arrange", "Halves"]
+                }),
+            );
+            assert!(
+                halves.structured()["items"]
+                    .as_array()
+                    .is_some_and(|items| items
+                        .iter()
+                        .any(|item| item["title"] == "Left Half"
+                            && item["shortcut"] == "fn J")),
+                "an fn-modified item must be listed with its fn modifier — as a bare \
+                 letter it names a chord that does not exist: {}",
+                halves.raw
             );
 
             let reply = driver.call(
@@ -2290,6 +2329,86 @@ fn harness_appkit_disabled_until_key_chord_lands_as_its_menu_command() {
             assert!(
                 after.contains("menu_action=window_arrange_left#1"),
                 "the menu command never reached the item:\n{after}"
+            );
+
+            // The fn bit, against an item the fixture declared: the chord has
+            // to resolve to the depth-4 item and be dispatched as it.
+            let fn_chord = driver.call(
+                "hotkey",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "keys": ["fn", "j"]
+                }),
+            );
+            assert!(
+                !fn_chord.is_error(),
+                "the fn chord failed: {}",
+                fn_chord.text()
+            );
+            assert_eq!(
+                fn_chord.structured()["route"],
+                serde_json::json!("menu_command"),
+                "the fn chord did not resolve to its menu item — the bridge published \
+                 some other bit for .function, so chord_modifier_mask(&[\"fn\"]) == 24 \
+                 matched nothing: {}",
+                fn_chord.raw
+            );
+            assert_eq!(
+                fn_chord.structured()["menu_path"],
+                serde_json::json!(["Window", "Arrange", "Halves", "Left Half"]),
+                "a match at four titles is the deepest the walk reaches: {}",
+                fn_chord.raw
+            );
+            assert_eq!(
+                fn_chord.structured()["delivery"]["mode"],
+                serde_json::json!("foreground"),
+                "{}",
+                fn_chord.raw
+            );
+            assert!(
+                fn_chord
+                    .text()
+                    .contains("Window > Arrange > Halves > Left Half"),
+                "the reply names the path it took: {}",
+                fn_chord.text()
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            let after_fn = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                after_fn.contains("menu_action=window_arrange_left_half#1"),
+                "the fn chord never reached the depth-4 item:\n{after_fn}"
+            );
+
+            // One title further down, the same chord shape is out of reach.
+            // Without this half the case passes at any cap ≥ 4.
+            let too_deep = driver.call(
+                "hotkey",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "keys": ["fn", "k"]
+                }),
+            );
+            assert_ne!(
+                too_deep.structured()["route"],
+                serde_json::json!("menu_command"),
+                "an item five titles from the menu bar was found by the key-equivalent \
+                 walk, so the depth cap is not the bound it documents: {}",
+                too_deep.raw
+            );
+            assert_eq!(
+                too_deep.structured()["menu_path"],
+                serde_json::Value::Null,
+                "a chord that resolved to no menu item must name no path: {}",
+                too_deep.raw
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            let after_deep = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                after_deep.contains("menu_action=window_arrange_left_half#1"),
+                "the out-of-reach item fired, or the reachable one fired twice:\n\
+                 {after_deep}"
             );
             let roster = driver.call(
                 "list_windows",

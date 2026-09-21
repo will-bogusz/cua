@@ -406,10 +406,14 @@
    {
     "id": "ns_menubar",
     "kind": "menubar_item",
-    "description": "Mac-specific: app menu item with a known title. Tests menubar enumeration via AX (the macOS main menu lives in the menubar, not the window's UIA tree).",
+    "description": "Mac-specific: app menu item with a known title. Tests menubar enumeration via AX (the macOS main menu lives in the menubar, not the window's UIA tree). The Window > Arrange submenu also carries the two key equivalents that pin the driver's chord->menu constants, both validated against window.isKeyWindow like Arrange > Left: Halves > Left Half is fn+J at four titles from the menu bar down, the deepest a key-equivalent walk reaches, and its fn modifier is the one bit the driver matches on that no app-declared item had ever exercised; Halves > Thirds > Left Third is fn+K one level further down, out of reach, which is what makes the cap a bound rather than 'deep enough'.",
     "controls": {
      "menu_item_aid": "menu-test-item",
-     "expected_menu_item_title": "Harness Test Item"
+     "expected_menu_item_title": "Harness Test Item",
+     "fn_menu_item_path": ["Window", "Arrange", "Halves", "Left Half"],
+     "fn_menu_item_key": ["fn", "j"],
+     "deep_menu_item_path": ["Window", "Arrange", "Halves", "Thirds", "Left Third"],
+     "deep_menu_item_key": ["fn", "k"]
     }
    },
    {

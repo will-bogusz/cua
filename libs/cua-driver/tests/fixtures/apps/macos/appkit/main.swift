@@ -63,6 +63,19 @@ let kScrollTopMarker = "SCROLL_TOP_MARKER_v1"
 let kScrollBottomMarker = "SCROLL_BOTTOM_MARKER_v1"
 let kExitButtonAID = "btn-exit"
 let kMenuItemTitle = "Harness Test Item"
+/// ns_menubar — the two key equivalents that pin the driver's chord→menu
+/// constants. `Window > Arrange > Halves > Left Half` is four titles deep and
+/// fn-modified: the depth the key-equivalent walk can still reach, and the
+/// one modifier bit the driver matches on without any app-declared item ever
+/// having exercised it. `Window > Arrange > Halves > Thirds > Left Third` is
+/// the same chord shape one level further down — out of reach, which is what
+/// makes the cap a bound rather than "deep enough".
+let kHalvesMenuTitle = "Halves"
+let kLeftHalfMenuTitle = "Left Half"
+let kLeftHalfMenuKey = "j"
+let kThirdsMenuTitle = "Thirds"
+let kLeftThirdMenuTitle = "Left Third"
+let kLeftThirdMenuKey = "k"
 let kSecondaryWindowTitle = "CuaTestHarness AppKit Secondary"
 let kSheetWindowTitle = "CuaTestHarness AppKit Sheet"
 let kFloatingWindowTitle = "CuaTestHarness AppKit Floating"
@@ -720,6 +733,8 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     // invisible — both to the assertion and to the driver's own change probe,
     // which then reports the landed chord as `suspected_noop`. Count it.
     var arrangeLeftFirings = 0
+    var arrangeLeftHalfFirings = 0
+    var arrangeLeftThirdFirings = 0
     let scrollOffsetLabel = NSTextField(labelWithString: "scroll_offset=0")
     let accelCountLabel = NSTextField(labelWithString: "accel_fired=0")
     var accelCount = 0
@@ -1533,8 +1548,25 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         menuActionLabel.stringValue = "menu_action=window_arrange_left#\(arrangeLeftFirings)"
     }
 
+    /// The fn-modified equivalent at the depth the walk can still reach.
+    @objc func onArrangeLeftHalf(_ sender: NSMenuItem) {
+        arrangeLeftHalfFirings += 1
+        menuActionLabel.stringValue =
+            "menu_action=window_arrange_left_half#\(arrangeLeftHalfFirings)"
+    }
+
+    /// One level past the cap. A firing here is the failure the depth-5 half
+    /// of the harness case looks for: the label must never carry it.
+    @objc func onArrangeLeftThird(_ sender: NSMenuItem) {
+        arrangeLeftThirdFirings += 1
+        menuActionLabel.stringValue =
+            "menu_action=window_arrange_left_third#\(arrangeLeftThirdFirings)"
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if menuItem.action == #selector(onArrangeLeft(_:)) {
+        if menuItem.action == #selector(onArrangeLeft(_:))
+            || menuItem.action == #selector(onArrangeLeftHalf(_:))
+            || menuItem.action == #selector(onArrangeLeftThird(_:)) {
             // Real macOS Window-menu commands are contextual: the application
             // being active is insufficient when the requested window is not
             // key. Keep this fixture honest so invoke_menu must establish the
@@ -1782,6 +1814,43 @@ func installMenuBar(target: HarnessWindowController) {
     leftItem.target = target
     leftItem.setAccessibilityIdentifier("menu-window-arrange-left")
     arrangeMenu.addItem(leftItem)
+
+    // The fn bit and the depth cap, declared by the application itself.
+    // `.function` is a member of `NSEvent.ModifierFlags`, so AppKit stores
+    // it; whether the accessibility bridge then publishes bit 4 in
+    // `AXMenuItemCmdModifiers` is what the harness case measures. Both items
+    // share the contextual validation above, so both read disabled while
+    // another window of the process is key — the state the substitution
+    // route needs.
+    let halvesItem = NSMenuItem(title: kHalvesMenuTitle, action: nil, keyEquivalent: "")
+    let halvesMenu = NSMenu(title: kHalvesMenuTitle)
+    let leftHalfItem = NSMenuItem(
+        title: kLeftHalfMenuTitle,
+        action: #selector(HarnessWindowController.onArrangeLeftHalf(_:)),
+        keyEquivalent: kLeftHalfMenuKey
+    )
+    leftHalfItem.keyEquivalentModifierMask = [.function]
+    leftHalfItem.target = target
+    leftHalfItem.setAccessibilityIdentifier("menu-window-arrange-left-half")
+    halvesMenu.addItem(leftHalfItem)
+
+    // Five titles from the menu bar down: one past the walk's cap, so the
+    // chord for it is never found and never becomes a menu command.
+    let thirdsItem = NSMenuItem(title: kThirdsMenuTitle, action: nil, keyEquivalent: "")
+    let thirdsMenu = NSMenu(title: kThirdsMenuTitle)
+    let leftThirdItem = NSMenuItem(
+        title: kLeftThirdMenuTitle,
+        action: #selector(HarnessWindowController.onArrangeLeftThird(_:)),
+        keyEquivalent: kLeftThirdMenuKey
+    )
+    leftThirdItem.keyEquivalentModifierMask = [.function]
+    leftThirdItem.target = target
+    leftThirdItem.setAccessibilityIdentifier("menu-window-arrange-left-third")
+    thirdsMenu.addItem(leftThirdItem)
+    thirdsItem.submenu = thirdsMenu
+    halvesMenu.addItem(thirdsItem)
+    halvesItem.submenu = halvesMenu
+    arrangeMenu.addItem(halvesItem)
     arrangeItem.submenu = arrangeMenu
     windowMenu.addItem(arrangeItem)
     windowItem.submenu = windowMenu
