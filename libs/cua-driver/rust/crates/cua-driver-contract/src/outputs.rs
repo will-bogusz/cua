@@ -663,6 +663,30 @@ impl ActionCommit {
     }
 }
 
+/// What making the target window key did to the desktop, for a caller that
+/// has to say it. Fronting an application is a user-visible focus change;
+/// making one of its own windows key is not, and the two must not read the
+/// same.
+///
+/// Before this field the activation reached a consumer only inside the
+/// reply's prose, so the one consumer that prints it recovered the fronting
+/// half by matching the driver's English — a sentence rewrite silently
+/// deleted the fact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct KeyWindowFact {
+    /// The target window was not its application's key window, so it was made
+    /// key for the dispatch.
+    pub made_key: bool,
+    /// The target application was not frontmost, so it was activated — the
+    /// half of the activation a person watching the screen sees.
+    pub app_fronted: bool,
+    /// Whether the prior frontmost was put back afterwards. Absent when
+    /// nothing had to change, so nothing had to be restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionResult {
@@ -683,6 +707,11 @@ pub struct ActionResult {
     /// driver dispatched, top level first. Absent on every other route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_path: Option<Vec<String>>,
+    /// Routes that had to make a window key to deliver — `menu_command`
+    /// today: what that activation did. Absent on every route that delivered
+    /// without touching focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_window: Option<KeyWindowFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -845,6 +874,7 @@ mod tests {
             escalation: None,
             committed: None,
             menu_path: None,
+            key_window: None,
         }
     }
 
@@ -887,6 +917,7 @@ mod tests {
                 "effect",
                 "escalation",
                 "evidence",
+                "key_window",
                 "menu_path",
                 "route"
             ]
@@ -985,6 +1016,23 @@ mod tests {
                 "suspected_noop",
                 "permission_required"
             ])
+        );
+
+        let key_window = object_variant(&properties["key_window"]);
+        assert_eq!(key_window["additionalProperties"], false);
+        assert_eq!(
+            key_window["required"],
+            json!(["made_key", "app_fronted"]),
+            "the two facts the activation always knows; a restore may not apply"
+        );
+        assert_eq!(
+            key_window["properties"]
+                .as_object()
+                .expect("key_window properties")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["app_fronted", "made_key", "restored"]
         );
     }
 

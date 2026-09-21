@@ -279,6 +279,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -294,6 +295,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -733,6 +759,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -748,6 +775,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -2278,6 +2330,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -2293,6 +2346,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -2497,6 +2575,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -2512,6 +2591,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -3228,6 +3332,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -3243,6 +3348,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -3496,6 +3626,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -3511,6 +3642,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -3784,6 +3940,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -3799,6 +3956,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -4316,6 +4498,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -4331,6 +4514,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -4720,6 +4928,7 @@
                     "app_focus",
                     "window_tree",
                     "window_change",
+                    "menu_opened",
                     null
                   ],
                   "type": [
@@ -4735,6 +4944,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "key_window": {
+            "additionalProperties": false,
+            "properties": {
+              "app_fronted": {
+                "type": "boolean"
+              },
+              "made_key": {
+                "type": "boolean"
+              },
+              "restored": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "made_key",
+              "app_fronted"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },

@@ -2065,14 +2065,14 @@ fn harness_appkit_type_at_a_row_that_cannot_focus_is_not_retryable() {
 /// `menu_action=window_arrange_left#<firings>`.
 ///
 /// Asserted on the surface a caller actually receives. The platform sets
-/// `structured["key_window"]` on every windowed chord, but the published
-/// ActionResult is the closed 0.9.0 schema, so a consumer sees only
-/// `route` / `delivery` / `effect` / `evidence` / `escalation`: the
-/// key-window fact survives as prose and, when the background rung is the
-/// one that cannot fix it, as `escalation.reason = route_unavailable`.
-/// The not-key arm has no live seam here — the fixture window is key from
-/// launch and the app owns no second key-able window — so it stays unit
-/// covered by `hotkey::tests::the_chord_reason_is_the_observed_key_window`.
+/// `structured["key_window"]` on every windowed chord, but that one names
+/// the state the chord was posted in rather than an activation, and it is
+/// not projected: here the key-window fact survives as prose and, when the
+/// background rung is the one that cannot fix it, as
+/// `escalation.reason = route_unavailable`. The route that does make a
+/// window key publishes what it changed as `ActionResult.key_window`, and
+/// the not-key arm has its own live seam in
+/// `harness_appkit_disabled_until_key_chord_lands_as_its_menu_command`.
 #[test]
 #[ignore]
 fn harness_appkit_menu_key_equivalent_through_hotkey() {
@@ -2274,6 +2274,17 @@ fn harness_appkit_disabled_until_key_chord_lands_as_its_menu_command() {
                 !reply.text().contains("not the frontmost application"),
                 "the app was already frontmost; the reply must not claim it was fronted: {}",
                 reply.text()
+            );
+            assert_eq!(
+                structured["key_window"],
+                serde_json::json!({
+                    "made_key": true,
+                    "app_fronted": false,
+                    "restored": true
+                }),
+                "the same three facts the sentence states must reach a caller as \
+                 fields, so reading them never means matching English: {}",
+                reply.raw
             );
             let after = snapshot_elements(driver, pid, wid).tree_text().to_owned();
             assert!(

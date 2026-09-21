@@ -269,6 +269,9 @@ pub struct ActionExecutionRecord {
     /// Menu-command dispatches only: the menu titles the driver pressed, top
     /// level first.
     pub menu_path: Option<Vec<String>>,
+    /// Routes that had to make a window key to deliver: what that activation
+    /// did to the desktop.
+    pub key_window: Option<cua_driver_contract::KeyWindowFact>,
 }
 
 impl ActionExecutionRecord {
@@ -290,6 +293,7 @@ impl ActionExecutionRecord {
             detail: None,
             committed: None,
             menu_path: None,
+            key_window: None,
         }
     }
 
@@ -462,6 +466,7 @@ impl ActionExecutionRecord {
             }),
             committed: self.committed,
             menu_path: self.menu_path.clone(),
+            key_window: self.key_window,
         })
     }
 
@@ -511,6 +516,17 @@ impl ActionExecutionRecord {
                     .map(str::to_owned)
                     .collect()
             });
+        // Two other legacy payloads carry a `key_window` object describing the
+        // state a control was *read* in (`is_key`, `app_frontmost`,
+        // `focused_window_id`). Only an activation reports what it changed, so
+        // the fact is taken solely from producers that spell both halves of it.
+        record.key_window = structured.get("key_window").and_then(|fact| {
+            Some(cua_driver_contract::KeyWindowFact {
+                made_key: fact.get("made_key")?.as_bool()?,
+                app_fronted: fact.get("app_fronted")?.as_bool()?,
+                restored: fact.get("restored").and_then(serde_json::Value::as_bool),
+            })
+        });
 
         if legacy_has_publishable_readback(tool_name, structured) {
             record.evidence.push(ActionEvidence {

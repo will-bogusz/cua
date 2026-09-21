@@ -1025,9 +1025,11 @@ mod tests {
     }
 
     /// The menu route's legacy payload projects to the closed contract as the
-    /// menu-command route with foreground delivery and the path it pressed —
-    /// a model reading `route`/`delivery` must never take it for a background
-    /// chord.
+    /// menu-command route with foreground delivery, the path it pressed, and
+    /// the activation it needed — a model reading `route`/`delivery` must
+    /// never take it for a background chord, and a consumer that wants to say
+    /// whether the application was fronted must never have to read the prose
+    /// to find out.
     #[test]
     fn the_menu_route_projects_as_a_fronted_menu_command() {
         let structured = serde_json::json!({
@@ -1038,6 +1040,12 @@ mod tests {
             "effect": "unverifiable",
             "evidence": [{ "kind": "app_focus" }],
             "escalation": { "target": "element", "reason": "route_unavailable" },
+            "key_window": {
+                "target_window_id": 19787,
+                "made_key": true,
+                "app_fronted": true,
+                "restored": true,
+            },
         });
         let record = cua_driver_core::action_record::ActionExecutionRecord::from_legacy(
             "hotkey",
@@ -1059,5 +1067,14 @@ mod tests {
         );
         assert_eq!(public["escalation"]["target"], "element");
         assert_eq!(public["escalation"]["reason"], "route_unavailable");
+        assert_eq!(
+            public["key_window"],
+            serde_json::json!({
+                "made_key": true,
+                "app_fronted": true,
+                "restored": true
+            }),
+            "the fronting fact is published, not left in the sentence: {public}"
+        );
     }
 }
