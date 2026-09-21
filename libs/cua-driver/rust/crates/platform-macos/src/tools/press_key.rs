@@ -71,18 +71,15 @@ fn key_path(foreground: bool, hid_tap: bool) -> &'static str {
     }
 }
 
-/// What the probe watched, for a key press whose control did not move.
+/// What a key press whose control did not move means.
 ///
-/// A single key has no general postcondition either, so the probe reports only
-/// whether anything reacted. It is never turned into a retry: the post may
-/// have landed invisibly, and pressing twice is worse.
+/// A single key has no general postcondition either, so the probe reports
+/// only whether anything reacted, over the signals it could compare and
+/// names. It is never turned into a retry: the post may have landed
+/// invisibly, and pressing twice is worse.
 fn key_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
     delivery_probe::NoopReport {
-        signals: if polled {
-            "focused element, app focus, window contents, new windows"
-        } else {
-            "focused element, app focus, window contents"
-        },
+        polled,
         escalation: None,
         advice: "",
     }

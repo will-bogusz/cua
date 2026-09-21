@@ -592,14 +592,6 @@ impl NextRung {
     }
 }
 
-fn watched_signals(polled: bool) -> &'static str {
-    if polled {
-        "element state, app focus, window contents, new windows"
-    } else {
-        "element state, app focus, window contents"
-    }
-}
-
 /// One option of a popup/select control, as the reply lists it.
 ///
 /// # Safety
@@ -643,43 +635,39 @@ unsafe fn popup_option_labels(element: AXUIElementRef) -> Vec<String> {
     options
 }
 
-fn noop_reason(chromium_family: bool, signals: &str) -> String {
-    if chromium_family {
-        "no observable change after background delivery; it cannot produce \
-         trusted pointer events, so controls driven by pointerdown \
-         (Chromium/Electron UIs) ignore it"
-            .to_owned()
-    } else {
-        format!(
-            "no observable change after background delivery; the probe reads \
-             {signals} only, so an effect it cannot see is still possible"
-        )
-    }
+/// Why a dispatch the app never reacted to may still have been delivered.
+/// Names the signals the probe compared, which is the whole scope of its
+/// silence.
+fn noop_reason(compared: &[&str]) -> String {
+    format!(
+        "no observable change after background delivery; the probe compared \
+         {} only, so an effect it cannot see is still possible",
+        compared.join(", ")
+    )
 }
 
-fn pointerdown_note(chromium_family: bool) -> &'static str {
-    if chromium_family {
-        " A control driven by pointerdown, common in Chromium/Electron UIs, \
-         ignores background delivery."
-    } else {
-        ""
-    }
-}
+/// The one mechanism measured behind a silent background click
+/// (`delivery_probe`'s table): background delivery produces no trusted
+/// pointer events, so a control that acts on `pointerdown` never hears it.
+/// Stated as a candidate for every target, because the probe observed the
+/// silence, not its cause — the app's bundle family says which UI toolkit
+/// drew the control, never what this control listens for.
+const POINTERDOWN_NOTE: &str = " Background delivery carries no trusted pointer events, \
+     so a control that acts on pointerdown would not have seen it.";
 
 /// The post-dispatch probe's verdict together with what the reply needs to
 /// say about it: the rung that can still deliver when nothing reacted, and
-/// the facts that shape the no-op explanation.
+/// whether the caller watched for windows opening.
 #[derive(Clone, Copy)]
 struct ProbeReport {
     outcome: delivery_probe::ProbeOutcome,
     rung: NextRung,
-    chromium_family: bool,
     polled: bool,
 }
 
 impl ProbeReport {
     fn noop_reason(&self) -> String {
-        noop_reason(self.chromium_family, watched_signals(self.polled))
+        noop_reason(&self.outcome.watched.compared(self.polled))
     }
 }
 
@@ -689,17 +677,13 @@ fn apply_delivery_evidence(
     report: ProbeReport,
     window_change: Option<&delivery_probe::WindowChangeEvidence>,
 ) {
-    let advice = format!(
-        "{} {}",
-        pointerdown_note(report.chromium_family),
-        report.rung.advice()
-    );
+    let advice = format!("{POINTERDOWN_NOTE} {}", report.rung.advice());
     delivery_probe::apply_evidence(
         msg,
         structured,
         report.outcome,
         delivery_probe::NoopReport {
-            signals: watched_signals(report.polled),
+            polled: report.polled,
             escalation: Some(serde_json::json!({
                 "recommended": report.rung.recommended(),
                 "reason": report.noop_reason(),
@@ -1445,14 +1429,6 @@ impl Tool for ClickTool {
                             } else {
                                 NextRung::PixelForeground
                             },
-                            chromium_family: matches!(
-                                delivery.evidence,
-                                delivery_probe::Evidence::Unchanged
-                            ) && cua_driver_core::operation::spawn_blocking(
-                                move || crate::browser::is_chromium_family(pid),
-                            )
-                            .await
-                            .unwrap_or(false),
                             polled: changes.polled,
                         }),
                         None => None,
@@ -1983,20 +1959,12 @@ impl Tool for ClickTool {
                         "count": count
                     });
                     if let Some(outcome) = evidence {
-                        let chromium_family =
-                            matches!(outcome.evidence, delivery_probe::Evidence::Unchanged)
-                                && cua_driver_core::operation::spawn_blocking(move || {
-                                    crate::browser::is_chromium_family(pid)
-                                })
-                                .await
-                                .unwrap_or(false);
                         apply_delivery_evidence(
                             &mut msg,
                             &mut structured,
                             ProbeReport {
                                 outcome,
                                 rung: NextRung::Foreground,
-                                chromium_family,
                                 polled: changes.polled,
                             },
                             window_change.as_ref(),
@@ -2669,24 +2637,30 @@ mod selection_fallback_tests {
 mod tests {
     use super::*;
 
+    /// A click that named an element in a quiescent window: every signal the
+    /// probe has was comparable.
     fn outcome(evidence: delivery_probe::Evidence, waited_ms: u64) -> delivery_probe::ProbeOutcome {
         delivery_probe::ProbeOutcome {
             evidence,
             probe: std::time::Duration::from_millis(waited_ms + 250),
             waited: std::time::Duration::from_millis(waited_ms),
+            watched: delivery_probe::Watched {
+                element: true,
+                focus: true,
+                tree: true,
+                accessory: true,
+            },
         }
     }
 
     fn report(
         outcome: delivery_probe::ProbeOutcome,
         rung: NextRung,
-        chromium_family: bool,
         polled: bool,
     ) -> ProbeReport {
         ProbeReport {
             outcome,
             rung,
-            chromium_family,
             polled,
         }
     }
@@ -2740,7 +2714,7 @@ mod tests {
         );
     }
 
-    /// The probe reads four signals; an effect outside them is invisible to
+    /// The probe reads five signals; an effect outside them is invisible to
     /// it, so an unobserved dispatch is unverified, never proven undelivered.
     /// The claim is only as wide as the window it watched, so the report has
     /// to name that window: a reader who knows the app reacts late can tell a
@@ -2755,7 +2729,6 @@ mod tests {
             report(
                 outcome(delivery_probe::Evidence::Unchanged, 2000),
                 NextRung::PixelForeground,
-                false,
                 true,
             ),
             None,
@@ -2769,7 +2742,7 @@ mod tests {
             ax_msg.contains("watched for 2000 ms after the dispatch"),
             "{ax_msg}"
         );
-        assert!(ax_msg.contains("re-observe before repeating"), "{ax_msg}");
+        assert!(ax_msg.contains("Re-observe before repeating"), "{ax_msg}");
         assert!(!ax_msg.contains("NOT delivered"), "{ax_msg}");
         assert!(ax_msg.contains("delivery_mode:\"foreground\""), "{ax_msg}");
 
@@ -2781,54 +2754,11 @@ mod tests {
             report(
                 outcome(delivery_probe::Evidence::Unchanged, 2000),
                 NextRung::Foreground,
-                false,
                 true,
             ),
             None,
         );
         assert_eq!(pixel["escalation"]["recommended"], "foreground");
-    }
-
-    /// Pointerdown advice belongs to Chromium-family targets: on an AppKit app
-    /// it sent the model hunting a cause that does not exist there.
-    #[test]
-    fn pointerdown_advice_is_reserved_for_chromium_family_targets() {
-        let mut native_msg = String::new();
-        let mut native = serde_json::json!({ "path": "ax" });
-        apply_delivery_evidence(
-            &mut native_msg,
-            &mut native,
-            report(
-                outcome(delivery_probe::Evidence::Unchanged, 2000),
-                NextRung::PixelForeground,
-                false,
-                true,
-            ),
-            None,
-        );
-        assert!(!native_msg.contains("pointerdown"), "{native_msg}");
-        assert!(
-            !native["escalation"]["reason"]
-                .as_str()
-                .expect("reason")
-                .contains("pointerdown"),
-            "{native}"
-        );
-
-        let mut chromium_msg = String::new();
-        let mut chromium = serde_json::json!({ "path": "ax" });
-        apply_delivery_evidence(
-            &mut chromium_msg,
-            &mut chromium,
-            report(
-                outcome(delivery_probe::Evidence::Unchanged, 2000),
-                NextRung::PixelForeground,
-                true,
-                true,
-            ),
-            None,
-        );
-        assert!(chromium_msg.contains("pointerdown"), "{chromium_msg}");
     }
 
     #[test]
@@ -2841,7 +2771,6 @@ mod tests {
             report(
                 outcome(delivery_probe::Evidence::Changed("element_state"), 120),
                 NextRung::PixelForeground,
-                false,
                 true,
             ),
             None,
@@ -2864,21 +2793,22 @@ mod tests {
                 outcome(delivery_probe::Evidence::Unchanged, 2000),
                 NextRung::PixelForeground,
                 false,
-                false,
             ),
             None,
         );
         assert!(
-            declined_msg.contains("nothing changed (element state, app focus, window contents)"),
+            declined_msg.contains(
+                "element_state, app_focus, window_tree, menu_opened read the same. Re-observe"
+            ),
             "{declined_msg}"
         );
-        assert!(!declined_msg.contains("new windows"), "{declined_msg}");
+        assert!(!declined_msg.contains("window_change"), "{declined_msg}");
         let reason = declined["escalation"]["reason"].as_str().expect("reason");
         assert!(
-            reason.contains("element state, app focus, window contents only"),
+            reason.contains("element_state, app_focus, window_tree, menu_opened only"),
             "{reason}"
         );
-        assert!(!reason.contains("new windows"), "{reason}");
+        assert!(!reason.contains("window_change"), "{reason}");
 
         let mut polled_msg = String::new();
         let mut polled = serde_json::json!({ "path": "ax", "effect": "unverifiable" });
@@ -2888,21 +2818,20 @@ mod tests {
             report(
                 outcome(delivery_probe::Evidence::Unchanged, 2000),
                 NextRung::PixelForeground,
-                false,
                 true,
             ),
             None,
         );
         assert!(
             polled_msg.contains(
-                "nothing changed (element state, app focus, window contents, new windows)"
+                "element_state, app_focus, window_tree, menu_opened, window_change read the same"
             ),
             "{polled_msg}"
         );
         assert!(polled["escalation"]["reason"]
             .as_str()
             .expect("reason")
-            .contains("new windows"));
+            .contains("window_change"));
     }
 
     #[test]
@@ -2920,7 +2849,6 @@ mod tests {
                 report(
                     outcome(delivery_probe::Evidence::Changed(signal), 120),
                     NextRung::PixelForeground,
-                    false,
                     true,
                 ),
                 Some(&observed),
@@ -2960,7 +2888,6 @@ mod tests {
                     0,
                 ),
                 NextRung::PixelForeground,
-                false,
                 true,
             ),
             Some(&observed),
@@ -2982,7 +2909,6 @@ mod tests {
             report(
                 outcome(delivery_probe::Evidence::Unusable, 2000),
                 NextRung::PixelForeground,
-                false,
                 true,
             ),
             None,
@@ -3136,7 +3062,6 @@ mod tests {
             Some(report(
                 outcome(delivery_probe::Evidence::ElementGone, 120),
                 NextRung::PixelForeground,
-                false,
                 true,
             )),
         );
@@ -3159,7 +3084,6 @@ mod tests {
             Some(report(
                 outcome(delivery_probe::Evidence::Unchanged, 2000),
                 NextRung::Foreground,
-                true,
                 false,
             )),
         );
@@ -3171,7 +3095,7 @@ mod tests {
                 .detail
                 .as_deref()
                 .unwrap()
-                .contains("pointerdown"),
+                .contains("the probe compared element_state, app_focus, window_tree, menu_opened"),
             "{escalation:?}"
         );
         assert_eq!(

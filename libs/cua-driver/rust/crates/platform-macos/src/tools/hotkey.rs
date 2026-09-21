@@ -16,18 +16,15 @@ use crate::window_change_detector::WindowChangeDetector;
 use super::delivery_probe;
 use super::ToolState;
 
-/// What the probe watched, and what it means for a chord that moved nothing.
+/// What a chord that moved nothing means.
 ///
 /// A chord's effect is whatever the application binds it to, so the probe can
-/// only report that nothing observable reacted. It is never turned into a
-/// retry: the post may have landed invisibly, and pressing twice is worse.
+/// only report that nothing observable reacted — over the signals it could
+/// actually compare, which it names itself. It is never turned into a retry:
+/// the post may have landed invisibly, and pressing twice is worse.
 fn chord_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
     delivery_probe::NoopReport {
-        signals: if polled {
-            "focused element, app focus, window contents, new windows"
-        } else {
-            "focused element, app focus, window contents"
-        },
+        polled,
         escalation: None,
         advice: "",
     }

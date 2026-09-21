@@ -32,12 +32,19 @@
 //! * a capped digest of the target window's AX subtree — used only when the
 //!   window proved quiescent across two back-to-back pre-dispatch samples, so
 //!   a self-updating window (clock, download counter, memory readout) can never
-//!   be mistaken for the click landing.
+//!   be mistaken for the click landing,
+//! * the accessory windows the application has on screen — an open `NSMenu`
+//!   or a popover is drawn in its own window, outside the target window's
+//!   subtree, so none of the three signals above moves when one appears.
 //!
 //! Unchanged across every usable signal is reported as such and escalated to
 //! the foreground rung. It is never converted into a retry, a route switch, or
 //! an error: a dispatched action may have taken effect invisibly, and repeating
-//! it could act twice.
+//! it could act twice. Which of the signals above were actually comparable
+//! varies per call — an action addressed by pixel watches no element of its
+//! own, an unquiescent window has no digest — so the reply names the ones that
+//! were compared and the ones that could not be read, and claims nothing about
+//! the rest.
 
 use std::time::{Duration, Instant};
 
@@ -68,6 +75,15 @@ const TREE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Matches the `type_text` delivery drain, which answers the same question
 /// about the same kind of latency.
 const SETTLE_BUDGET: Duration = Duration::from_secs(2);
+/// The same window for a probe the caller passed no element to — a chord, or
+/// a press whose focused element would not read. The budget above is sized
+/// for the slowest signal this probe has, a control's own state (~1.3 s on
+/// Contacts' add button), and that signal needs an element pointer: what is
+/// left reads the application, not the control it was aimed at. So the blind
+/// wait is capped at the 500 ms a single sample used to be taken at, and a
+/// chord nothing reacted to pays a quarter of the full budget instead of all
+/// of it. Lowering it further is a `SETTLE_POLL` question, not this one: the
+/// loop returns on the first sample that differs.
 const BLIND_SETTLE_BUDGET: Duration = Duration::from_millis(500);
 /// Gap between post-dispatch samples. Each sample already costs one or more
 /// native AX reads, so this only keeps a cheap sample set from spinning.
@@ -172,6 +188,84 @@ impl Evidence {
     }
 }
 
+/// Which of the probe's signals were comparable across this dispatch.
+///
+/// A signal nobody could read refutes nothing, so "nothing changed" has to
+/// carry its own scope: a caller that passed no element pointer never watched
+/// an element, and an unquiescent window has no digest to compare. Derived
+/// from the samples the verdict was reached on, by the same predicates
+/// [`classify`] uses — never from what the calling tool usually watches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Watched {
+    /// The watched element answered a comparable state before the dispatch,
+    /// and either answered one after it or reported itself destroyed.
+    pub element: bool,
+    /// The application's focused element answered on both samples.
+    pub focus: bool,
+    /// The window's subtree digest was comparable: the window proved
+    /// quiescent and both walks finished.
+    pub tree: bool,
+    /// The application's accessory windows were compared for a surface
+    /// gained. Read from WindowServer, which answers for any pid, so an
+    /// empty set is a real answer rather than a failed read.
+    pub accessory: bool,
+}
+
+impl Watched {
+    /// What a sample pair let [`classify`] compare.
+    fn over(before: &Signals, after: &Signals, quiescent: bool) -> Self {
+        Self {
+            element: before.element.state().is_some()
+                && matches!(after.element, ElementRead::State(_) | ElementRead::Gone),
+            focus: before.focus.is_some() && after.focus.is_some(),
+            tree: quiescent && before.tree.is_some() && after.tree.is_some(),
+            accessory: true,
+        }
+    }
+
+    /// What the pre-dispatch sample alone offers, for a verdict reached
+    /// before any post-dispatch sample was taken ([`DeliveryProbe::settled`]).
+    fn offered(before: &Signals, quiescent: bool) -> Self {
+        Self {
+            element: before.element.state().is_some(),
+            focus: before.focus.is_some(),
+            tree: quiescent && before.tree.is_some(),
+            accessory: true,
+        }
+    }
+
+    /// The signals that were compared, spelled as the action contract
+    /// publishes them. `polled` is the caller's own window watch: the probe
+    /// cannot see a window opening, so it names that signal only when the
+    /// caller asked for it.
+    pub fn compared(self, polled: bool) -> Vec<&'static str> {
+        [
+            (self.element, ELEMENT_SIGNAL),
+            (self.focus, FOCUS_SIGNAL),
+            (self.tree, TREE_SIGNAL),
+            (self.accessory, MENU_SIGNAL),
+            (polled, WINDOW_SIGNAL),
+        ]
+        .into_iter()
+        .filter_map(|(compared, signal)| compared.then_some(signal))
+        .collect()
+    }
+
+    /// The signals the probe tried to read and could not, so a change there
+    /// would not have been seen. The caller's window watch is not in here: a
+    /// poll it declined is a choice, not a failed read.
+    pub fn unread(self) -> Vec<&'static str> {
+        [
+            (self.element, ELEMENT_SIGNAL),
+            (self.focus, FOCUS_SIGNAL),
+            (self.tree, TREE_SIGNAL),
+        ]
+        .into_iter()
+        .filter_map(|(compared, signal)| (!compared).then_some(signal))
+        .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AppearedWindow {
     pub window_id: u32,
@@ -251,6 +345,9 @@ pub struct ProbeOutcome {
     /// This is the number a "nothing reacted" report has to publish: it is
     /// the whole claim's scope.
     pub waited: Duration,
+    /// Which signals this verdict is a verdict over. A "nothing reacted"
+    /// report names them, so the claim cannot be read wider than it is.
+    pub watched: Watched,
 }
 
 /// Pre-dispatch capture. Hold it across the action, then `compare()`.
@@ -373,12 +470,12 @@ impl DeliveryProbe {
             let evidence = classify(&self.before, &after, self.quiescent);
             let expired = Instant::now() >= deadline;
             if evidence.is_reaction() || expired {
-                return (self.outcome(evidence, start.elapsed()), after);
+                return (self.outcome(evidence, start.elapsed(), &after), after);
             }
             // A cancelled caller stops waiting on a target it no longer wants
             // and keeps the verdict observed so far.
             if cua_driver_core::operation::sleep(SETTLE_POLL).is_err() {
-                return (self.outcome(evidence, start.elapsed()), after);
+                return (self.outcome(evidence, start.elapsed(), &after), after);
             }
         }
     }
@@ -399,11 +496,12 @@ impl DeliveryProbe {
         }
     }
 
-    fn outcome(&self, evidence: Evidence, waited: Duration) -> ProbeOutcome {
+    fn outcome(&self, evidence: Evidence, waited: Duration, after: &Signals) -> ProbeOutcome {
         ProbeOutcome {
             evidence,
             probe: self.elapsed + waited,
             waited,
+            watched: Watched::over(&self.before, after, self.quiescent),
         }
     }
 
@@ -414,6 +512,7 @@ impl DeliveryProbe {
             evidence,
             probe: self.elapsed,
             waited: Duration::ZERO,
+            watched: Watched::offered(&self.before, self.quiescent),
         }
     }
 }
@@ -560,7 +659,10 @@ fn gained_menus(before: &[u32], after: &[u32]) -> Vec<u32> {
 }
 
 pub struct NoopReport<'a> {
-    pub signals: &'a str,
+    /// Whether the caller watched for windows opening during the action. The
+    /// probe cannot see that signal itself, so the reply names it only when
+    /// the caller polled for it.
+    pub polled: bool,
     pub escalation: Option<serde_json::Value>,
     pub advice: &'a str,
 }
@@ -589,10 +691,14 @@ pub fn apply_evidence(
 ) {
     let probe_ms = outcome.probe.as_millis();
     let waited_ms = outcome.waited.as_millis();
+    let compared = outcome.watched.compared(noop.polled);
+    let unread = outcome.watched.unread();
     structured["delivery_probe"] = serde_json::json!({
         "signal": outcome.evidence.signal(),
         "probe_ms": probe_ms,
         "waited_ms": waited_ms,
+        "watched": compared,
+        "unread": unread,
     });
     match outcome.evidence {
         Evidence::Changed(_) | Evidence::ElementGone => {
@@ -616,11 +722,24 @@ pub fn apply_evidence(
             if let Some(escalation) = noop.escalation {
                 structured["escalation"] = escalation;
             }
+            // The scope of the claim, in the contract's own signal spellings:
+            // what was compared, and what a change would have gone unseen in.
+            // A per-tool list of what that tool usually watches named signals
+            // this call never read.
+            let unread = if unread.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} could not be read, so a change there would not have been seen",
+                    unread.join(", ")
+                )
+            };
             msg.push_str(&format!(
                 "\n⚠️ Unverified: the target was watched for {waited_ms} ms after the \
-                 dispatch and nothing changed ({}) — re-observe before repeating. The \
+                 dispatch and {} read the same{unread}. Re-observe before repeating — the \
                  dispatch may still have landed, so a second call could act twice.{}",
-                noop.signals, noop.advice
+                compared.join(", "),
+                noop.advice
             ));
         }
         Evidence::Unusable => {
@@ -769,9 +888,15 @@ mod tests {
                 evidence: Evidence::ElementGone,
                 probe: Duration::from_millis(80),
                 waited: Duration::from_millis(20),
+                watched: Watched {
+                    element: true,
+                    focus: true,
+                    tree: true,
+                    accessory: true,
+                },
             },
             NoopReport {
-                signals: "focused element, app focus, window contents",
+                polled: false,
                 escalation: Some(serde_json::json!({ "target": "foreground" })),
                 advice: "",
             },
@@ -788,6 +913,176 @@ mod tests {
             msg.contains("the element the probe watched is gone"),
             "{msg}"
         );
+    }
+
+    fn unchanged(watched: Watched, waited_ms: u64) -> ProbeOutcome {
+        ProbeOutcome {
+            evidence: Evidence::Unchanged,
+            probe: Duration::from_millis(waited_ms + 70),
+            waited: Duration::from_millis(waited_ms),
+            watched,
+        }
+    }
+
+    fn noop(polled: bool) -> NoopReport<'static> {
+        NoopReport {
+            polled,
+            escalation: None,
+            advice: "",
+        }
+    }
+
+    /// The list is the probe's own record, not the calling tool's habit. The
+    /// per-tool literal it replaces named signals this call never read and
+    /// omitted the accessory surfaces it always compares.
+    #[test]
+    fn the_no_change_sentence_names_only_the_signals_that_were_compared() {
+        let mut msg = String::new();
+        let mut structured = serde_json::json!({ "path": "ax", "effect": "unverifiable" });
+        apply_evidence(
+            &mut msg,
+            &mut structured,
+            unchanged(
+                Watched {
+                    element: false,
+                    focus: true,
+                    tree: false,
+                    accessory: true,
+                },
+                2000,
+            ),
+            noop(false),
+            None,
+        );
+        assert!(
+            msg.contains("app_focus, menu_opened read the same"),
+            "the compared set is what the sentence may claim: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "element_state, window_tree could not be read, so a change there would not \
+                 have been seen"
+            ),
+            "an unread signal refutes nothing and has to say so: {msg}"
+        );
+        assert_eq!(
+            structured["delivery_probe"]["watched"],
+            serde_json::json!(["app_focus", "menu_opened"])
+        );
+        assert_eq!(
+            structured["delivery_probe"]["unread"],
+            serde_json::json!(["element_state", "window_tree"])
+        );
+
+        // A caller that declined the window poll never watched for windows
+        // opening, and a caller that asked for it did. The accessory surfaces
+        // are read from WindowServer, so they are compared either way.
+        let mut polled_msg = String::new();
+        apply_evidence(
+            &mut polled_msg,
+            &mut structured,
+            unchanged(
+                Watched {
+                    element: false,
+                    focus: false,
+                    tree: false,
+                    accessory: true,
+                },
+                2000,
+            ),
+            noop(true),
+            None,
+        );
+        assert!(
+            polled_msg.contains("menu_opened, window_change read the same"),
+            "{polled_msg}"
+        );
+        assert!(!msg.contains(WINDOW_SIGNAL), "a declined poll is not a signal: {msg}");
+    }
+
+    /// The login-item regression: `press("cmd+shift+g")` passed no element,
+    /// waited the blind budget and the reply still said a "focused element"
+    /// was watched. The probe's own record cannot say that.
+    #[test]
+    fn a_blind_chord_never_claims_an_element_was_watched() {
+        let outcome = probe_over_a_pid_that_answers_nothing().compare();
+        assert!(
+            !outcome.watched.element,
+            "no element pointer was ever passed: {:?}",
+            outcome.watched
+        );
+        let mut msg = String::new();
+        let mut structured = serde_json::json!({ "path": "key_events" });
+        apply_evidence(&mut msg, &mut structured, outcome, noop(false), None);
+        assert!(!msg.contains(ELEMENT_SIGNAL), "{msg}");
+
+        // The same chord against an application that answers: its focused
+        // element, the window digest and the accessory surfaces all compare,
+        // the element the caller never named does not.
+        let mut msg = String::new();
+        apply_evidence(
+            &mut msg,
+            &mut structured,
+            unchanged(
+                Watched {
+                    element: false,
+                    focus: true,
+                    tree: true,
+                    accessory: true,
+                },
+                633,
+            ),
+            noop(false),
+            None,
+        );
+        assert_eq!(
+            msg,
+            "\n⚠️ Unverified: the target was watched for 633 ms after the dispatch and \
+             app_focus, window_tree, menu_opened read the same; element_state could not be \
+             read, so a change there would not have been seen. Re-observe before repeating \
+             — the dispatch may still have landed, so a second call could act twice."
+        );
+    }
+
+    /// The sentence is the wire for this fact: OMP recovers the scope of the
+    /// doubt by matching `watched for (\d+) ms after the dispatch` over the
+    /// driver's prose (`render.ts`), so the phrase and the number's place in
+    /// it are a contract, not wording.
+    #[test]
+    fn the_sentence_keeps_the_phrase_the_session_matches_on() {
+        for watched in [
+            Watched {
+                element: true,
+                focus: true,
+                tree: true,
+                accessory: true,
+            },
+            Watched {
+                element: false,
+                focus: true,
+                tree: false,
+                accessory: true,
+            },
+        ] {
+            let mut msg = String::new();
+            let mut structured = serde_json::json!({ "path": "ax" });
+            apply_evidence(
+                &mut msg,
+                &mut structured,
+                unchanged(watched, 1450),
+                noop(false),
+                None,
+            );
+            let waited = msg
+                .split_once("watched for ")
+                .and_then(|(_, rest)| rest.split_once(" ms after the dispatch"))
+                .map(|(waited, _)| waited.to_owned());
+            assert_eq!(
+                waited.as_deref(),
+                Some("1450"),
+                "the phrase render.ts reads the wait out of: {msg}"
+            );
+        }
     }
 
     #[test]

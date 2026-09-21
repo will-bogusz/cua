@@ -40,11 +40,7 @@ fn activation_needed(prior_front: Option<i32>, target_pid: i32) -> bool {
 
 fn drag_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
     delivery_probe::NoopReport {
-        signals: if polled {
-            "app focus, window contents, new windows"
-        } else {
-            "app focus, window contents"
-        },
+        polled,
         escalation: None,
         advice: " A drag whose window never moved usually missed the drag source or was \
                  rejected by the drop target: re-read the window and, if the source is right, \
@@ -528,11 +524,19 @@ mod tests {
         assert!(activation_needed(None, 758));
     }
 
+    /// A drag addresses pixels, never an element, so the probe watches
+    /// everything but the element's own state.
     fn outcome(evidence: delivery_probe::Evidence, waited_ms: u64) -> delivery_probe::ProbeOutcome {
         delivery_probe::ProbeOutcome {
             evidence,
             probe: std::time::Duration::from_millis(waited_ms + 120),
             waited: std::time::Duration::from_millis(waited_ms),
+            watched: delivery_probe::Watched {
+                element: false,
+                focus: true,
+                tree: true,
+                accessory: true,
+            },
         }
     }
 
@@ -557,13 +561,17 @@ mod tests {
         );
         assert!(msg.contains("longer duration_ms"), "{msg}");
         assert!(
-            msg.contains("(app focus, window contents, new windows)"),
+            msg.contains("app_focus, window_tree, menu_opened, window_change read the same"),
             "{msg}"
+        );
+        assert!(
+            msg.contains("element_state could not be read"),
+            "a drag names no element, and the reply says so: {msg}"
         );
     }
 
     #[test]
-    fn a_drag_whose_caller_declined_the_window_poll_does_not_claim_new_windows() {
+    fn a_drag_whose_caller_declined_the_window_poll_does_not_claim_the_window_signal() {
         let mut msg = String::new();
         let mut structured = serde_json::json!({ "path": "cgevent_fg", "effect": "unverifiable" });
         delivery_probe::apply_evidence(
@@ -573,8 +581,11 @@ mod tests {
             drag_noop_report(false),
             None,
         );
-        assert!(msg.contains("(app focus, window contents)"), "{msg}");
-        assert!(!msg.contains("new windows"), "{msg}");
+        assert!(
+            msg.contains("app_focus, window_tree, menu_opened read the same"),
+            "{msg}"
+        );
+        assert!(!msg.contains("window_change"), "{msg}");
     }
 
     #[test]
