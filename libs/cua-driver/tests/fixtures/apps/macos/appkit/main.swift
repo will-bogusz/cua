@@ -15,6 +15,9 @@
 //   context_menu   — NSButton + NSMenu (Cut/Copy/Paste → menu_action=)
 //   scroll_target  — NSScrollView with a tall body and offset label
 //   ns_menubar     — main menu item with known title (Mac-specific)
+//   child_editor   — a borderless child window accessibility publishes as its
+//                    own text field, drawn inside the main window, plus an
+//                    attached sheet (CUA_APPKIT_CHILD_EDITOR=1 | sheet)
 //   exit           — NSButton terminates the app
 //
 // AX identifiers (via `setAccessibilityIdentifier(_:)`) match the IDs in
@@ -59,6 +62,24 @@ let kSheetWindowTitle = "CuaTestHarness AppKit Sheet"
 let kFloatingWindowTitle = "CuaTestHarness AppKit Floating"
 /// Not a `kWindowTitle` substring: the harness finds its main window by that.
 let kSecondKeyWindowTitle = "CuaTestHarness Second Key Window"
+/// child_editor — the inline-editor shape (`CUA_APPKIT_CHILD_EDITOR=1`, or
+/// `=sheet` to also open an attached sheet at launch). The application edits
+/// in a separate borderless WindowServer window drawn inside the window it
+/// edits, and accessibility publishes that window as the text field itself,
+/// not as a window. See [`ChildEditorWindow`] for the measured shape.
+let kChildEditorFieldAID = "txt-child-editor"
+let kChildEditorStateAID = "lbl-child-editor"
+let kChildEditorValueAID = "lbl-child-editor-value"
+let kChildEditorCommitAID = "lbl-child-editor-commit"
+let kChildEditorSeedValue = "child editor seed"
+// Not a superstring of the harness window's title: the harness resolves its
+// window by title substring, front first, and the sheet is front when open.
+let kChildEditorSheetTitle = "Child Editor Sheet (CuaTestHarness)"
+/// Where the editor sits relative to the main window's own origin, and how
+/// big it is. Both keep it strictly inside the window's frame, which is what
+/// makes the window its owner rather than a sibling's.
+let kChildEditorOffset = NSPoint(x: 120, y: 200)
+let kChildEditorSize = NSSize(width: 220, height: 24)
 
 // MARK: - Controls
 
@@ -153,6 +174,175 @@ final class HelpfulGroupView: NSView {
     }
 }
 
+/// The inline-editor shape: a borderless child window that accessibility
+/// publishes as the text field it contains.
+///
+/// Measured in Finder's inline rename editor, which is what this reproduces:
+/// the editor is its own layer-0 WindowServer window drawn inside the window
+/// being renamed, and the application answers `AXWindows` with the editor's
+/// `AXTextField` — role `AXTextField`, `CFEqual` to the application's
+/// `AXFocusedUIElement`, mapped by `_AXUIElementGetWindow` to the child's
+/// CGWindowID, with no `AXWindow` and no `AXTopLevelUIElement` attribute and
+/// an `AXParent` chain that goes straight to `AXApplication`. While it is up
+/// the application answers no `AXFocusedWindow` at all.
+///
+/// Nothing can address, activate or make such a surface key on its own, and
+/// making its parent window key is exactly what dismisses it — so a driver
+/// that fronts the parent to deliver a keystroke destroys the destination it
+/// was aiming at. `canBecomeKey` is overridden because a borderless window
+/// refuses key status by default; the real editors this stands in for take it.
+final class ChildEditorWindow: NSWindow {
+    let field = NSTextField(string: kChildEditorSeedValue)
+
+    override var canBecomeKey: Bool { true }
+
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .textField }
+
+    override func accessibilityValue() -> Any? { field.stringValue }
+
+    override func accessibilityTitle() -> String? { nil }
+
+    override func accessibilityChildren() -> [Any]? { nil }
+
+    override func isAccessibilityFocused() -> Bool { isKeyWindow }
+
+
+    /// An `AXFocused` write is how a driver asks for the keyboard without a
+    /// click; the editor answers by taking key and putting its field first.
+    override func setAccessibilityFocused(_ focused: Bool) {
+        guard focused else { return }
+        makeKeyAndOrderFront(nil)
+        if field.currentEditor() == nil {
+            makeFirstResponder(field)
+        }
+    }
+
+
+    override func setAccessibilityValue(_ value: Any?) {
+        guard let text = value as? String else { return }
+        field.stringValue = text
+        if let editor = field.currentEditor() {
+            editor.string = text
+        }
+        onValueChanged?()
+    }
+
+    /// Set by the owning surface so a value written through AX (which raises
+    /// no `controlTextDidChange`) still reaches the mirrors.
+    var onValueChanged: (() -> Void)?
+}
+
+/// Owns the child editor and mirrors its state into the main window.
+///
+/// The mirrors are the point: the editor is not in the main window's AX
+/// subtree, so a window-scoped observation of the main window can only learn
+/// what landed in the editor if the application says it there.
+final class ChildEditorSurface: NSObject, NSTextFieldDelegate {
+    let editor = ChildEditorWindow(
+        contentRect: NSRect(origin: .zero, size: kChildEditorSize),
+        styleMask: [.borderless], backing: .buffered, defer: false)
+    let stateLabel = NSTextField(labelWithString: "child_editor=closed")
+    let valueLabel = NSTextField(labelWithString: "child_value=none")
+    let commitLabel = NSTextField(labelWithString: "child_committed=none")
+    private let parent: NSWindow
+    private let withSheet: Bool
+    private var sheet: NSWindow?
+
+    init(parent: NSWindow, withSheet: Bool) {
+        self.parent = parent
+        self.withSheet = withSheet
+        super.init()
+        stateLabel.setAccessibilityIdentifier(kChildEditorStateAID)
+        valueLabel.setAccessibilityIdentifier(kChildEditorValueAID)
+        commitLabel.setAccessibilityIdentifier(kChildEditorCommitAID)
+        editor.setAccessibilityIdentifier(kChildEditorFieldAID)
+        editor.isReleasedWhenClosed = false
+        editor.isRestorable = false
+        editor.hasShadow = false
+        let content = NSView(frame: NSRect(origin: .zero, size: kChildEditorSize))
+        editor.field.frame = content.bounds
+        editor.field.delegate = self
+        editor.field.target = self
+        editor.field.action = #selector(onCommit)
+        // Return commits (the action). Losing first responder must not: a
+        // text field's cell fires its action on end-of-editing by default,
+        // which committed and closed the editor the moment anything else took
+        // key — the sheet below, or the harness backgrounding the process.
+        // Finder's editor does close on deactivation; the fixture keeps its
+        // editor up through it so the background rungs can be exercised at
+        // all, and dismisses on the trigger that was measured to matter: the
+        // parent window becoming key (see `parentBecameKey`).
+        editor.field.cell?.sendsActionOnEndEditing = false
+        editor.onValueChanged = { [weak self] in self?.publish() }
+        content.addSubview(editor.field)
+        editor.contentView = content
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(parentBecameKey(_:)),
+            name: NSWindow.didBecomeKeyNotification, object: parent)
+    }
+
+    /// Making the parent key is what dismisses an inline editor — measured in
+    /// Finder, one foreground chord at the parent ended the rename outright.
+    /// A driver that fronts the parent to reach the editor destroys it; the
+    /// mirrors then read `closed`, which is what the harness asserts against.
+    @objc private func parentBecameKey(_ notification: Notification) {
+        guard editor.isVisible else { return }
+        onCommit()
+    }
+
+    /// Opens the editor inside the parent's current frame. Called after the
+    /// main window has been centered, so the frame it is placed in is final.
+    func open() {
+        editor.setFrameOrigin(NSPoint(
+            x: parent.frame.origin.x + kChildEditorOffset.x,
+            y: parent.frame.origin.y + kChildEditorOffset.y))
+        parent.addChildWindow(editor, ordered: .above)
+        editor.makeKeyAndOrderFront(nil)
+        editor.makeFirstResponder(editor.field)
+        editor.field.currentEditor()?.selectAll(nil)
+        publish()
+        if withSheet {
+            openSheet()
+        }
+    }
+
+    /// An attached sheet, for the contrast: a sheet is published as an
+    /// `AXSheet` child of its parent window (not in the application's
+    /// `AXWindows`), becomes its application's key window, and is therefore a
+    /// keyboard destination of its own — unlike the editor above.
+    func openSheet() {
+        let candidate = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 160),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        candidate.title = kChildEditorSheetTitle
+        candidate.contentView = NSTextField(labelWithString: "attached sheet takes key")
+        sheet = candidate
+        parent.beginSheet(candidate)
+    }
+
+    func publish() {
+        stateLabel.stringValue = editor.isVisible
+            ? "child_editor=open id=\(editor.windowNumber)"
+            : "child_editor=closed"
+        valueLabel.stringValue = "child_value=\(editor.field.stringValue)"
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        publish()
+    }
+
+    /// Return commits and dismisses the editor, the way an inline rename does.
+    @objc private func onCommit() {
+        commitLabel.stringValue = "child_committed=\(editor.field.stringValue)"
+        parent.removeChildWindow(editor)
+        editor.orderOut(nil)
+        parent.makeKeyAndOrderFront(nil)
+        publish()
+    }
+}
+
 // MARK: - Controller
 
 final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
@@ -186,6 +376,10 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let accelCountLabel = NSTextField(labelWithString: "accel_fired=0")
     var accelCount = 0
     var keyMonitor: Any?
+    /// The inline-editor scenario's child window and its mirrors. Opened
+    /// after [`show`] has centered the main window, so it is placed inside
+    /// the frame the window actually ends up with.
+    var childEditor: ChildEditorSurface?
 
     // Pinned content size — every launch MUST produce a byte-identical window
     // so screenshot dimensions (and the hardcoded pixel coords the harness tests
@@ -220,6 +414,19 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     func show() {
         window.makeKeyAndOrderFront(nil)
         window.center()
+        // `show` runs before `app.run()`, so the parent is only ordered in when
+        // the application finishes launching. An editor opened before that
+        // loses key status to the parent's deferred ordering, ends its edit
+        // session and dismisses itself — the inline-editor behaviour the
+        // scenario exists to exercise, fired by the launch instead of a test.
+        // Open it once the parent is really on screen and key.
+        if let editor = childEditor {
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didFinishLaunchingNotification, object: nil, queue: .main
+            ) { _ in
+                editor.open()
+            }
+        }
     }
 
     // MARK: - Layout
@@ -447,6 +654,30 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             rowHelpGroup.heightAnchor.constraint(equalToConstant: 28),
         ])
         content.addArrangedSubview(pressableRowStack)
+
+        var extraHeight: CGFloat = 0
+        if let mode = ProcessInfo.processInfo.environment["CUA_APPKIT_CHILD_EDITOR"],
+           mode == "1" || mode == "sheet" {
+            content.addArrangedSubview(sectionLabel("child_editor"))
+            let surface = ChildEditorSurface(parent: window, withSheet: mode == "sheet")
+            for mirror in [surface.stateLabel, surface.valueLabel, surface.commitLabel] {
+                mirror.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            }
+            let editorRow = NSStackView()
+            editorRow.orientation = .horizontal
+            editorRow.spacing = 12
+            editorRow.addArrangedSubview(surface.stateLabel)
+            editorRow.addArrangedSubview(surface.valueLabel)
+            editorRow.addArrangedSubview(surface.commitLabel)
+            content.addArrangedSubview(editorRow)
+            childEditor = surface
+            extraHeight += 60
+        }
+        if extraHeight > 0 {
+            window.setContentSize(NSSize(
+                width: HarnessWindowController.kContentSize.width,
+                height: HarnessWindowController.kContentSize.height + extraHeight))
+        }
 
         // No outer scroll-view wrap: the content is sized to fit the window
         // so the only scrollable surface is the inner scroll_target NSScrollView.

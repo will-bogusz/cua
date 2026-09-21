@@ -457,6 +457,23 @@ impl Tool for PressKeyTool {
             }
         };
 
+        // A key for whatever holds focus, when what holds it is a surface this
+        // window owns (an inline editor, an autocomplete field): the keyboard
+        // is already there, the application is already frontmost, and the only
+        // thing the foreground rung's activation can do to that surface is
+        // dismiss it. Post PID-routed and skip activation entirely — the same
+        // transport the background rung uses, which is what `key_events_fg`
+        // already names. An addressed element is excluded: focusing it is the
+        // caller's own request, and that write moves focus off the surface.
+        let owned_child_surface = match (fg && !px_focus && pre_focus_ptr.is_none(), window_id) {
+            (true, Some(wid)) => cua_driver_core::operation::spawn_blocking(move || {
+                crate::ax::exact_target::focused_owned_child_surface(pid, wid).is_some()
+            })
+            .await
+            .unwrap_or(false),
+            _ => false,
+        };
+
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Single-key presses can fire autocomplete (Return on a search
         // box opens a results popover) or trigger menu shortcuts that
@@ -492,7 +509,7 @@ impl Tool for PressKeyTool {
                     // silently discard them even while frontmost; the guarded HID route
                     // is accepted by both. Skipped when px-focus already handled the
                     // target-specific foreground transition.
-                    if fg && !px_focus {
+                    if fg && !px_focus && !owned_child_surface {
                         let wid = window_id.ok_or_else(|| {
                             anyhow::anyhow!(
                                 "delivery_mode=foreground requires window_id for press_key"
@@ -517,7 +534,9 @@ impl Tool for PressKeyTool {
                             )
                         });
                     }
-                    // background (default): auth-envelope post, no raise.
+                    // background (default), and the foreground rung for a
+                    // surface that already holds the keyboard: auth-envelope
+                    // post to the pid, no raise.
                     dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, |capture| {
                         capture();
                         crate::input::keyboard::press_key(pid, &key, &m)
@@ -577,7 +596,7 @@ impl Tool for PressKeyTool {
             changes.result_suffix()
         );
         let mut structured = serde_json::json!({
-            "path": key_path(fg, fg && !px_focus),
+            "path": key_path(fg, fg && !px_focus && !owned_child_surface),
             "verified": confirmed,
             "effect": if confirmed { "confirmed" } else { "unverifiable" },
         });

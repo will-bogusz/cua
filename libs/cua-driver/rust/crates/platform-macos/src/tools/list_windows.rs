@@ -105,9 +105,7 @@ impl Tool for ListWindowsTool {
                 } else {
                     None
                 };
-                let ax_backed = roster
-                    .as_ref()
-                    .and_then(|roster| roster.ax_backed(w.window_id));
+                let ax_backed = row_ax_backed(kind, roster.as_ref(), w.window_id);
                 window_record_json(w, kind, ax_backed)
             })
             .collect();
@@ -156,6 +154,42 @@ impl AccessibilityRoster {
     }
 }
 
+/// Whether an `AXWindows` entry this roster could not describe leaves the
+/// enumeration unable to claim it saw every window of the process.
+///
+/// An entry that maps no CGWindowID and is not an `AXWindow` is an
+/// application-level surface, not a window this pass failed to identify: a
+/// display's desktop surface is listed under `AXWindows` and never as an
+/// `AXWindow`, so it has no window id by construction
+/// (`ax::window_scope::decide_desktop_surface_scope`). Counting it as a miss
+/// made every roster of a pid that owns one permanently incomplete, and an
+/// incomplete mapping is the one thing a caller may not narrow an acquisition
+/// with. Every other shape is a real window this roster cannot describe: an
+/// `AXWindow` whose id would not map, or a non-window element that does map
+/// one (an application's inline-rename field).
+fn entry_leaves_roster_incomplete(mapped: Option<u32>, role: Option<&str>) -> bool {
+    !matches!((mapped, role), (None, Some(role)) if role != "AXWindow")
+}
+
+/// `ax_backed` for one WindowServer row.
+///
+/// A desktop surface is never claimed by an `AXWindow`, yet `get_window_state`
+/// reads it through the desktop-surface scope — it is the one surface of that
+/// pid the driver can read. Reporting it as accessibility-backed keeps a
+/// caller that skips rows no accessibility window claims from skipping the
+/// only readable one.
+fn row_ax_backed(
+    kind: Option<&str>,
+    roster: Option<&AccessibilityRoster>,
+    window_id: u32,
+) -> Option<bool> {
+    let roster = roster?;
+    if kind == Some(crate::window_kind::DESKTOP_KIND) {
+        return Some(true);
+    }
+    roster.ax_backed(window_id)
+}
+
 fn accessibility_roster(pid: i32) -> AccessibilityRoster {
     use crate::ax::bindings::*;
     use core_foundation::base::{CFRelease, CFTypeRef};
@@ -198,7 +232,11 @@ fn accessibility_roster(pid: i32) -> AccessibilityRoster {
                             "main": copy_bool_attr(window, "AXMain"),
                         }))
                     }
-                    _ => complete = false,
+                    (mapped, role) => {
+                        if entry_leaves_roster_incomplete(mapped, role.as_deref()) {
+                            complete = false;
+                        }
+                    }
                 }
             } else {
                 complete = false;
@@ -343,6 +381,51 @@ mod tests {
         assert_eq!(
             window_record_json(&window, None, partial.ax_backed(window.window_id)).get("ax_backed"),
             None
+        );
+    }
+
+    /// An application-level surface in `AXWindows` — one with no window id to
+    /// map, which is what a display's desktop surface is — is not a window
+    /// this enumeration missed. Counting it as one made every roster of the
+    /// pid that owns it incomplete, and only a complete mapping may narrow an
+    /// acquisition.
+    #[test]
+    fn an_unmappable_non_window_surface_does_not_make_the_roster_incomplete() {
+        assert!(!entry_leaves_roster_incomplete(None, Some("AXList")));
+        assert!(!entry_leaves_roster_incomplete(None, Some("AXGroup")));
+
+        assert!(
+            entry_leaves_roster_incomplete(None, Some("AXWindow")),
+            "a window whose id would not map is a window this roster cannot describe"
+        );
+        assert!(
+            entry_leaves_roster_incomplete(Some(51), Some("AXTextField")),
+            "an element that maps its own window id is a surface a caller can address"
+        );
+        assert!(
+            entry_leaves_roster_incomplete(None, None),
+            "an unreadable role says nothing, and nothing is not proof"
+        );
+    }
+
+    /// The desktop surface is the one row whose accessibility backing cannot
+    /// come from the AXWindows mapping: no AXWindow claims it, yet
+    /// `get_window_state` reads it. A caller skipping rows nothing claims must
+    /// not skip it.
+    #[test]
+    fn the_desktop_surface_is_reported_accessibility_backed() {
+        let roster = roster(true, &[42]);
+        let desktop = crate::window_kind::DESKTOP_KIND;
+        assert_eq!(row_ax_backed(Some(desktop), Some(&roster), 99), Some(true));
+        assert_eq!(
+            row_ax_backed(None, Some(&roster), 99),
+            Some(false),
+            "an ordinary row no accessibility window claims is still unclaimed"
+        );
+        assert_eq!(
+            row_ax_backed(Some(desktop), None, 99),
+            None,
+            "without accessibility metadata the roster claims nothing"
         );
     }
 

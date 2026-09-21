@@ -716,6 +716,22 @@ pub fn with_foreground_assist(
         return Ok(false);
     }
 
+    // The application is already frontmost and editing in a surface this
+    // window owns. Fronting it would make the parent key, which is exactly
+    // what dismisses the surface, so the body's input goes out without any
+    // activation — the same rung a background delivery would have used.
+    if front_target_edits_in_owned_child(
+        prev_ok,
+        prev_psn,
+        target_psn,
+        target_pid,
+        target_wid,
+        crate::ax::bindings::focused_window_id_of_pid(target_pid),
+    ) {
+        body()?;
+        return Ok(false);
+    }
+
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     // `set_front` moves WindowServer's front process but does not make the
     // target's NSWindow key, and AppKit installs a first responder only for a
@@ -852,9 +868,7 @@ pub fn with_foreground_hid_activation(
         anyhow::bail!("could not resolve target window for foreground HID delivery");
     }
 
-    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
-    if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
-    {
+    if exact_target_holds_keyboard(prev_ok, prev_psn, target_psn, target_pid, target_wid) {
         // Re-activating an already key exact window can clear Chromium's
         // renderer focus even though WindowServer keeps the app frontmost.
         // The AX window proof lets us deliver directly without weakening the
@@ -885,16 +899,77 @@ pub fn with_foreground_hid_activation(
     result
 }
 
+/// Whether the exact target already owns the keyboard, so no activation is
+/// needed — and, for a child surface, so none may be attempted.
+fn exact_target_holds_keyboard(
+    previous_process_known: bool,
+    previous_psn: [u8; 8],
+    target_psn: [u8; 8],
+    target_pid: libc::pid_t,
+    target_window_id: u32,
+) -> bool {
+    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
+    preserves_exact_existing_focus(
+        previous_process_known,
+        previous_psn,
+        target_psn,
+        focused_window_id,
+        target_window_id,
+        front_target_edits_in_owned_child(
+            previous_process_known,
+            previous_psn,
+            target_psn,
+            target_pid,
+            target_window_id,
+            focused_window_id,
+        ),
+    )
+}
+
+/// Whether the target's application is frontmost and editing in a surface the
+/// target window owns: an inline editor, an autocomplete field, a combo popup
+/// (see [`crate::ax::exact_target::focused_owned_child_surface`]).
+///
+/// This is the one keyboard state an activation cannot improve and can only
+/// destroy — making the parent key dismisses the surface. The read costs a
+/// CGWindowList enumeration, so it runs only once the cheap window proof has
+/// failed and only while the process is already frontmost: a surface the
+/// application opened to edit in does not hold a background process's keyboard.
+fn front_target_edits_in_owned_child(
+    previous_process_known: bool,
+    previous_psn: [u8; 8],
+    target_psn: [u8; 8],
+    target_pid: libc::pid_t,
+    target_window_id: u32,
+    focused_window_id: Option<u32>,
+) -> bool {
+    previous_process_known
+        && previous_psn == target_psn
+        && focused_window_id != Some(target_window_id)
+        && crate::ax::exact_target::focused_owned_child_surface(target_pid, target_window_id)
+            .is_some()
+}
+
+/// Whether an activation would only take the keyboard away from where it
+/// already is.
+///
+/// `focused_owned_child` is the second way the target can hold it: the
+/// application is editing in a surface the target window owns (an inline
+/// editor, an autocomplete field — see
+/// [`crate::ax::exact_target::focused_owned_child_surface`]). Such a surface
+/// reports no `AXFocusedWindow` at all, so the window proof above cannot see
+/// it, and making the parent key is exactly what dismisses it.
 fn preserves_exact_existing_focus(
     previous_process_known: bool,
     previous_psn: [u8; 8],
     target_psn: [u8; 8],
     focused_window_id: Option<u32>,
     target_window_id: u32,
+    focused_owned_child: bool,
 ) -> bool {
     previous_process_known
         && previous_psn == target_psn
-        && focused_window_id == Some(target_window_id)
+        && (focused_window_id == Some(target_window_id) || focused_owned_child)
 }
 
 /// Make `target_wid` the application's key window, run `action`, then restore
@@ -929,9 +1004,7 @@ pub fn with_menu_key_activation(
         anyhow::bail!("could not resolve target window for menu key-equivalent delivery");
     }
 
-    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
-    if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
-    {
+    if exact_target_holds_keyboard(prev_ok, prev_psn, target_psn, target_pid, target_wid) {
         return action();
     }
 
@@ -973,9 +1046,34 @@ mod tests {
     #[test]
     fn exact_existing_focus_avoids_reactivation() {
         let psn = [1, 2, 3, 4, 5, 6, 7, 8];
-        assert!(preserves_exact_existing_focus(true, psn, psn, Some(42), 42));
+        assert!(preserves_exact_existing_focus(
+            true,
+            psn,
+            psn,
+            Some(42),
+            42,
+            false
+        ));
     }
 
+    /// The application reports no focused window at all while it edits in a
+    /// surface the target owns, and making the target key dismisses it.
+    #[test]
+    fn a_child_surface_holding_the_keyboard_avoids_reactivation() {
+        let psn = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(preserves_exact_existing_focus(true, psn, psn, None, 42, true));
+        assert!(preserves_exact_existing_focus(
+            true,
+            psn,
+            psn,
+            Some(41),
+            42,
+            true
+        ));
+    }
+
+    /// A child surface of a background process is not this target's keyboard:
+    /// the process proof still gates the whole decision.
     #[test]
     fn process_or_window_uncertainty_requires_guarded_activation() {
         let target = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -985,24 +1083,33 @@ mod tests {
             target,
             target,
             Some(42),
-            42
+            42,
+            false
         ));
         assert!(!preserves_exact_existing_focus(
             true,
             other,
             target,
             Some(42),
-            42
+            42,
+            false
         ));
         assert!(!preserves_exact_existing_focus(
             true,
             target,
             target,
             Some(41),
-            42
+            42,
+            false
         ));
         assert!(!preserves_exact_existing_focus(
-            true, target, target, None, 42
+            true, target, target, None, 42, false
+        ));
+        assert!(!preserves_exact_existing_focus(
+            false, target, target, None, 42, true
+        ));
+        assert!(!preserves_exact_existing_focus(
+            true, other, target, None, 42, true
         ));
     }
 }

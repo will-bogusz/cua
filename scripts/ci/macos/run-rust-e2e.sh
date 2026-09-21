@@ -375,6 +375,10 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
     harness_appkit_double_click_px_foreground \
     harness_appkit_double_click_px_background \
     harness_appkit_slider_drag_px_foreground \
+    harness_appkit_child_editor_takes_window_scoped_background_keys \
+    harness_appkit_foreground_chord_does_not_dismiss_the_child_editor \
+    harness_appkit_set_value_on_the_child_editor_is_inside_its_window \
+    harness_appkit_an_attached_sheet_still_competes_for_the_keyboard \
       harness_appkit_slider_drag_px_background; do
       run_test "appkit-${appkit_test}" cargo test -p cua-driver --test harness_appkit_test -- \
         --ignored --exact "${appkit_test}" --nocapture --test-threads=1

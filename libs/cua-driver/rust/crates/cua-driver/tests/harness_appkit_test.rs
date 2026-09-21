@@ -200,6 +200,28 @@ fn element_pixel_frame(snapshot: &ToolResponse, identifier: &str) -> (f64, f64, 
     )
 }
 
+/// One structured row of a snapshot, by the accessibility identifier its
+/// markdown row carries.
+fn element_by_id(snapshot: &ToolResponse, identifier: &str) -> serde_json::Value {
+    let index = element_index_by_id(snapshot.tree_text(), identifier)
+        .unwrap_or_else(|| panic!("{identifier} element_index not found"));
+    element_where(snapshot, |element| {
+        element["element_index"].as_u64() == Some(index)
+    })
+    .unwrap_or_else(|| panic!("{identifier} structured element not found"))
+}
+
+/// The first structured row satisfying `matches`, if the snapshot has one.
+fn element_where(
+    snapshot: &ToolResponse,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    snapshot.structured()["elements"]
+        .as_array()
+        .and_then(|elements| elements.iter().find(|element| matches(element)))
+        .cloned()
+}
+
 fn run_case(
     case: cua_driver_testkit::e2e::CaseSpec,
     test: impl FnOnce(u32, u64, &mut McpDriver) -> Observation,
@@ -2419,4 +2441,283 @@ fn harness_appkit_slider_drag_px_background() {
             Evidence::default(),
         )
     });
+}
+// ── child-window ownership (child_editor scenario) ───────────────────────────
+//
+// The shape, measured in Finder's inline rename editor: the application edits
+// in a separate borderless WindowServer window drawn inside the window being
+// edited, accessibility publishes that window as the text field itself (role
+// `AXTextField`, mapped by `_AXUIElementGetWindow`, no `AXWindow` /
+// `AXTopLevelUIElement` attribute, `AXParent` = the application), and while it
+// is up the application answers no `AXFocusedWindow`. Such a surface cannot be
+// addressed, activated or made key on its own, so it is the requested window's
+// own surface — and making the requested window key is what dismisses it.
+//
+// The editor is not in the main window's AX subtree, so the fixture publishes
+// its state into the main window: `child_editor=open id=<n>` / `closed`,
+// `child_value=`, `child_committed=`.
+
+/// The refusal code a reply carries, under either shape the tools publish it
+/// in (`code` at the top level, or nested under `refusal`).
+fn refusal_code(reply: &ToolResponse) -> Option<&str> {
+    let structured = reply.structured();
+    structured["code"]
+        .as_str()
+        .or_else(|| structured["refusal"]["code"].as_str())
+}
+
+/// The line the fixture publishes for the editor's own window, so a test can
+/// prove the same surface survived rather than a re-created one.
+fn child_editor_state(tree: &str) -> String {
+    tree.lines()
+        .find(|line| line.contains("child_editor="))
+        .map(|line| {
+            let start = line.find("child_editor=").expect("child_editor= marker");
+            let rest = &line[start..];
+            rest.split(|c: char| c == '|' || c == '<')
+                .next()
+                .unwrap_or(rest)
+                .trim()
+                .to_owned()
+        })
+        .unwrap_or_else(|| panic!("the fixture published no child_editor= state:\n{tree}"))
+}
+
+/// Window-scoped background keys, with the application editing in a child
+/// surface of the requested window. The surface is a second same-pid layer-0
+/// window that the application also lists in `AXWindows`, so the pre-fix gate
+/// counted it as a competing keyboard destination and refused both rungs with
+/// `same_pid_keyboard_ambiguity` — refusing to type into the very field the
+/// keyboard was already in.
+#[test]
+#[ignore]
+fn harness_appkit_child_editor_takes_window_scoped_background_keys() {
+    run_background_case_with_env(
+        "child_editor_background_keys",
+        Targeting::Ax,
+        DriverRoute::MacosCgEventPid,
+        &[("CUA_APPKIT_CHILD_EDITOR", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let state = child_editor_state(before.tree_text());
+            assert!(
+                state.starts_with("child_editor=open"),
+                "the fixture must launch with its child editor open: {state}"
+            );
+            assert!(
+                has_id(before.tree_text(), "txt-child-editor"),
+                "the fixture's child window must be published as a text field in the \
+                 application's window list, not as a window — the shape under test is \
+                 gone otherwise:\n{}",
+                before.tree_text()
+            );
+
+            // No element_index: the window-scoped form, which is the one the
+            // process-scoped keyboard gate decides.
+            let typed = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "text": "editor-cua",
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(
+                !typed.is_error(),
+                "a background type at a window whose own child surface holds the keyboard \
+                 was refused: {} / {}",
+                refusal_code(&typed).unwrap_or("no code"),
+                typed.text()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            let mid = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                mid.contains("editor-cua"),
+                "the keystrokes did not reach the child editor:\n{mid}"
+            );
+
+            let pressed = driver.call(
+                "press_key",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "key": "Return",
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(
+                !pressed.is_error(),
+                "a background Return at the same window was refused: {} / {}",
+                refusal_code(&pressed).unwrap_or("no code"),
+                pressed.text()
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let post = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                post.contains("child_committed=editor-cua"),
+                "Return did not commit the child editor's text:\n{post}"
+            );
+        },
+    );
+}
+
+/// The foreground chord rung must not front the parent over the surface it is
+/// aiming at. `with_menu_key_activation` makes the requested window the
+/// application's key window, and that is exactly what dismisses an inline
+/// editor: measured in Finder, one foreground `cmd+a` at the parent ended the
+/// rename outright.
+#[test]
+#[ignore]
+fn harness_appkit_foreground_chord_does_not_dismiss_the_child_editor() {
+    run_case_with_env(
+        native_foreground_case(
+            "appkit",
+            "child_editor_foreground_chord",
+            Targeting::Ax,
+            DriverRoute::MacosCgEventHid,
+        ),
+        &[("CUA_APPKIT_CHILD_EDITOR", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let open = child_editor_state(before.tree_text());
+            assert!(
+                open.starts_with("child_editor=open"),
+                "the fixture must launch with its child editor open: {open}"
+            );
+
+            let chord = driver.call(
+                "hotkey",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "keys": ["cmd", "a"],
+                    "delivery_mode": "foreground"
+                }),
+            );
+            assert!(
+                !chord.is_error(),
+                "foreground chord failed: {}",
+                chord.text()
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let after = snapshot_elements(driver, pid, wid);
+            assert_eq!(
+                child_editor_state(after.tree_text()),
+                open,
+                "the foreground chord dismissed (or re-created) the application's own \
+                 editing surface: {}",
+                chord.text()
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
+/// An element in a surface the requested window owns is in that window. The
+/// editor is a root-level row of the requested window's own snapshot (a
+/// non-window top-level child of the application), and its `AXParent` chain
+/// reaches the application without passing a window, so the pre-fix ancestry
+/// verdict was `Unproven` and the write was refused
+/// `element_outside_target_window` — against the one field the prompt tells a
+/// caller to address.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_on_the_child_editor_is_inside_its_window() {
+    run_background_case_with_env(
+        "child_editor_set_value",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_APPKIT_CHILD_EDITOR", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let editor = element_by_id(&before, "txt-child-editor");
+            let index = editor["element_index"]
+                .as_u64()
+                .expect("child editor element_index");
+
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_index": index,
+                    "snapshot_id": before.snapshot_id(),
+                    "value": "written-cua"
+                }),
+            );
+            assert_ne!(
+                refusal_code(&set),
+                Some("element_outside_target_window"),
+                "the window's own editing surface was refused as outside it: {}",
+                set.raw
+            );
+            assert!(
+                !set.is_error(),
+                "set_value on the child editor failed: {}",
+                set.text()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            let post = snapshot_elements(driver, pid, wid).tree_text().to_owned();
+            assert!(
+                post.contains("written-cua"),
+                "the write did not land in the child editor:\n{post}"
+            );
+        },
+    );
+}
+
+/// The contrast, and the guard the two-window rule exists for: an attached
+/// sheet keeps its window role (`AXSheet`), becomes its application's key
+/// window and can be addressed on its own, so it is a keyboard destination in
+/// its own right. A process-scoped key stays refused while one is up, with the
+/// same code and the same sentence as before.
+#[test]
+#[ignore]
+fn harness_appkit_an_attached_sheet_still_competes_for_the_keyboard() {
+    run_case_with_env(
+        native_readonly_case(
+            "appkit",
+            "child_editor_sheet_competes",
+            Targeting::Ax,
+            DriverRoute::AxRead,
+            vec![OracleKind::AxState],
+        ),
+        &[("CUA_APPKIT_CHILD_EDITOR", "sheet")],
+        |pid, wid, driver| {
+            let (sheet, _) = driver
+                .find_window(pid as i64, "Child Editor Sheet")
+                .expect("the fixture's attached sheet was not found");
+            assert_ne!(sheet, wid);
+
+            let refused = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "text": "sheet-cua",
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(
+                refused.is_error(),
+                "a process-scoped key was accepted while a sheet held the keyboard: {}",
+                refused.text()
+            );
+            assert_eq!(
+                refusal_code(&refused),
+                Some("same_pid_keyboard_ambiguity"),
+                "wrong refusal for a sibling that can be the key window: {}",
+                refused.raw
+            );
+            assert!(
+                refused
+                    .text()
+                    .contains("other eligible top-level window(s)"),
+                "the refusal sentence for a competing destination changed: {}",
+                refused.text()
+            );
+            Observation::delivered(vec![OracleKind::AxState], Evidence::default())
+        },
+    );
 }
