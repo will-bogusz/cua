@@ -31,12 +31,14 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_children, copy_number_attr, copy_string_attr, kAXErrorSuccess,
-    perform_action, set_number_attr, set_range_attr, set_string_attr, AXUIElementRef,
+    copy_action_names, copy_children, copy_element_attr, copy_number_attr, copy_string_attr,
+    kAXErrorSuccess, perform_action, release_all, set_number_attr, set_range_attr, set_string_attr,
+    AXUIElementRef,
 };
+use crate::ax::RetainedElement;
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
-use core_foundation::base::CFRelease;
+use core_foundation::base::{CFEqual, CFRelease, CFTypeRef};
 
 use super::ToolState;
 
@@ -473,50 +475,201 @@ fn keystroke_refusal_reason(refusal: &ToolResult) -> String {
     }
 }
 
+// ── Following a control across its app's end-of-edit ────────────────────────
+
+/// How to find a control again after its application rebuilds it.
+///
+/// An end-of-edit is handed to the application, and an application that reacts
+/// by re-creating the control does so with a *new* `AXUIElementRef`: every read
+/// on the pointer this call addressed then answers `kAXErrorInvalidUIElement`,
+/// which is indistinguishable from "the value is gone" unless the control is
+/// looked up again. What identifies it across the rebuild is its place in its
+/// parent — same role, same label, same ordinal among the parent's children
+/// that share both. The value is deliberately not part of that: this call is
+/// what just changed it.
+struct ElementIdentity {
+    parent: RetainedElement,
+    role: String,
+    label: Option<String>,
+    ordinal: usize,
+}
+
+/// The parts of a control's description an edit does not change.
+///
+/// `copy_label_attr` falls back to `AXValue`, which is exactly what a write
+/// rewrites, so the label is read only from the attributes AppKit keeps across
+/// the edit: the title, the description, the placeholder.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the
+/// call.
+unsafe fn stable_label(element: AXUIElementRef) -> Option<String> {
+    ["AXTitle", "AXDescription", "AXPlaceholderValue"]
+        .into_iter()
+        .find_map(|attr| copy_string_attr(element, attr).filter(|label| !label.is_empty()))
+}
+
+/// Whether `candidate` is a control of the same role and stable label.
+///
+/// # Safety
+///
+/// `candidate` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn same_control(candidate: AXUIElementRef, role: &str, label: Option<&str>) -> bool {
+    copy_string_attr(candidate, "AXRole").as_deref() == Some(role)
+        && stable_label(candidate).as_deref() == label
+}
+
+/// Record where the addressed control sits, before a gesture that may rebuild
+/// it. `None` when the control has no parent to be found in again.
+fn capture_identity(element: AXUIElementRef, role: &str) -> Option<ElementIdentity> {
+    let parent = unsafe { RetainedElement::adopt(copy_element_attr(element, "AXParent")?)? };
+    let label = unsafe { stable_label(element) };
+    let children = unsafe { copy_children(parent.as_ptr() as AXUIElementRef) };
+    let ordinal = children
+        .iter()
+        .filter(|&&sibling| unsafe { same_control(sibling, role, label.as_deref()) })
+        .position(|&sibling| unsafe { CFEqual(sibling as CFTypeRef, element as CFTypeRef) } != 0);
+    unsafe { release_all(children) };
+    Some(ElementIdentity {
+        parent,
+        role: role.to_owned(),
+        label,
+        ordinal: ordinal?,
+    })
+}
+
+/// Find the control an identity describes among its parent's current children.
+fn resolve_identity(identity: &ElementIdentity) -> Option<RetainedElement> {
+    let children = unsafe { copy_children(identity.parent.as_ptr() as AXUIElementRef) };
+    let mut matched = None;
+    let mut seen = 0_usize;
+    for &child in &children {
+        if unsafe { same_control(child, &identity.role, identity.label.as_deref()) } {
+            if seen == identity.ordinal {
+                matched = Some(unsafe { RetainedElement::retain(child as usize) });
+                break;
+            }
+            seen += 1;
+        }
+    }
+    unsafe { release_all(children) };
+    matched
+}
+
+/// Read the control's value after a commit gesture, following it across a
+/// rebuild: when the addressed pointer stops answering, the control's identity
+/// is resolved again and the replacement is read instead. The replacement is
+/// returned with the value, because a pointer that had to be replaced is itself
+/// evidence the edit session it belonged to is over.
+fn read_back_after_commit(
+    element: AXUIElementRef,
+    identity: Option<&ElementIdentity>,
+) -> (Option<String>, Option<RetainedElement>) {
+    if let Some(value) = unsafe { copy_string_attr(element, "AXValue") } {
+        return (Some(value), None);
+    }
+    let Some(resolved) = identity.and_then(resolve_identity) else {
+        return (None, None);
+    };
+    let value = unsafe { copy_string_attr(resolved.as_ptr() as AXUIElementRef, "AXValue") };
+    (value, Some(resolved))
+}
+
+/// What a commit gesture is judged against: the value asked for, the value the
+/// control held before the write, and how to find the control again if its app
+/// rebuilds it on end-of-edit.
+struct CommitTarget<'a> {
+    requested: &'a str,
+    before: Option<&'a str>,
+    numeric: bool,
+    identity: Option<&'a ElementIdentity>,
+}
+
+impl CommitTarget<'_> {
+    /// Judge a commit gesture by reading the control back through it.
+    fn judge(
+        &self,
+        element: AXUIElementRef,
+        dispatched: bool,
+        witness: CommitWitness,
+        gesture: &str,
+    ) -> CommitJudgement {
+        if !dispatched {
+            return CommitJudgement::of(
+                judge_commit(CommitReadback::NotDispatched, witness, gesture),
+                None,
+            );
+        }
+        std::thread::sleep(COMMIT_SETTLE);
+        let (settled, _resolved) = read_back_after_commit(element, self.identity);
+        let verdict = judge_commit(
+            classify_readback(settled.as_deref(), self.before, self.requested, self.numeric),
+            witness,
+            gesture,
+        );
+        CommitJudgement::of(verdict, settled)
+    }
+}
+
+/// What a commit gesture produced: the verdict, the sentence that reports it,
+/// and the value the judging read-back saw — `None` when no gesture ran or
+/// nothing answered, so a caller can report the control's settled state rather
+/// than the one it read before the gesture.
+struct CommitJudgement {
+    committed: Option<ActionCommit>,
+    detail: String,
+    settled: Option<String>,
+}
+
+impl CommitJudgement {
+    fn of(verdict: (Option<ActionCommit>, String), settled: Option<String>) -> Self {
+        Self {
+            committed: verdict.0,
+            detail: verdict.1,
+            settled,
+        }
+    }
+}
+
 /// Run the commit gesture for an `AXValue` write and report what was observed
 /// of the app's end-of-edit.
 fn commit_written_value(
     element: AXUIElementRef,
     pid: i32,
-    requested: &str,
-    numeric: bool,
     plan: WritePlan,
     changed: Option<bool>,
-) -> (Option<ActionCommit>, String) {
+    target: &CommitTarget<'_>,
+) -> CommitJudgement {
     match plan {
-        WritePlan::ValueOnly => (None, String::new()),
-        WritePlan::Blocked(reason) => (
-            Some(ActionCommit::NotCommitted),
-            format!(" Not committed: {reason}."),
+        WritePlan::ValueOnly => CommitJudgement::of((None, String::new()), None),
+        WritePlan::Blocked(reason) => CommitJudgement::of(
+            (
+                Some(ActionCommit::NotCommitted),
+                format!(" Not committed: {reason}."),
+            ),
+            None,
         ),
         WritePlan::Retype(_) => unreachable!("the retype route does not write AXValue"),
         WritePlan::ValueThenConfirm => {
             let dispatched = unsafe { perform_action(element, "AXConfirm") } == kAXErrorSuccess;
-            let survived = dispatched && {
-                std::thread::sleep(COMMIT_SETTLE);
-                let after = unsafe { copy_string_attr(element, "AXValue") };
-                value_matches(after.as_deref(), requested, numeric)
-            };
+            // A value the control already held survives any gesture, so only a
+            // write that moved it can be witnessed by the control's own action.
             let witness = if changed == Some(true) {
                 CommitWitness::OwnConfirmAction
             } else {
                 CommitWitness::ReadbackOnly
             };
-            judge_commit(dispatched, survived, witness, "AXConfirm")
+            target.judge(element, dispatched, witness, "AXConfirm")
         }
         WritePlan::ValueThenKey(key) => {
             let focused = crate::input::ax_actions::focus_element(element as usize).is_ok();
             let dispatched = focused && crate::input::keyboard::press_key(pid, key, &[]).is_ok();
-            let survived = dispatched && {
-                std::thread::sleep(COMMIT_SETTLE);
-                let after = unsafe { copy_string_attr(element, "AXValue") };
-                value_matches(after.as_deref(), requested, numeric)
-            };
             // The key ends the edit session, but the value in it arrived
             // through `AXValue` rather than the field editor, and a synthesized
             // key is not the control's own advertised commit, so the ended
             // session is not evidence the app took it.
-            judge_commit(dispatched, survived, CommitWitness::ReadbackOnly, key)
+            target.judge(element, dispatched, CommitWitness::ReadbackOnly, key)
         }
     }
 }
@@ -537,6 +690,63 @@ enum CommitWitness {
     ReadbackOnly,
 }
 
+/// What the read-back after a commit gesture saw.
+///
+/// Only one of these refutes a commit. A control that reads back the value it
+/// held *before* the write is a control whose application discarded the edit
+/// and put its own value back — the one thing "not committed" claims. A control
+/// that reads back something else took the edit and rewrote it: an end-of-edit
+/// formatter is ordinary AppKit, so a phone number comes back as
+/// `(555) 789-0123` and a date in the app's own spelling. A control that stops
+/// answering has been re-created by its application. Neither of those is
+/// evidence the application kept its own value, so neither may say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitReadback<'a> {
+    /// The commit gesture could not be dispatched.
+    NotDispatched,
+    /// The read-back is the value this call asked for.
+    Matches,
+    /// The read-back is the value the control held before the write.
+    Restored,
+    /// The read-back is neither, quoted as the control reports it.
+    Rewritten(&'a str),
+    /// Nothing answered after the gesture, though the control published a value
+    /// before it: the control this pointer addressed is gone and its identity
+    /// resolved to nothing readable either.
+    Unreadable,
+    /// The control publishes no readable value at all, before or after.
+    Unpublished,
+}
+
+/// Compare a post-gesture read-back against the request and the control's prior
+/// value.
+///
+/// Both comparisons stay exact — `value_equal` normalises nothing but a numeric
+/// control's own formatting. Folding digits, whitespace or bidi isolates into a
+/// match would report the *application's* value as the caller's, which is the
+/// one thing the caller cannot check for itself.
+fn classify_readback<'a>(
+    after: Option<&'a str>,
+    before: Option<&str>,
+    requested: &str,
+    numeric: bool,
+) -> CommitReadback<'a> {
+    let Some(after) = after else {
+        return if before.is_some() {
+            CommitReadback::Unreadable
+        } else {
+            CommitReadback::Unpublished
+        };
+    };
+    if value_equal(after, requested, numeric) {
+        return CommitReadback::Matches;
+    }
+    match before {
+        Some(before) if value_equal(after, before, numeric) => CommitReadback::Restored,
+        _ => CommitReadback::Rewritten(after),
+    }
+}
+
 /// What the driver may claim about the app's end-of-edit.
 ///
 /// An accessibility read-back is echoed by a bound control whether or not the
@@ -555,49 +765,70 @@ enum CommitWitness {
 /// Return does. Paired with a read-back that moved off the field's prior value
 /// — so the survival is not an echo of a value the field already held — that
 /// is the application's end-of-edit, observed.
+///
+/// Refuting a commit is narrower than it looks: the sentence claims the
+/// application put its own value back, and only [`CommitReadback::Restored`]
+/// shows that.
 fn judge_commit(
-    dispatched: bool,
-    survived: bool,
+    readback: CommitReadback<'_>,
     witness: CommitWitness,
     gesture: &str,
 ) -> (Option<ActionCommit>, String) {
-    if !dispatched {
-        return (
+    match readback {
+        CommitReadback::NotDispatched => (
             Some(ActionCommit::NotCommitted),
             format!(" Not committed: the {gesture} commit gesture could not be dispatched."),
-        );
-    }
-    if !survived {
-        return (
+        ),
+        CommitReadback::Restored => (
             Some(ActionCommit::NotCommitted),
             " Not committed: the value did not survive the app's end-of-edit, so the app \
              still holds its own value."
                 .to_owned(),
-        );
-    }
-    match witness {
-        CommitWitness::TypedEditEnded => (
-            Some(ActionCommit::Committed),
-            format!(
-                " Committed via {gesture}: the typed edit session ended with this value in \
-                 place."
-            ),
         ),
-        CommitWitness::OwnConfirmAction => (
-            Some(ActionCommit::Committed),
-            format!(
-                " Committed via {gesture}: the control's own confirm action ran and the value \
-                 it changed to survived it."
-            ),
-        ),
-        CommitWitness::ReadbackOnly => (
+        CommitReadback::Rewritten(value) => (
             Some(ActionCommit::Unproven),
             format!(
-                " Commit unproven: the value survived {gesture}, but the app's own model was \
-                 not observed — an accessibility read-back is echoed by a bound control \
-                 whether or not the app took the value. Check the app's own output."
+                " Commit unproven: the app's end-of-edit rewrote the value — it reads back as \
+                 \"{value}\", which is neither what was written nor the value the control held \
+                 before. Judge it by the app's own output."
             ),
         ),
+        CommitReadback::Unreadable => (
+            Some(ActionCommit::Unproven),
+            " Commit unproven: the control was re-created on end-of-edit; read it back."
+                .to_owned(),
+        ),
+        CommitReadback::Unpublished => (
+            Some(ActionCommit::Unproven),
+            format!(
+                " Commit unproven: the control publishes no readable value, so nothing could \
+                 read back what {gesture} left in it."
+            ),
+        ),
+        CommitReadback::Matches => match witness {
+            CommitWitness::TypedEditEnded => (
+                Some(ActionCommit::Committed),
+                format!(
+                    " Committed via {gesture}: the typed edit session ended with this value in \
+                     place."
+                ),
+            ),
+            CommitWitness::OwnConfirmAction => (
+                Some(ActionCommit::Committed),
+                format!(
+                    " Committed via {gesture}: the control's own confirm action ran and the \
+                     value it changed to survived it."
+                ),
+            ),
+            CommitWitness::ReadbackOnly => (
+                Some(ActionCommit::Unproven),
+                format!(
+                    " Commit unproven: the value survived {gesture}, but the app's own model \
+                     was not observed — an accessibility read-back is echoed by a bound control \
+                     whether or not the app took the value. Check the app's own output."
+                ),
+            ),
+        },
     }
 }
 
@@ -699,6 +930,10 @@ fn set_value_blocking(
         // Read the value before writing so an unchanged field can be reported as
         // idempotent rather than silently indistinguishable from a fresh write.
         let before = unsafe { copy_string_attr(element, "AXValue") };
+        // Taken while the element still answers: an app that re-creates the
+        // control on its end-of-edit leaves this pointer invalid, and the
+        // identity is how the read-back finds what the app put in its place.
+        let identity = capture_identity(element, &role);
         let err = match numeric_target {
             Some(n) => {
                 let e = unsafe { set_number_attr(element, "AXValue", n) };
@@ -711,15 +946,31 @@ fn set_value_blocking(
             None => unsafe { set_string_attr(element, "AXValue", value) },
         };
         if err == kAXErrorSuccess {
-            let after = unsafe { copy_string_attr(element, "AXValue") };
+            let written = unsafe { copy_string_attr(element, "AXValue") };
+            // The witness needs the move the *write* made: a gesture over a
+            // value the control already held proves nothing about the app.
+            let (_, written_change) = classify_write(
+                before.as_deref(),
+                written.as_deref(),
+                value,
+                numeric_target.is_some(),
+            );
+            let target = CommitTarget {
+                requested: value,
+                before: before.as_deref(),
+                numeric: numeric_target.is_some(),
+                identity: identity.as_ref(),
+            };
+            let judgement = commit_written_value(element, pid, plan, written_change, &target);
+            // What the caller acts on is the control's settled state, so the
+            // read that judged the gesture outranks the one taken before it.
+            let after = judgement.settled.or(written);
             let (verified, changed) = classify_write(
                 before.as_deref(),
                 after.as_deref(),
                 value,
                 numeric_target.is_some(),
             );
-            let (committed, commit_detail) =
-                commit_written_value(element, pid, value, numeric_target.is_some(), plan, changed);
             let suffix = match (verified, changed) {
                 (Some(true), Some(false)) => " Value already matched; write was idempotent.",
                 (Some(true), _) => "",
@@ -728,11 +979,12 @@ fn set_value_blocking(
             };
             Ok(SetValueOutcome {
                 detail: format!(
-                    "✅ Set AXValue on [{element_index}] {role}.{suffix}{commit_detail}"
+                    "✅ Set AXValue on [{element_index}] {role}.{suffix}{commit_detail}",
+                    commit_detail = judgement.detail
                 ),
                 verified,
                 changed,
-                committed,
+                committed: judgement.committed,
                 path: "ax",
                 delivered: None,
             })
@@ -780,6 +1032,10 @@ fn retype_blocking(
     role: &str,
 ) -> anyhow::Result<SetValueOutcome> {
     let before = unsafe { copy_string_attr(element, "AXValue") };
+    // Taken before the edit: an app that re-creates the control when the edit
+    // session ends leaves `element` invalid, and this is how the read-back
+    // finds the control the app put in its place.
+    let identity = capture_identity(element, role);
 
     crate::input::ax_actions::focus_element(element_ptr)
         .map_err(|error| anyhow::anyhow!("could not focus [{element_index}] {role}: {error}"))?;
@@ -830,24 +1086,30 @@ fn retype_blocking(
     let (delivered_all, delivered) = (delivery.verified, delivery.delivered);
 
     let dispatched = crate::input::keyboard::press_key(pid, end, &[]).is_ok();
-    let (survived, edit_ended) = if dispatched {
+    let (after, resolved) = if dispatched {
         std::thread::sleep(COMMIT_SETTLE);
-        let after = unsafe { copy_string_attr(element, "AXValue") };
-        (
-            value_matches(after.as_deref(), value, false),
-            !crate::input::ax_actions::is_element_focused(pid, element_ptr),
-        )
+        read_back_after_commit(element, identity.as_ref())
     } else {
-        (false, false)
+        (None, None)
     };
+    let readback = if dispatched {
+        classify_readback(after.as_deref(), before.as_deref(), value, false)
+    } else {
+        CommitReadback::NotDispatched
+    };
+    // An AppKit edit session ends when the control gives up keyboard focus —
+    // and a control its app replaced on end-of-edit ended the session by
+    // definition, which is why a resolved replacement counts as that same
+    // observation rather than a lost one.
+    let edit_ended = dispatched
+        && (resolved.is_some() || !crate::input::ax_actions::is_element_focused(pid, element_ptr));
     let witness = if edit_ended {
         CommitWitness::TypedEditEnded
     } else {
         CommitWitness::ReadbackOnly
     };
-    let (committed, commit_detail) = judge_commit(dispatched, survived, witness, end);
+    let (committed, commit_detail) = judge_commit(readback, witness, end);
 
-    let after = unsafe { copy_string_attr(element, "AXValue") };
     let (verified, changed) = classify_write(before.as_deref(), after.as_deref(), value, false);
     let delivery = match (delivered_all, delivered) {
         (true, _) => String::new(),
@@ -908,12 +1170,6 @@ fn value_equal(observed: &str, expected: &str, numeric: bool) -> bool {
         }
         _ => false,
     }
-}
-
-/// An unreadable AXValue never counts as a match: the write is unproven, not
-/// confirmed.
-fn value_matches(observed: Option<&str>, expected: &str, numeric: bool) -> bool {
-    observed.is_some_and(|observed| value_equal(observed, expected, numeric))
 }
 
 /// Decide what a post-write AXValue read proves.
@@ -1198,9 +1454,9 @@ fn hex_digit(n: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_surface_trust, apply_verification_label, classify_write, commit_written_value,
-        judge_commit, refused_keystroke_plan, write_plan, CommitWitness, SetValueOutcome,
-        ToolResult, WritePlan,
+        apply_surface_trust, apply_verification_label, classify_readback, classify_write,
+        commit_written_value, judge_commit, refused_keystroke_plan, write_plan, CommitReadback,
+        CommitTarget, CommitWitness, SetValueOutcome, ToolResult, WritePlan,
     };
     use cua_driver_contract::ActionCommit;
 
@@ -1218,6 +1474,23 @@ mod tests {
             delivered: None,
         }
     }
+
+    /// A commit target with no identity to re-resolve: the branches these tests
+    /// exercise never touch an element.
+    fn target<'a>(requested: &'a str, before: Option<&'a str>) -> CommitTarget<'a> {
+        CommitTarget {
+            requested,
+            before,
+            numeric: false,
+            identity: None,
+        }
+    }
+
+    /// What Contacts' phone field reads back after its own end-of-edit, as the
+    /// bench trees print it: the number parenthesised and wrapped in the bidi
+    /// isolates AppKit's phone formatter adds (U+202D … U+202C), written as
+    /// escapes because raw direction-changing codepoints are a rustc error.
+    const REFORMATTED_PHONE: &str = "\u{202d}(555) 789-0123\u{202c}";
 
     /// The Automator "Save as:" field advertises `AXConfirm`, and an `AXValue`
     /// write plus that action left the app holding `Untitled.txt`. A plain
@@ -1289,16 +1562,18 @@ mod tests {
             write_plan("AXCheckBox", "", &[], "name.txt"),
             WritePlan::ValueOnly
         );
-        let (committed, detail) = commit_written_value(
+        let judgement = commit_written_value(
             std::ptr::null_mut(),
             0,
-            "value",
-            false,
             WritePlan::ValueOnly,
             Some(true),
+            &target("value", Some("old")),
         );
-        assert_eq!(committed, None, "a slider write has nothing to commit");
-        assert!(detail.is_empty());
+        assert_eq!(
+            judgement.committed, None,
+            "a slider write has nothing to commit"
+        );
+        assert!(judgement.detail.is_empty());
     }
 
     #[test]
@@ -1307,10 +1582,19 @@ mod tests {
         // document stayed unmarked. There is no end-of-edit gesture to run.
         let plan = write_plan("AXTextArea", "", &[], "name.txt");
         assert!(matches!(plan, WritePlan::Blocked(_)), "{plan:?}");
-        let (committed, detail) =
-            commit_written_value(std::ptr::null_mut(), 0, "value", false, plan, Some(true));
-        assert_eq!(committed, Some(ActionCommit::NotCommitted));
-        assert!(detail.contains("Not committed"), "{detail}");
+        let judgement = commit_written_value(
+            std::ptr::null_mut(),
+            0,
+            plan,
+            Some(true),
+            &target("value", Some("old")),
+        );
+        assert_eq!(judgement.committed, Some(ActionCommit::NotCommitted));
+        assert!(
+            judgement.detail.contains("Not committed"),
+            "{}",
+            judgement.detail
+        );
     }
 
     /// A read-back is echoed by a bound control whether or not the app took
@@ -1321,28 +1605,134 @@ mod tests {
     /// the app still kept its own value on disk.
     #[test]
     fn a_readback_alone_is_never_a_commit() {
-        let (committed, detail) =
-            judge_commit(true, true, CommitWitness::ReadbackOnly, "AXConfirm");
+        let (committed, detail) = judge_commit(
+            CommitReadback::Matches,
+            CommitWitness::ReadbackOnly,
+            "AXConfirm",
+        );
         assert_eq!(committed, Some(ActionCommit::Unproven));
         assert!(detail.contains("Commit unproven"), "{detail}");
 
         // The AXValue + Tab route: dispatched, survived, and the edit really
         // ended — but untyped, so the only honest verdict is unproven.
         assert_eq!(
-            judge_commit(true, true, CommitWitness::ReadbackOnly, "tab").0,
+            judge_commit(CommitReadback::Matches, CommitWitness::ReadbackOnly, "tab").0,
             Some(ActionCommit::Unproven)
         );
         assert_eq!(
-            judge_commit(true, true, CommitWitness::TypedEditEnded, "tab").0,
+            judge_commit(CommitReadback::Matches, CommitWitness::TypedEditEnded, "tab").0,
             Some(ActionCommit::Committed)
         );
         assert_eq!(
-            judge_commit(true, false, CommitWitness::TypedEditEnded, "tab").0,
+            judge_commit(
+                CommitReadback::NotDispatched,
+                CommitWitness::ReadbackOnly,
+                "tab"
+            )
+            .0,
             Some(ActionCommit::NotCommitted)
         );
+    }
+
+    /// `not committed` makes exactly one claim — the application put its own
+    /// value back — so only the read-back that shows that may carry it.
+    #[test]
+    fn only_the_apps_own_value_coming_back_refutes_the_commit() {
+        let (committed, detail) =
+            judge_commit(CommitReadback::Restored, CommitWitness::TypedEditEnded, "tab");
+        assert_eq!(committed, Some(ActionCommit::NotCommitted));
+        assert!(detail.contains("still holds its own value"), "{detail}");
+    }
+
+    /// A value the app's end-of-edit rewrote is the app having *taken* the
+    /// edit, not having refused it. Contacts reformats a phone number it keeps
+    /// (`555-789-0123` comes back parenthesised and wrapped in bidi isolates)
+    /// and three bench writes were reported as "the app still holds its own
+    /// value" while the same reply's tree printed the value under the field.
+    /// What the control holds now is the only thing worth reporting, quoted,
+    /// so the caller can judge it.
+    #[test]
+    fn a_rewritten_value_is_unproven_and_quotes_what_it_reads() {
+        let (committed, detail) = judge_commit(
+            CommitReadback::Rewritten(REFORMATTED_PHONE),
+            CommitWitness::TypedEditEnded,
+            "tab",
+        );
+        assert_eq!(committed, Some(ActionCommit::Unproven));
+        assert!(
+            detail.contains(&format!("reads back as \"{REFORMATTED_PHONE}\"")),
+            "{detail}"
+        );
+        assert!(!detail.contains("Not committed"), "{detail}");
+    }
+
+    /// An app may replace the control itself when the edit session ends, which
+    /// leaves the addressed pointer answering nothing. That is a lost
+    /// observation, not a refused edit.
+    #[test]
+    fn a_control_that_stopped_answering_is_unproven() {
+        let (committed, detail) = judge_commit(
+            CommitReadback::Unreadable,
+            CommitWitness::TypedEditEnded,
+            "tab",
+        );
+        assert_eq!(committed, Some(ActionCommit::Unproven));
+        assert!(
+            detail.contains("the control was re-created on end-of-edit; read it back"),
+            "{detail}"
+        );
+
+        // A control that never published a value has nothing to do with a
+        // rebuild and must not be told it was re-created.
+        let (committed, detail) = judge_commit(
+            CommitReadback::Unpublished,
+            CommitWitness::TypedEditEnded,
+            "tab",
+        );
+        assert_eq!(committed, Some(ActionCommit::Unproven));
+        assert!(detail.contains("publishes no readable value"), "{detail}");
+        assert!(!detail.contains("re-created"), "{detail}");
+    }
+
+    /// The comparison stays exact in both directions. A read-back that differs
+    /// from the request only by the app's own formatting is still a different
+    /// value: normalising digits, whitespace or bidi isolates would report the
+    /// application's value as the caller's.
+    #[test]
+    fn a_reformatted_read_back_is_never_read_as_a_match() {
         assert_eq!(
-            judge_commit(false, false, CommitWitness::ReadbackOnly, "tab").0,
-            Some(ActionCommit::NotCommitted)
+            classify_readback(Some(REFORMATTED_PHONE), Some(""), "555-789-0123", false),
+            CommitReadback::Rewritten(REFORMATTED_PHONE)
+        );
+        assert_eq!(
+            classify_readback(Some(" ramp"), Some("old"), "ramp", false),
+            CommitReadback::Rewritten(" ramp")
+        );
+        assert_eq!(
+            classify_readback(Some("ramp"), Some("old"), "ramp", false),
+            CommitReadback::Matches
+        );
+        assert_eq!(
+            classify_readback(Some("old"), Some("old"), "ramp", false),
+            CommitReadback::Restored
+        );
+        // Without a prior value nothing can be shown to have been put back.
+        assert_eq!(
+            classify_readback(Some("old"), None, "ramp", false),
+            CommitReadback::Rewritten("old")
+        );
+        assert_eq!(
+            classify_readback(None, Some("old"), "ramp", false),
+            CommitReadback::Unreadable
+        );
+        assert_eq!(
+            classify_readback(None, None, "ramp", false),
+            CommitReadback::Unpublished
+        );
+        // A numeric control's own formatting is not the app rewriting a value.
+        assert_eq!(
+            classify_readback(Some("25.0"), Some("10"), "25", true),
+            CommitReadback::Matches
         );
     }
 
@@ -1354,24 +1744,43 @@ mod tests {
     /// no information.
     #[test]
     fn a_confirmed_change_on_the_controls_own_action_commits() {
-        let (committed, detail) =
-            judge_commit(true, true, CommitWitness::OwnConfirmAction, "AXConfirm");
+        let (committed, detail) = judge_commit(
+            CommitReadback::Matches,
+            CommitWitness::OwnConfirmAction,
+            "AXConfirm",
+        );
         assert_eq!(committed, Some(ActionCommit::Committed));
         assert!(detail.contains("Committed via AXConfirm"), "{detail}");
 
         // An idempotent write moved nothing, so the survival is an echo of a
         // value the field already held and there is no commit to prove.
         assert_eq!(
-            judge_commit(true, true, CommitWitness::ReadbackOnly, "AXConfirm").0,
+            judge_commit(
+                CommitReadback::Matches,
+                CommitWitness::ReadbackOnly,
+                "AXConfirm"
+            )
+            .0,
             Some(ActionCommit::Unproven)
         );
-        // The confirm still has to have been dispatched and survived.
+        // The confirm still has to have been dispatched, and the app still has
+        // to have kept what it changed the control to.
         assert_eq!(
-            judge_commit(false, false, CommitWitness::OwnConfirmAction, "AXConfirm").0,
+            judge_commit(
+                CommitReadback::NotDispatched,
+                CommitWitness::OwnConfirmAction,
+                "AXConfirm"
+            )
+            .0,
             Some(ActionCommit::NotCommitted)
         );
         assert_eq!(
-            judge_commit(true, false, CommitWitness::OwnConfirmAction, "AXConfirm").0,
+            judge_commit(
+                CommitReadback::Restored,
+                CommitWitness::OwnConfirmAction,
+                "AXConfirm"
+            )
+            .0,
             Some(ActionCommit::NotCommitted)
         );
     }

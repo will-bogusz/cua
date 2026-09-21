@@ -62,6 +62,20 @@ let kSheetWindowTitle = "CuaTestHarness AppKit Sheet"
 let kFloatingWindowTitle = "CuaTestHarness AppKit Floating"
 /// Not a `kWindowTitle` substring: the harness finds its main window by that.
 let kSecondKeyWindowTitle = "CuaTestHarness Second Key Window"
+/// end_of_edit — five editable fields that differ only in what their app does
+/// with its own end-of-edit. Each placeholder doubles as the field's stable AX
+/// label: the one description an edit cannot change, so a control can be found
+/// again after its app rebuilds it.
+let kReformatInputAID = "txt-reformat"
+let kReformatPlaceholder = "Reformats on commit"
+let kSwapInputAID = "txt-swap"
+let kSwapPlaceholder = "Swapped on commit"
+let kDiscardInputAID = "txt-discard"
+let kDiscardPlaceholder = "Discards on commit"
+let kDiscardKeptValue = "keep-me"
+let kConfirmInputAID = "txt-confirm"
+let kConfirmPlaceholder = "Confirms its own commit"
+let kEndOfEditStateAID = "lbl-end-of-edit"
 /// menu_popover — a popup button whose press opens a native NSMenu, and a
 /// button that shows an NSPopover tall enough to hang past the window's
 /// bottom edge (`CUA_APPKIT_MENU_POPOVER=1`). Both are the shapes a
@@ -124,6 +138,25 @@ final class LaggingTextField: NSTextField {
         if elapsed >= lag { return actual }
         let visible = max(1, Int(Double(actual.count) * elapsed / lag))
         return String(actual.prefix(visible))
+    }
+}
+
+/// An `NSTextField` whose advertised `AXConfirm` *is* its commit: performing
+/// the action publishes the value the app took, the way a search field runs
+/// its search. A control that advertises the action and acts on it is the one
+/// case where an `AXValue` write plus `AXConfirm` is the application's own
+/// end-of-edit — which is why the driver picks that route for it and types
+/// into a plain bound field instead, whatever that one advertises.
+final class ConfirmCommitTextField: NSTextField {
+    var onConfirm: (String) -> Void = { _ in }
+
+    override func accessibilitySubrole() -> NSAccessibility.Subrole? { .searchField }
+
+    override func accessibilityActionNames() -> [NSAccessibility.Action] { [.confirm] }
+
+    override func accessibilityPerformConfirm() -> Bool {
+        onConfirm(stringValue)
+        return true
     }
 }
 
@@ -369,6 +402,18 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let textInput = LaggingTextField(string: "")
     let textInputMirror = NSTextField(labelWithString: "")
     let textInputCommit = NSTextField(labelWithString: "committed=none")
+    let reformatInput = NSTextField(string: "")
+    var swapInput = NSTextField(string: "")
+    let discardInput = NSTextField(string: kDiscardKeptValue)
+    let confirmInput = ConfirmCommitTextField(string: "")
+    let endOfEditRow = NSStackView()
+    let endOfEditLabel = NSTextField(labelWithString: "")
+    var reformatCommitted = "none"
+    var swapCommitted = "none"
+    var swaps = 0
+    var discardCommitted = "none"
+    var confirmCommitted = "none"
+    var confirmTyped = 0
     let lastActionLabel = NSTextField(labelWithString: "last_action=none")
     let clickCountLabel = NSTextField(labelWithString: "clicks=0")
     var clicks = 0
@@ -680,6 +725,34 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         ])
         content.addArrangedSubview(pressableRowStack)
 
+        // end_of_edit — appended last so no section above it shifts. One
+        // reformats the value it keeps, one replaces the control itself, one
+        // discards the edit, one takes its commit from its own advertised
+        // AXConfirm, and one starts out holding a non-BMP value a replacement
+        // has to select past.
+        configureEndOfEditField(
+            reformatInput, aid: kReformatInputAID, placeholder: kReformatPlaceholder)
+        configureEndOfEditField(swapInput, aid: kSwapInputAID, placeholder: kSwapPlaceholder)
+        configureEndOfEditField(
+            discardInput, aid: kDiscardInputAID, placeholder: kDiscardPlaceholder)
+        configureEndOfEditField(
+            confirmInput, aid: kConfirmInputAID, placeholder: kConfirmPlaceholder)
+        confirmInput.onConfirm = { [weak self] value in
+            guard let self else { return }
+            self.confirmCommitted = value
+            self.publishEndOfEdit()
+        }
+        endOfEditRow.orientation = .horizontal
+        endOfEditRow.spacing = 8
+        endOfEditRow.addArrangedSubview(reformatInput)
+        endOfEditRow.addArrangedSubview(swapInput)
+        endOfEditRow.addArrangedSubview(discardInput)
+        endOfEditRow.addArrangedSubview(confirmInput)
+        endOfEditLabel.setAccessibilityIdentifier(kEndOfEditStateAID)
+        endOfEditLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        publishEndOfEdit()
+        content.addArrangedSubview(endOfEditRow)
+        content.addArrangedSubview(endOfEditLabel)
         var extraHeight: CGFloat = 0
         if HarnessWindowController.envFlag("CUA_APPKIT_MENU_POPOVER") {
             content.addArrangedSubview(sectionLabel("menu_popover"))
@@ -957,6 +1030,13 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         if field === textInput {
             textInputMirror.stringValue = field.stringValue
         }
+        if field === confirmInput {
+            // Keystrokes reach a field editor and raise this notification; an
+            // `AXValue` write does not. Counting it is how a test separates the
+            // driver's typed route from its value-then-confirm route.
+            confirmTyped += 1
+            publishEndOfEdit()
+        }
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
@@ -965,6 +1045,65 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             textInputCommit.stringValue = "committed=\(field.stringValue)"
             runControlledCommand(field.stringValue)
         }
+        if field === reformatInput {
+            // An end-of-edit formatter is ordinary AppKit: the app keeps the
+            // edit and rewrites it, so the control ends up holding neither what
+            // was written nor what it held before.
+            let formatted = "[\(field.stringValue)]"
+            field.stringValue = formatted
+            reformatCommitted = formatted
+            publishEndOfEdit()
+        }
+        if field === discardInput {
+            // The other app: it refuses the edit and puts its own value back.
+            field.stringValue = kDiscardKeptValue
+            discardCommitted = kDiscardKeptValue
+            publishEndOfEdit()
+        }
+        if field === swapInput {
+            swapCommitted = field.stringValue
+            swaps += 1
+            publishEndOfEdit()
+            replaceSwapField(field)
+        }
+    }
+
+    /// Contacts' card editor replaces the control when the edit session ends:
+    /// the `AXUIElementRef` a caller addressed goes invalid while a fresh
+    /// instance holds the committed value — same parent, same place in it, same
+    /// role and label. Done on the next pass of the run loop because the field
+    /// editor this notification belongs to is still being torn down.
+    private func replaceSwapField(_ field: NSTextField) {
+        let committed = field.stringValue
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.swapInput === field else { return }
+            let index = self.endOfEditRow.arrangedSubviews.firstIndex(of: field)
+                ?? self.endOfEditRow.arrangedSubviews.count
+            self.endOfEditRow.removeView(field)
+            let replacement = NSTextField(string: committed)
+            self.configureEndOfEditField(
+                replacement, aid: kSwapInputAID, placeholder: kSwapPlaceholder)
+            self.endOfEditRow.insertArrangedSubview(replacement, at: index)
+            self.swapInput = replacement
+        }
+    }
+
+    private func configureEndOfEditField(_ field: NSTextField, aid: String, placeholder: String) {
+        field.setAccessibilityIdentifier(aid)
+        field.placeholderString = placeholder
+        field.delegate = self
+        field.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(equalToConstant: 96).isActive = true
+    }
+
+    private func publishEndOfEdit() {
+        endOfEditLabel.stringValue = [
+            "reformat_committed=\(reformatCommitted)",
+            "swap_committed=\(swapCommitted) swaps=\(swaps)",
+            "discard_committed=\(discardCommitted)",
+            "confirm_committed=\(confirmCommitted) confirm_typed=\(confirmTyped)",
+        ].joined(separator: " | ")
     }
 
     /// Test-only terminal-like command seam. It accepts exactly one harmless

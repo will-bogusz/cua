@@ -350,6 +350,10 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
     harness_appkit_invoke_menu_live_path \
     harness_appkit_text_input \
     harness_appkit_set_value_commits_the_edit \
+    harness_appkit_set_value_on_a_reformatting_field_is_unproven \
+    harness_appkit_set_value_follows_a_field_its_app_re_creates \
+    harness_appkit_set_value_reports_a_discarded_edit_as_not_committed \
+    harness_appkit_set_value_uses_an_advertised_confirm_as_the_commit \
     harness_appkit_foreground_press_key_chord_carries_its_modifiers \
     harness_appkit_click_on_a_text_role_focuses_it \
     harness_appkit_click_on_a_selectable_row_selects_without_pressing \

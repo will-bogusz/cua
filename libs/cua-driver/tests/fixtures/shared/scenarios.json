@@ -343,6 +343,18 @@
     }
    },
    {
+    "id": "end_of_edit",
+    "kind": "text_box_mirror",
+    "description": "Five editable NSTextFields that differ only in what the app does with its own end-of-edit: txt-reformat keeps the value and rewrites it ([value]), txt-swap replaces the control with a fresh instance holding the value, txt-discard puts its own value back (keep-me), txt-confirm advertises AXConfirm and takes its commit from that action alone (confirm_typed= counts field-editor keystrokes), txt-nonbmp starts holding a non-BMP value whose UTF-16 length exceeds its character count. One lbl-end-of-edit label publishes all five commit states.",
+    "controls": {
+     "reformat_textbox_aid": "txt-reformat",
+     "swap_textbox_aid": "txt-swap",
+     "discard_textbox_aid": "txt-discard",
+     "confirm_textbox_aid": "txt-confirm",
+     "state_label_aid": "lbl-end-of-edit"
+    }
+   },
+   {
     "id": "click_target",
     "kind": "right_double_click",
     "description": "Real NSButton (AX-addressable) records click / double_click / right_click. AXPress (element_index) fires the single-click path; a pixel double-click sets double_click; right-click sets right_click. last_action= + clicks= labels.",

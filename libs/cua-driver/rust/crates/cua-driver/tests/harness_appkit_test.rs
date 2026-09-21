@@ -1014,6 +1014,210 @@ fn harness_appkit_set_value_commits_the_edit() {
     );
 }
 
+/// `Not committed` makes one claim — the application put its own value back —
+/// so only the read-back that shows that may carry it. `txt-reformat` keeps the
+/// edit and rewrites it in `controlTextDidEndEditing` (Contacts' phone field
+/// does the same, `555-789-0123` → `(555) 789-0123`), which left three bench
+/// writes reported as lost while the same reply's tree printed the value.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_on_a_reformatting_field_is_unproven() {
+    run_background_case(
+        "set_value_reformat",
+        DriverRoute::MacosCgEventPid,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("reformat_committed=none"),
+                "fixture did not start uncommitted:\n{}",
+                before.tree_text()
+            );
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "txt-reformat"),
+                    "value": "ramp"
+                }),
+            );
+            assert!(!set.is_error(), "set_value failed: {}", set.text());
+            assert_eq!(
+                set.structured()["committed"],
+                serde_json::json!("unproven"),
+                "a kept-and-rewritten value was reported as the app's own: {}",
+                set.raw
+            );
+            assert!(
+                set.text().contains("reads back as \"[ramp]\""),
+                "the reply did not quote what the control now holds: {}",
+                set.text()
+            );
+            assert!(
+                !set.text().contains("Not committed"),
+                "the reply still claims the app kept its own value: {}",
+                set.text()
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after.tree_text().contains("reformat_committed=[ramp]"),
+                "the app never registered the write:\n{}",
+                after.tree_text()
+            );
+        },
+    );
+}
+
+/// An app may replace the control itself when the edit session ends, leaving
+/// the `AXUIElementRef` the call addressed answering nothing — Contacts'
+/// card editor does it, and the read-back on the retained pointer then missed
+/// a value the app had kept. `txt-swap` re-creates itself in the same place,
+/// with the same role and label, so the write is judged on the control that
+/// now exists.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_follows_a_field_its_app_re_creates() {
+    run_background_case(
+        "set_value_field_swap",
+        DriverRoute::MacosCgEventPid,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("swap_committed=none swaps=0"),
+                "fixture did not start unswapped:\n{}",
+                before.tree_text()
+            );
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "txt-swap"),
+                    "value": "ramp"
+                }),
+            );
+            assert!(!set.is_error(), "set_value failed: {}", set.text());
+            assert_eq!(
+                set.structured()["committed"],
+                serde_json::json!("committed"),
+                "the re-created control was not read back: {}",
+                set.raw
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after.tree_text().contains("swap_committed=ramp swaps=1"),
+                "the app never registered the write, or never swapped:\n{}",
+                after.tree_text()
+            );
+        },
+    );
+}
+
+/// The other app: `txt-discard` puts its own value back on end-of-edit, which
+/// is exactly what `not committed` claims — so that verdict and that sentence
+/// stay.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_reports_a_discarded_edit_as_not_committed() {
+    run_background_case(
+        "set_value_discarded",
+        DriverRoute::MacosCgEventPid,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "txt-discard"),
+                    "value": "ramp"
+                }),
+            );
+            assert!(!set.is_error(), "set_value failed: {}", set.text());
+            assert_eq!(
+                set.structured()["committed"],
+                serde_json::json!("not_committed"),
+                "a discarded edit was not reported as lost: {}",
+                set.raw
+            );
+            assert!(
+                set.text().contains("still holds its own value"),
+                "the reply did not say what happened: {}",
+                set.text()
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after.tree_text().contains("discard_committed=keep-me"),
+                "the fixture did not keep its own value:\n{}",
+                after.tree_text()
+            );
+        },
+    );
+}
+
+/// A control that advertises `AXConfirm` and acts on it is written through that
+/// action, not through keystrokes: `confirm_typed=0` is the fixture saying no
+/// field editor ever saw a character, and `confirm_committed=` is the app's own
+/// handler having run. A plain bound field keeps the typed route whatever it
+/// advertises — measured on Automator's "Save as:" parameter, where the
+/// value+confirm route left the app holding its own value.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_uses_an_advertised_confirm_as_the_commit() {
+    run_background_case(
+        "set_value_advertised_confirm",
+        DriverRoute::MacosAxValue,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before
+                    .tree_text()
+                    .contains("confirm_committed=none confirm_typed=0"),
+                "fixture did not start uncommitted:\n{}",
+                before.tree_text()
+            );
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "txt-confirm"),
+                    "value": "ramp"
+                }),
+            );
+            assert!(!set.is_error(), "set_value failed: {}", set.text());
+            assert_eq!(
+                set.action_route(),
+                Some("accessibility"),
+                "a control whose confirm is its commit must not be typed into: {}",
+                set.raw
+            );
+            assert_eq!(
+                set.structured()["committed"],
+                serde_json::json!("committed"),
+                "the control's own confirm action ran and was not credited: {}",
+                set.raw
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after
+                    .tree_text()
+                    .contains("confirm_committed=ramp confirm_typed=0"),
+                "the confirm handler did not run, or keystrokes were sent:\n{}",
+                after.tree_text()
+            );
+        },
+    );
+}
+
 /// `press_key` on the foreground rung built its events with a default source
 /// and no flags, so a chord's base key arrived bare: `cmd+a` typed a literal
 /// `a`. The fixture's accelerator requires the modifiers to be present on the
