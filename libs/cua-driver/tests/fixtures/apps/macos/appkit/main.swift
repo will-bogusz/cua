@@ -382,6 +382,14 @@ final class ChildEditorWindow: NSWindow {
 
     override func isAccessibilityFocused() -> Bool { isKeyWindow }
 
+    /// The application's `AXFocusedUIElement` is resolved through its key
+    /// window, and a window that publishes itself as a childless text field
+    /// would otherwise resolve it to an orphaned field editor the AX server
+    /// drops. The editor *is* the focused element while it is up — the same
+    /// identity the real editors answer.
+    override var accessibilityFocusedUIElement: Any {
+        isKeyWindow || field.currentEditor() != nil ? self : super.accessibilityFocusedUIElement
+    }
 
     /// An `AXFocused` write is how a driver asks for the keyboard without a
     /// click; the editor answers by taking key and putting its field first.
@@ -393,6 +401,13 @@ final class ChildEditorWindow: NSWindow {
         }
     }
 
+    /// `NSWindow` admits only its own setters through the AX bridge; a text
+    /// field's value write has to be allowed by name or it is dropped as
+    /// unsettable (System Events reports the write accepted and nothing moves).
+    override func isAccessibilitySelectorAllowed(_ selector: Selector) -> Bool {
+        if selector == #selector(setAccessibilityValue(_:)) { return true }
+        return super.isAccessibilitySelectorAllowed(selector)
+    }
 
     override func setAccessibilityValue(_ value: Any?) {
         guard let text = value as? String else { return }

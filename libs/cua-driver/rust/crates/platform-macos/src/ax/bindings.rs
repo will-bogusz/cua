@@ -800,6 +800,45 @@ pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
     focused_window_of_pid(pid).and_then(|focused| focused.window_id)
 }
 
+/// Ask AppKit to make exactly one of `pid`'s windows key and main: `AXRaise`,
+/// then `AXMain` and `AXFocused` on the AXWindow that reports `window_id`.
+/// Addresses only that window; it never orders the process's other windows.
+///
+/// This is the half of the exact-window sequence that moves key status
+/// *between sibling windows*. The SkyLight make-key records
+/// ([`crate::input::skylight::make_exact_window_key`]) make an inactive
+/// application install its remembered key window on activation, but an
+/// application that is already frontmost with another of its windows key
+/// keeps that window until AppKit itself is asked to raise the target.
+///
+/// Returns whether any of the three requests was accepted; the caller's
+/// postcondition read remains authoritative.
+pub fn raise_exact_ax_window(pid: i32, window_id: u32) -> bool {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        let mut target = None;
+        for window in copy_ax_windows(app) {
+            if target.is_none() && ax_get_window_id(window) == Some(window_id) {
+                target = Some(window);
+            } else {
+                CFRelease(window as CFTypeRef);
+            }
+        }
+        CFRelease(app as CFTypeRef);
+        let Some(target) = target else {
+            return false;
+        };
+        let raised = perform_action(target, "AXRaise") == 0;
+        let main = set_bool_attr_true(target, "AXMain") == 0;
+        let focused = set_bool_attr_true(target, "AXFocused") == 0;
+        CFRelease(target as CFTypeRef);
+        raised || main || focused
+    }
+}
+
 /// How many children an element reports, without copying or retaining any of
 /// them. One native request and no allocation, so it is cheap enough to
 /// sample repeatedly.

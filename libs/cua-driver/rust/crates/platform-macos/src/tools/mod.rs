@@ -212,6 +212,9 @@ pub(crate) struct ObscuringWindow {
     pub ax_backed: Option<bool>,
     pub role: Option<String>,
     pub subrole: Option<String>,
+    /// `AXModal`: the application's own report that this window blocks every
+    /// other window of its process. `None` when unread or unanswered.
+    pub modal: Option<bool>,
 }
 
 impl ObscuringWindow {
@@ -226,6 +229,7 @@ impl ObscuringWindow {
             ax_backed: None,
             role: None,
             subrole: None,
+            modal: None,
         };
         resolved.resolve_ax_identity(pid);
         Some(resolved)
@@ -250,6 +254,7 @@ impl ObscuringWindow {
                     self.ax_backed = Some(true);
                     self.role = crate::ax::bindings::copy_string_attr(window, "AXRole");
                     self.subrole = crate::ax::bindings::copy_string_attr(window, "AXSubrole");
+                    self.modal = crate::ax::bindings::copy_bool_attr(window, "AXModal");
                 }
                 core_foundation::base::CFRelease(window as core_foundation::base::CFTypeRef);
             }
@@ -273,7 +278,22 @@ impl ObscuringWindow {
         if let Some(subrole) = &self.subrole {
             payload["subrole"] = serde_json::json!(subrole);
         }
+        if let Some(modal) = self.modal {
+            payload["modal"] = serde_json::json!(modal);
+        }
         payload
+    }
+
+    /// Whether this window keeps the keyboard after the window behind it is
+    /// raised and made key. A window with no `AXWindow` cannot be moved past by
+    /// giving another window key status (the process never publishes a key
+    /// window to move it to), and a window the application reports modal
+    /// refuses key status to every other window of the process. Any other
+    /// window in front is simply the process's current front window, which
+    /// the foreground rung overtakes: the SkyLight make-key records followed
+    /// by `AXRaise` on the exact target window (`with_foreground_assist`).
+    pub(crate) fn holds_keyboard_through_raise(&self) -> bool {
+        !self.is_focusable() || self.modal == Some(true)
     }
 
     /// Whether the window publishes an `AXWindow` the caller could focus.
@@ -369,6 +389,7 @@ fn resolve_process_front_order(
             ax_backed: None,
             role: None,
             subrole: None,
+            modal: None,
         }),
     }
 }

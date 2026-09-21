@@ -56,6 +56,15 @@ pub enum ElementAncestry {
     /// `window_id` are the same identity `get_window_state` already reports
     /// for it under `related_windows`.
     ProvenAttachedSheet { pid: i32, window_id: u32 },
+    /// The live element ascends to a window the same application reports
+    /// modal (`AXModal`) while the requested window is another window of that
+    /// process. An app-modal dialog is a separate CGWindow, so ancestry to the
+    /// requested id is unprovable by construction — but the dialog IS what is
+    /// blocking the requested window, `get_window_state` already reports its
+    /// rows in the blocked window's observation under "Modal dialog:", and the
+    /// window cannot be used again until the dialog is dismissed. `pid` and
+    /// `window_id` are the identity the observation's `modal_windows` carries.
+    ProvenAppModal { pid: i32, window_id: u32 },
     /// The live element ascends to a different window. `window_id` is the
     /// window it does belong to, with the owning `pid` when WindowServer
     /// could resolve one, so a refusal can name a scope that exists.
@@ -292,8 +301,22 @@ pub fn decide_background_input(
         // window ancestry to the requested id. Window-aimed routes still
         // require that ancestry: a stamped pointer event or a process-scoped
         // keystroke would land somewhere other than what was addressed.
-        ElementAncestry::ProvenAppMenu | ElementAncestry::ProvenAttachedSheet { .. }
+        ElementAncestry::ProvenAppMenu
+        | ElementAncestry::ProvenAttachedSheet { .. }
+        | ElementAncestry::ProvenAppModal { .. }
             if matches!(action, BackgroundAction::AxSemantic) => {}
+        ElementAncestry::ProvenAppModal { pid, window_id } => {
+            return refuse(
+                refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
+                format!(
+                    "this element belongs to app-modal dialog {window_id} (pid {pid}), which \
+                     is blocking window {} from its own separate window; address that dialog \
+                     and act there",
+                    target.window_id
+                ),
+                Some(BackgroundAdvice::AcquireWindow),
+            );
+        }
         ElementAncestry::ProvenAttachedSheet { pid, window_id } => {
             return refuse(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
@@ -855,6 +878,40 @@ mod tests {
                 refusal.reason
             );
             assert_eq!(refusal.advice, Some(BackgroundAdvice::Element));
+        }
+    }
+
+    /// The dialog blocking the requested window has the standing of an
+    /// attached sheet: a semantic action on one of its rows is how the block
+    /// is lifted, and a window-aimed route is refused naming the dialog.
+    #[test]
+    fn app_modal_dialog_admits_semantic_ax_and_names_itself_for_other_routes() {
+        let facts = BackgroundTargetFacts {
+            element: ElementAncestry::ProvenAppModal {
+                pid: 42,
+                window_id: 806,
+            },
+            ..matched_facts()
+        };
+        assert!(decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute());
+        for action in [
+            BackgroundAction::WindowPointer,
+            BackgroundAction::InsertText,
+            BackgroundAction::GenericKey,
+        ] {
+            let decision = decide_background_input(TARGET, &facts, action);
+            assert_eq!(
+                code_of(decision.clone()),
+                refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
+                "{action:?} on an app-modal dialog element"
+            );
+            let reason = reason_of(decision);
+            assert!(reason.contains("app-modal dialog 806"), "{reason}");
+            assert!(reason.contains("pid 42"), "{reason}");
+            assert!(
+                reason.contains("address that dialog and act there"),
+                "{reason}"
+            );
         }
     }
 

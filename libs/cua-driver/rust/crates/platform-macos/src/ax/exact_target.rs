@@ -353,6 +353,9 @@ enum SurfaceRole {
 struct AxWindowRecord {
     window_id: u32,
     minimized: Option<bool>,
+    /// The application's own report that this window blocks every other
+    /// window of its process (`AXModal`). Unreadable is not modal.
+    modal: bool,
     system_sharing_overlay: bool,
     hosted_panel: Option<(i32, u32)>,
     role: SurfaceRole,
@@ -447,6 +450,7 @@ unsafe fn ax_window_records(
                 AxWindowRecord {
                     window_id,
                     minimized,
+                    modal: copy_bool_attr(window, "AXModal") == Some(true),
                     system_sharing_overlay: window_id != target_window_id
                         && minimized != Some(true)
                         && is_system_sharing_overlay(window, window_id, pid),
@@ -693,6 +697,16 @@ pub fn gather_background_facts(
                 }
                 match element_window_id(element) {
                     Some(id) if id == window_id => ElementAncestry::ProvenDescendant,
+                    // The dialog blocking the requested window: its rows are
+                    // in the blocked window's observation, and a semantic
+                    // action on one is how the block is lifted.
+                    Some(id)
+                        if records
+                            .iter()
+                            .any(|record| record.window_id == id && record.modal) =>
+                    {
+                        ElementAncestry::ProvenAppModal { pid, window_id: id }
+                    }
                     // The application's own editing surface: there is no
                     // window ancestry to walk, so ownership is proven through
                     // the surface the keyboard is in.
@@ -747,6 +761,7 @@ mod tests {
         AxWindowRecord {
             window_id,
             minimized,
+            modal: false,
             system_sharing_overlay: false,
             hosted_panel: None,
             role: SurfaceRole::Independent,

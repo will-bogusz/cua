@@ -100,6 +100,31 @@ impl Tool for ListWindowsTool {
 
         let roster = include_accessibility.then(|| accessibility_roster(pid_filter.unwrap()));
 
+        // An application runs its modal alert at the modal-panel level, which
+        // the layer filter above does not admit — so the one window the
+        // roster most needs to name would otherwise be missing from it. The
+        // application has already named it (AXModal); admit that exact
+        // window, front of the process's rows.
+        if let Some(roster) = roster.as_ref() {
+            let pid = pid_filter.unwrap();
+            let mut missing: Vec<u32> = roster
+                .modal_window_ids
+                .iter()
+                .copied()
+                .filter(|id| !windows.iter().any(|w| w.window_id == *id))
+                .collect();
+            missing.sort_unstable();
+            let front = windows.iter().map(|w| w.z_index).max().unwrap_or(0);
+            for (offset, window_id) in missing.into_iter().enumerate() {
+                if let Some(mut info) = crate::windows::window_info_by_id(window_id) {
+                    if info.pid == pid && info.is_on_screen {
+                        info.z_index = front + 1 + offset;
+                        windows.insert(0, info);
+                    }
+                }
+            }
+        }
+
         let windows_json: Vec<Value> = windows
             .iter()
             .map(|w| {

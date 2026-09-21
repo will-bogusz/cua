@@ -13,7 +13,6 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::{
     protocol::ToolResult,
     tool::{Tool, ToolDef},
@@ -21,10 +20,7 @@ use cua_driver_core::{
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 use serde_json::{json, Value};
 
-use crate::ax::bindings::{
-    ax_get_window_id, copy_ax_windows, perform_action, set_bool_attr_true,
-    AXUIElementCreateApplication,
-};
+use crate::ax::bindings::raise_exact_ax_window;
 
 pub struct BringToFrontTool;
 
@@ -227,34 +223,6 @@ fn wait_for_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
             return observation;
         }
         std::thread::sleep(VERIFY_POLL);
-    }
-}
-
-/// Best-effort completion of the one exact-window request. This addresses only
-/// the requested AX window; it never orders every window owned by the process.
-fn raise_exact_ax_window(pid: i32, window_id: u32) -> bool {
-    unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return false;
-        }
-        let mut target = None;
-        for window in copy_ax_windows(app) {
-            if target.is_none() && ax_get_window_id(window) == Some(window_id) {
-                target = Some(window);
-            } else {
-                CFRelease(window as CFTypeRef);
-            }
-        }
-        CFRelease(app as CFTypeRef);
-        let Some(target) = target else {
-            return false;
-        };
-        let raised = perform_action(target, "AXRaise") == 0;
-        let main = set_bool_attr_true(target, "AXMain") == 0;
-        let focused = set_bool_attr_true(target, "AXFocused") == 0;
-        CFRelease(target as CFTypeRef);
-        raised || main || focused
     }
 }
 
@@ -637,6 +605,7 @@ mod tests {
                 ax_backed: Some(true),
                 role: Some("AXWindow".to_owned()),
                 subrole: Some("AXUnknown".to_owned()),
+                modal: None,
             }),
         );
         assert_eq!(result.is_error, None);
@@ -681,6 +650,7 @@ mod tests {
                 ax_backed: Some(false),
                 role: None,
                 subrole: None,
+                modal: None,
             }),
         );
         assert!(

@@ -739,6 +739,14 @@ pub fn with_foreground_assist(
     // remaining, from AppKit's point of view, unfocused — so the AXFocused
     // write in the body has no responder chain to attach to.
     make_exact_window_key(target_pid, target_wid);
+    // The records make an *inactive* application install the target on
+    // activation. An application that is already frontmost with a sibling
+    // window key keeps that sibling until AppKit is asked to raise the target
+    // itself — the same `AXRaise`/`AXMain`/`AXFocused` step `bring_to_front`
+    // ends its exact-window sequence with. Measured on the AppKit fixture:
+    // without it a key-gated toolbar field behind a key sibling stayed
+    // disabled through the whole 400 ms wait.
+    crate::ax::bindings::raise_exact_ax_window(target_pid, target_wid);
     await_window_focused(target_pid, target_wid);
 
     let result = body();

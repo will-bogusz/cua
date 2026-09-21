@@ -339,8 +339,15 @@ impl ElementDisabled {
         if self.role == "AXMenuItem" {
             return DisabledCause::MenuItem;
         }
+        // A window in front decides the cause only if raising the target
+        // cannot take the keyboard from it. Any other same-process window in
+        // front is the process's current front window, which the foreground
+        // rung's make-key records plus `AXRaise` on the target overtake — so
+        // it is named below as the order, and the key-window fact decides.
         if let Some(obscuring) = &self.obscuring_window {
-            return DisabledCause::OwnedPanelInFront(obscuring);
+            if obscuring.holds_keyboard_through_raise() {
+                return DisabledCause::OwnedPanelInFront(obscuring);
+            }
         }
         match self.key_window.denial(self.pid, self.window_id) {
             // The foreground rung is already in force and the activation it
@@ -3302,13 +3309,24 @@ mod tests {
             ax_backed: Some(ax_backed),
             role: ax_backed.then(|| "AXWindow".to_owned()),
             subrole: ax_backed.then(|| "AXUnknown".to_owned()),
+            modal: None,
         }
     }
 
+    /// A blocker the application reports modal: the one AX-backed window in
+    /// front that raising the target cannot get past.
+    fn modal_blocker(window_id: u32, title: &str) -> super::super::ObscuringWindow {
+        let mut blocker = blocker(window_id, title, true);
+        blocker.modal = Some(true);
+        blocker
+    }
+
+    /// An AX-backed window the application reports modal is the one window in
+    /// front that raising the target cannot get past, so it decides the cause.
     #[test]
-    fn a_disabled_control_behind_an_ax_backed_panel_offers_that_window() {
+    fn a_disabled_control_behind_a_modal_window_offers_that_window() {
         let mut state = disabled("AXButton", false);
-        state.obscuring_window = Some(blocker(17018, "", true));
+        state.obscuring_window = Some(modal_blocker(17018, ""));
         let reason = state.reason();
         assert!(
             reason.contains(
@@ -3330,6 +3348,41 @@ mod tests {
         assert_eq!(payload["obscured_by"]["layer"], 0);
         assert_eq!(payload["obscured_by"]["ax_backed"], true);
         assert_eq!(payload["obscured_by"]["subrole"], "AXUnknown");
+        assert_eq!(payload["obscured_by"]["modal"], true);
+        assert!(payload.get("escalation").is_none(), "{payload}");
+    }
+
+    /// An ordinary window of the process in front of the target is what the
+    /// foreground rung's make-key-plus-`AXRaise` overtakes, so it does not
+    /// decide the cause: the key-window fact does, the rung is named, and the
+    /// window in front is still named as the order.
+    #[test]
+    fn a_sibling_window_in_front_that_is_not_modal_leaves_the_foreground_rung_open() {
+        let mut state = not_key(false);
+        state.key_window = KeyWindowState {
+            app_frontmost: true,
+            focused_window_id: Some(19077),
+        };
+        state.obscuring_window = Some(blocker(19077, "Second", true));
+        let reason = state.reason();
+        assert!(
+            reason.contains(
+                "Window 19077 — pid 84264's own front window, titled \"Second\", \
+                 AXWindow/AXUnknown — is drawn in front of window 19080, but window 19080 is \
+                 not pid 84264's key window — window 19077 holds pid 84264's keyboard focus"
+            ),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("A foreground dispatch makes it key first."),
+            "{reason}"
+        );
+        assert!(!reason.contains("Dismiss that window"), "{reason}");
+
+        let payload = state.payload();
+        assert_eq!(payload["escalation"]["target"], "foreground");
+        assert_eq!(payload["obscured_by"]["window_id"], 19077);
+        assert_eq!(payload["key_window"]["is_key"], false);
     }
 
     /// A layer-0 panel with no `AXWindow` can never become the focused window,
@@ -3578,7 +3631,7 @@ mod tests {
     }
 
     /// A key window's disabled control and a menu row keep their own arms, and
-    /// a real owned panel in front outranks the key-window fact: dismissing or
+    /// a modal window in front outranks the key-window fact: dismissing or
     /// addressing that window is what the state leaves open.
     #[test]
     fn the_other_arms_withhold_the_foreground_escalation() {
@@ -3590,7 +3643,7 @@ mod tests {
             );
         }
         let mut behind_panel = not_key(false);
-        behind_panel.obscuring_window = Some(blocker(19091, "Print", true));
+        behind_panel.obscuring_window = Some(modal_blocker(19091, "Print"));
         let reason = behind_panel.reason();
         assert!(
             reason.contains("Dismiss that window, or address window 19091 and act on it there."),
