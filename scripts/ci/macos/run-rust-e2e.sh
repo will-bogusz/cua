@@ -392,6 +392,9 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
     harness_appkit_press_that_opens_a_menu_is_delivery_with_the_menu_in_the_tree \
     harness_appkit_capture_with_an_open_popover_reports_the_rect_it_covers \
     harness_appkit_a_plain_window_capture_stays_point_for_point \
+    harness_appkit_caret_places_the_insertion_point_before_typing \
+    harness_appkit_an_unlabelled_row_is_named_by_its_text_descendants \
+    harness_appkit_a_desktop_level_window_is_a_desktop_row_read_through_its_content \
       harness_appkit_slider_drag_px_background; do
       run_test "appkit-${appkit_test}" cargo test -p cua-driver --test harness_appkit_test -- \
         --ignored --exact "${appkit_test}" --nocapture --test-threads=1

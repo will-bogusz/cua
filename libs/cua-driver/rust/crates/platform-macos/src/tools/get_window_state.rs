@@ -1921,15 +1921,21 @@ mod tests {
         let mut nodes = nodes;
         nodes[0].description = Some("from-desc".into());
         nodes[1].value = Some("from-val".into());
-        // Notes' list cell: the identifier is the only attribute the app
-        // sets, but the walker read the note title beneath it.
-        nodes[2].identifier = Some("ICMNoteListCell".into());
-        nodes[2].descendant_text = Some("Meeting 047 …warehouse pallet audit".into());
+        // A list cell whose only own attribute is its identifier, while the
+        // walker read the row's text from the static text beneath it. Neutral
+        // seeds: what is under test is the order of the fallback chain, not
+        // any one application's private identifier.
+        nodes[2].identifier = Some("row-cell".into());
+        let from_descendants = "Row title row snippet 5:10 AM";
+        nodes[2].descendant_text = Some(from_descendants.into());
         nodes[3].identifier = Some("from-id".into());
         let elements = build_elements_array_with_token(&nodes, None);
         assert_eq!(elements[0]["label"], "from-desc");
         assert_eq!(elements[1]["label"], "from-val");
-        assert_eq!(elements[2]["label"], "Meeting 047 …warehouse pallet audit");
+        assert_eq!(
+            elements[2]["label"], from_descendants,
+            "descendant text outranks the identifier"
+        );
         assert_eq!(elements[3]["label"], "from-id");
     }
 

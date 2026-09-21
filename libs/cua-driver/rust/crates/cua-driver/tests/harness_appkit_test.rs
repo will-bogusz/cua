@@ -3704,3 +3704,305 @@ fn harness_appkit_an_attached_sheet_still_competes_for_the_keyboard() {
         },
     );
 }
+
+
+// ── wave-9 feature scenarios (caret, descendant text, desktop row) ──────────
+
+/// The caret scenario's seed, as `scenarios.json` carries it. The emoji is
+/// two UTF-16 units, so the first anchor's end is 9 units in and 8 characters
+/// in — the one difference a character-counting implementation gets wrong.
+const CARET_SEED: &str = "\u{1F600} anchor one, anchor two.";
+const CARET_ANCHOR: &str = "anchor";
+const CARET_FIRST_ANCHOR_END_UTF16: u64 = 9;
+/// The unlabelled row's three pieces of text, and the image label that is not
+/// one of them.
+const ROW_FIRST_TEXT: &str = "Row title";
+const ROW_SECOND_TEXT: &str = "row snippet 5:10 AM";
+const ROW_GROUP_TEXT: &str = "in group: Group A";
+const ROW_IMAGE_LABEL: &str = "row image badge";
+/// The one child of the desktop-level surface.
+const DESKTOP_ITEM_LABEL: &str = "DESKTOP_ITEM_MARKER_v1";
+
+/// `type_text`'s `caret` shipped with seven unit tests and no live coverage:
+/// the fixture owned no editable `NSTextView`, and `txt-input`'s
+/// `NSTextField` is a different surface — `place_caret` writes
+/// `AXSelectedTextRange` before anything focuses the element, and a field
+/// with no field editor may refuse that write. The scenario therefore uses
+/// the surface wave 9 measured on Notes: an editable `AXTextArea`.
+///
+/// Three claims no unit test can reach. The offset is UTF-16: the seed's
+/// emoji puts the first anchor's end 9 units in and 8 characters in, so a
+/// character-counting implementation inserts one unit early and the value
+/// reads back wrong. The offset is the *application's*, not the driver's own
+/// read-back — `lbl-caret-state` carries every selection change the text view
+/// itself saw, so the number the app reports can be compared with the number
+/// in the reply. And an anchor the value does not hold dispatches nothing at
+/// all, rather than typing at wherever the caret happened to rest.
+#[test]
+#[ignore]
+fn harness_appkit_caret_places_the_insertion_point_before_typing() {
+    run_background_case_with_env(
+        "caret_placement",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_APPKIT_CARET", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert_eq!(
+                element_value_by_id(&before, "txt-caret").as_deref(),
+                Some(CARET_SEED),
+                "the caret scenario did not start from its seed:\n{}",
+                before.tree_text()
+            );
+
+            let typed = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "txt-caret"),
+                    "text": "X",
+                    "caret": { "after": CARET_ANCHOR }
+                }),
+            );
+            assert!(!typed.is_error(), "caret type failed: {}", typed.text());
+            assert_eq!(
+                typed.structured()["caret_index"].as_u64(),
+                Some(CARET_FIRST_ANCHOR_END_UTF16),
+                "the caret index must be the UTF-16 offset of the first anchor's end, \
+                 not its character offset: {}",
+                typed.raw
+            );
+            assert_eq!(
+                typed.structured()["caret_anchor"],
+                serde_json::json!({ "after": CARET_ANCHOR }),
+                "the reply names the anchor it resolved: {}",
+                typed.raw
+            );
+
+            std::thread::sleep(Duration::from_millis(300));
+            let after = snapshot_elements(driver, pid, wid);
+            let anchor_end = CARET_SEED
+                .find(CARET_ANCHOR)
+                .expect("the seed holds the anchor")
+                + CARET_ANCHOR.len();
+            let mut placed = CARET_SEED.to_owned();
+            placed.insert_str(anchor_end, "X");
+            assert_eq!(
+                element_value_by_id(&after, "txt-caret").as_deref(),
+                Some(placed.as_str()),
+                "the text landed somewhere other than after the FIRST anchor:\n{}",
+                after.tree_text()
+            );
+
+            // The application's own witness: the selection it saw at the
+            // placement, then one unit further once the character landed.
+            let witnessed = format!(
+                "{CARET_FIRST_ANCHOR_END_UTF16},0|{},0",
+                CARET_FIRST_ANCHOR_END_UTF16 + 1
+            );
+            assert!(
+                after.tree_text().contains(&witnessed),
+                "the text view never reported the caret at {CARET_FIRST_ANCHOR_END_UTF16} \
+                 before the insertion; expected {witnessed} in its history:\n{}",
+                after.tree_text()
+            );
+
+            let refused = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&after, "txt-caret"),
+                    "text": "Y",
+                    "caret": { "after": "nope" }
+                }),
+            );
+            assert!(
+                refused.is_error(),
+                "an anchor the value does not hold was accepted: {}",
+                refused.text()
+            );
+            assert_eq!(
+                refusal_code(&refused),
+                Some("caret_anchor_not_found"),
+                "wrong refusal for an absent anchor: {}",
+                refused.raw
+            );
+            assert_eq!(
+                refused.structured()["delivered_chars"].as_u64(),
+                Some(0),
+                "{}",
+                refused.raw
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            let untouched = snapshot_elements(driver, pid, wid);
+            assert_eq!(
+                element_value_by_id(&untouched, "txt-caret").as_deref(),
+                Some(placed.as_str()),
+                "the refused call typed anyway:\n{}",
+                untouched.tree_text()
+            );
+        },
+    );
+}
+
+/// A list row that names nothing itself is named by the text it contains.
+/// Shipped with three unit tests over a hand-built node list and no live
+/// coverage: the fixture's only `AXRow` publishes `accessibilityLabel()`, so
+/// the synthesis never ran against a real AX bridge.
+///
+/// Asserted on `elements[].label`, not on the tree text: the walker fills
+/// `descendant_text` after the markdown lines are rendered, so the
+/// synthesised name reaches a consumer through the structured row only — and
+/// that ordering is asserted here too, because a change that moved the fill
+/// earlier would silently duplicate every row's text into the markdown.
+#[test]
+#[ignore]
+fn harness_appkit_an_unlabelled_row_is_named_by_its_text_descendants() {
+    run_case_with_env(
+        native_readonly_case(
+            "appkit",
+            "descendant_text_row",
+            Targeting::Ax,
+            DriverRoute::AxRead,
+            vec![OracleKind::AxState],
+        ),
+        &[("CUA_APPKIT_DESCENDANT_ROW", "1")],
+        |pid, wid, driver| {
+            let snapshot = snapshot_elements(driver, pid, wid);
+            let row = element_by_id(&snapshot, "row-unlabelled");
+            assert_eq!(row["role"], "AXRow", "the fixture row changed shape: {row}");
+            let expected = format!("{ROW_FIRST_TEXT} {ROW_SECOND_TEXT} {ROW_GROUP_TEXT}");
+            assert_eq!(
+                row["label"],
+                serde_json::json!(expected),
+                "the row must be named by its text descendants — the two texts and the \
+                 description-only text, single-spaced, without the image's label: {row}"
+            );
+            assert!(
+                has_id(snapshot.tree_text(), "row-unlabelled"),
+                "the row left the tree:\n{}",
+                snapshot.tree_text()
+            );
+            assert!(
+                snapshot.tree_text().contains(ROW_IMAGE_LABEL),
+                "the image must still be readable as itself:\n{}",
+                snapshot.tree_text()
+            );
+            assert!(
+                !snapshot.tree_text().contains(&expected),
+                "the synthesised name reached the markdown, which is rendered before the \
+                 fill — every row's text is now duplicated:\n{}",
+                snapshot.tree_text()
+            );
+
+            // Nothing was added or re-indexed to carry the name.
+            let again = snapshot_elements(driver, pid, wid);
+            assert_eq!(
+                element_by_id(&again, "row-unlabelled")["element_index"],
+                row["element_index"],
+                "the row's element_index moved between two identical reads: {}",
+                again.raw
+            );
+            Observation::delivered(vec![OracleKind::AxState], Evidence::default())
+        },
+    );
+}
+
+/// A window at the desktop-icon level is a desktop row, read through the
+/// content inside it — and nothing on that path is Finder-specific.
+///
+/// Wave 9 shipped it with six unit tests and one live measurement against
+/// Finder's own desktop, which proves the feature works where it was
+/// measured and not that the rule is the general one. The fixture owns a
+/// borderless window at `kCGDesktopIconWindowLevel` published as an
+/// `AXScrollArea`, so every step has to hold for a generic application: the
+/// listing admits the level from any owner, the row is classified by the
+/// level alone, no `AXWindow` claims the id, and the scope is proven from
+/// ownership plus the child's frame.
+#[test]
+#[ignore]
+fn harness_appkit_a_desktop_level_window_is_a_desktop_row_read_through_its_content() {
+    run_case_with_env(
+        native_readonly_case(
+            "appkit",
+            "desktop_surface",
+            Targeting::Ax,
+            DriverRoute::AxRead,
+            vec![OracleKind::AxState],
+        ),
+        &[("CUA_APPKIT_DESKTOP_SURFACE", "1")],
+        |pid, wid, driver| {
+            let roster = driver.call(
+                "list_windows",
+                serde_json::json!({ "pid": pid as i64, "include_accessibility_metadata": true }),
+            );
+            assert!(!roster.is_error(), "listing failed: {}", roster.text());
+            let desktop = roster.structured()["windows"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["kind"] == "desktop"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "pid {pid}'s own desktop-level window is not in its listing: {}",
+                        roster.raw
+                    )
+                });
+            assert_eq!(
+                desktop["ax_backed"],
+                serde_json::json!(true),
+                "a desktop row the application publishes is AX-backed: {desktop}"
+            );
+            assert_eq!(
+                roster.structured()["accessibility_windows"]["complete"],
+                serde_json::json!(true),
+                "an application-level surface must not leave the roster incomplete: {}",
+                roster.raw
+            );
+            let surface = desktop["window_id"].as_u64().expect("desktop window_id");
+            assert_ne!(surface, wid, "the main window was classified as a desktop");
+
+            let snapshot = snapshot_elements(driver, pid, surface);
+            assert!(
+                !snapshot.is_error(),
+                "the desktop surface refused a read: {}",
+                snapshot.text()
+            );
+            let scope = snapshot.structured()["tree_scope"].clone();
+            assert_eq!(
+                scope["code"],
+                serde_json::json!("desktop_surface"),
+                "the tree must name the scope it was read under: {}",
+                snapshot.raw
+            );
+            assert!(
+                scope["content_children"].as_u64().unwrap_or(0) >= 1,
+                "the scope found no application-level content inside the window: {scope}"
+            );
+            assert!(
+                scope["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("kCGDesktopIconWindowLevel")),
+                "the scope's sentence no longer says what filed the window: {scope}"
+            );
+            assert!(
+                snapshot.tree_text().contains(DESKTOP_ITEM_LABEL),
+                "the surface's own content is missing from its tree:\n{}",
+                snapshot.tree_text()
+            );
+            assert!(
+                snapshot.tree_text().contains("AXMenuBar"),
+                "a desktop-surface tree carries the menu bar, like every window-scoped \
+                 tree — the two-snapshot menu flow needs it:\n{}",
+                snapshot.tree_text()
+            );
+            assert!(
+                snapshot.structured().get("degraded").is_none(),
+                "a surface whose content was found and walked is not degraded: {}",
+                snapshot.raw
+            );
+            Observation::delivered(vec![OracleKind::AxState], Evidence::default())
+        },
+    );
+}

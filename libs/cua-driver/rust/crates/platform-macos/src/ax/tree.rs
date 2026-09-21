@@ -1603,42 +1603,47 @@ mod tests {
         }
     }
 
-    /// Notes' note list after a search, as the walker publishes it: the row,
-    /// its cell and the `ICMNoteListCell` cell name nothing themselves; the
-    /// title, snippet and folder are non-actionable static text beneath.
-    fn notes_list() -> Vec<AXNode> {
+    /// The text pieces the unlabelled row is named by. Neutral on purpose:
+    /// the shape under test is a list row whose text is only in its
+    /// descendants, and the original seeds transcribed one real note from one
+    /// bench run, so a reader could not tell the join rules from the anecdote.
+    const ROW_FIRST_TEXT: &str = "Row title";
+    /// Ragged on purpose: a run of spaces and a trailing newline are what an
+    /// application's own static text holds, and collapsing them is part of
+    /// the rule this pins.
+    const ROW_SECOND_TEXT: &str = "row snippet  5:10 AM\n";
+    const ROW_GROUP_TEXT: &str = "in group: Group A";
+    /// An image beneath the row, labelled — never part of the row's name.
+    const ROW_IMAGE_LABEL: &str = "row image badge";
+
+    /// A list row whose text is only in its descendants, as the walker
+    /// publishes it: the row, its cell and the identified cell name nothing
+    /// themselves, the text sits in non-actionable static text beneath, and a
+    /// labelled image sits between the two texts. The last two nodes are a
+    /// row the application titles itself, and its own static text.
+    ///
+    /// Notes' note list after a search is the measured original;
+    /// `harness_appkit_an_unlabelled_row_is_named_by_its_text_descendants`
+    /// holds the same shape live, against a generic application.
+    fn unlabelled_row() -> Vec<AXNode> {
         let mut list_cell = walked(Some(2), "AXCell", 2, None, None, None);
-        list_cell.identifier = Some("ICMNoteListCell".into());
+        list_cell.identifier = Some("row-cell".into());
         vec![
             walked(Some(0), "AXRow", 0, None, Some(""), None),
             walked(Some(1), "AXCell", 1, None, None, None),
             list_cell,
-            walked(None, "AXStaticText", 3, None, Some("Meeting 047"), None),
-            walked(
-                None,
-                "AXStaticText",
-                3,
-                None,
-                Some("…warehouse pallet audit  5:10 AM\n"),
-                None,
-            ),
-            walked(Some(3), "AXImage", 3, Some("move"), None, None),
-            walked(
-                None,
-                "AXStaticText",
-                3,
-                None,
-                None,
-                Some("in folder: Bench — iCloud"),
-            ),
-            walked(Some(4), "AXRow", 0, Some("Top Hits"), None, None),
+            walked(None, "AXStaticText", 3, None, Some(ROW_FIRST_TEXT), None),
+            walked(None, "AXStaticText", 3, None, Some(ROW_SECOND_TEXT), None),
+            walked(Some(3), "AXImage", 3, Some(ROW_IMAGE_LABEL), None, None),
+            walked(None, "AXStaticText", 3, None, None, Some(ROW_GROUP_TEXT)),
+            walked(Some(4), "AXRow", 0, Some("Titled row"), None, None),
             walked(None, "AXStaticText", 1, None, Some("not the row's label"), None),
         ]
     }
 
     #[test]
     fn a_list_item_without_its_own_label_reads_its_descendant_text() {
-        let mut nodes = notes_list();
+        let mut nodes = unlabelled_row();
         let before: Vec<(Option<usize>, String)> = nodes
             .iter()
             .map(|node| (node.element_index, node.role.clone()))
@@ -1646,13 +1651,25 @@ mod tests {
 
         fill_descendant_text(&mut nodes);
 
-        let expected = "Meeting 047 …warehouse pallet audit 5:10 AM in folder: Bench — iCloud";
+        // The rule, stated once: every text-role descendant's text in order,
+        // split into words and rejoined by single spaces.
+        let expected = format!("{ROW_FIRST_TEXT} {ROW_SECOND_TEXT} {ROW_GROUP_TEXT}")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         for index in 0..3 {
             assert_eq!(
                 nodes[index].descendant_text.as_deref(),
-                Some(expected),
+                Some(expected.as_str()),
                 "{} carries the text beneath it, images excluded",
                 nodes[index].role
+            );
+            assert!(
+                !nodes[index]
+                    .descendant_text
+                    .as_deref()
+                    .is_some_and(|text| text.contains(ROW_IMAGE_LABEL)),
+                "an image's own label is not text a person reads in a row"
             );
         }
         assert_eq!(

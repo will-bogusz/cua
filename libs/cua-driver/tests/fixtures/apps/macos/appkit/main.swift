@@ -18,6 +18,12 @@
 //   child_editor   — a borderless child window accessibility publishes as its
 //                    own text field, drawn inside the main window, plus an
 //                    attached sheet (CUA_APPKIT_CHILD_EDITOR=1 | sheet)
+//   caret_target   — an editable NSTextView seeded with a repeated anchor
+//                    behind a non-BMP character (CUA_APPKIT_CARET=1)
+//   descendant_text_row — an unlabelled AXRow whose text is only in its
+//                    display-only descendants (CUA_APPKIT_DESCENDANT_ROW=1)
+//   desktop_surface — a window at the desktop-icon level holding one
+//                    labelled image (CUA_APPKIT_DESKTOP_SURFACE=1)
 //   exit           — NSButton terminates the app
 //
 // AX identifiers (via `setAccessibilityIdentifier(_:)`) match the IDs in
@@ -142,6 +148,53 @@ let kChildEditorSheetTitle = "Child Editor Sheet (CuaTestHarness)"
 /// makes the window its owner rather than a sibling's.
 let kChildEditorOffset = NSPoint(x: 120, y: 200)
 let kChildEditorSize = NSSize(width: 220, height: 24)
+/// caret_target — an editable `NSTextView` seeded so the two ways of
+/// counting an offset disagree (`CUA_APPKIT_CARET=1`).
+///
+/// The seed's anchor word occurs twice, so "the first occurrence" is a
+/// promise the caller relies on, and the non-BMP character ahead of it makes
+/// the UTF-16 offset of that occurrence differ from its character offset —
+/// 9 against 8. `AXSelectedTextRange` counts UTF-16 units, so an
+/// implementation that counted characters would place the caret one unit
+/// early and the test would read the text back with the insertion in the
+/// wrong place. `bodyText` cannot stand in for this: it is not editable.
+let kCaretViewAID = "txt-caret"
+let kCaretStateAID = "lbl-caret-state"
+let kCaretRepeatedAnchor = "anchor"
+let kCaretSeedValue = "\u{1F600} anchor one, anchor two."
+/// How many selection changes [`CaretStateObserver`] keeps. Typing moves the
+/// caret past what it inserted, so the offset the caret was *placed* at is
+/// gone from the live selection by the time the reply arrives; the history is
+/// what makes the application's own witness readable afterwards.
+let kCaretHistoryLimit = 8
+/// descendant_text_row — the list-row shape whose text lives entirely in
+/// display-only descendants (`CUA_APPKIT_DESCENDANT_ROW=1`).
+///
+/// Measured in Notes' note list: every row is `AXRow` > `AXCell` > `AXCell`
+/// with the title, snippet and folder in non-actionable static text and no
+/// title, value or description anywhere on the row itself. The image between
+/// the two texts carries a label of its own, which the row's synthesised name
+/// must not absorb; the third piece names itself through its description
+/// alone, which a value-first reader drops.
+let kDescendantRowAID = "row-unlabelled"
+let kDescendantRowFirstText = "Row title"
+let kDescendantRowSecondText = "row snippet 5:10 AM"
+let kDescendantRowImageLabel = "row image badge"
+let kDescendantRowGroupText = "in group: Group A"
+/// desktop_surface — a window at the desktop-icon window level holding one
+/// labelled image (`CUA_APPKIT_DESKTOP_SURFACE=1`).
+///
+/// Finder's desktop is the measured case, but nothing on the driver's
+/// desktop-row path is Finder-specific: the CGWindow level alone classifies
+/// the row, and the listing admits that level from any owner. So a generic
+/// application can own a desktop surface, and this one does.
+let kDesktopSurfaceAID = "desktop-surface"
+let kDesktopItemLabel = "DESKTOP_ITEM_MARKER_v1"
+let kDesktopSurfaceSize = NSSize(width: 360, height: 220)
+/// Where the surface sits inside the main display, in the display's own
+/// bottom-left-origin coordinates. Away from the menu bar and the Dock so it
+/// is fully on screen, which is what puts it in an on-screen-only listing.
+let kDesktopSurfaceOrigin = NSPoint(x: 80, y: 120)
 
 // MARK: - Controls
 
@@ -307,6 +360,98 @@ final class HarnessWindow: NSWindow {
 /// is key, which is what a click on a text control does.
 final class KeyWindowGatedSearchField: NSSearchField {
     override func isAccessibilityEnabled() -> Bool { window?.isKeyWindow == true }
+}
+
+/// The application's own witness of where its insertion point went.
+///
+/// A caret read back through `AXSelectedTextRange` proves only that the AX
+/// bridge echoed the write. What the caret contract needs proving is that the
+/// text view agrees, in the units it counts: `NSTextView.selectedRange` is an
+/// `NSRange` over UTF-16 code units, the same units the driver resolves an
+/// anchor in, so the two numbers are directly comparable.
+///
+/// Every change is kept, not just the last: an insertion moves the caret past
+/// the text it inserted, so the placement offset is no longer the live
+/// selection once the reply exists.
+final class CaretStateObserver: NSObject, NSTextViewDelegate {
+    let label = NSTextField(labelWithString: "caret_offset=none caret_history=none")
+    private var history: [String] = []
+
+    func textViewDidChangeSelection(_ notification: Notification) {
+        guard let view = notification.object as? NSTextView else { return }
+        let range = view.selectedRange()
+        history.append("\(range.location),\(range.length)")
+        if history.count > kCaretHistoryLimit {
+            history.removeFirst(history.count - kCaretHistoryLimit)
+        }
+        label.stringValue = "caret_offset=\(history[history.count - 1]) "
+            + "caret_history=\(history.joined(separator: "|"))"
+    }
+}
+
+/// The Notes/Mail list-row shape: a row that advertises the press a real row
+/// advertises and publishes no name of its own at all.
+///
+/// [`PressableRowView`] cannot stand in for this — it answers
+/// `accessibilityLabel()`, which is the one line a row must not have for its
+/// name to be read from what it contains. The children are published
+/// explicitly so their order in the tree is the fixture's, not a layout
+/// accident: the synthesised name is the text in the order it is read.
+final class UnlabelledRowView: NSView {
+    var cells: [NSView] = []
+
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .row }
+
+    override func accessibilityLabel() -> String? { nil }
+
+    override func accessibilityTitle() -> String? { nil }
+
+    override func accessibilityValue() -> Any? { nil }
+
+    override func accessibilityChildren() -> [Any]? {
+        cells.isEmpty ? super.accessibilityChildren() : cells
+    }
+
+    override func accessibilityActionNames() -> [NSAccessibility.Action] { [.press] }
+
+    override func accessibilityPerformPress() -> Bool { true }
+}
+
+/// A text node that names itself through its description alone.
+///
+/// AppKit produces this for a view with an accessibility label and no value,
+/// and it is the piece of a row's text a value-first reader silently drops —
+/// in Notes' list that piece is the folder a note lives in.
+final class DescriptionOnlyText: NSView {
+    var text = ""
+
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .staticText }
+
+    override func accessibilityLabel() -> String? { text }
+
+    override func accessibilityValue() -> Any? { nil }
+}
+
+/// A window at the desktop-icon window level, published the way a desktop
+/// surface is published: its own accessibility element, role `AXScrollArea`,
+/// claiming no window identity.
+///
+/// [`ChildEditorWindow`] already proves an `NSWindow` can publish a
+/// non-`AXWindow` role, which is what makes its CGWindowID unmappable — the
+/// walker asks only `AXWindow`/`AXSheet` for one. This is the same technique
+/// one level down the window stack, so the scope decision has to prove
+/// identity the way it does for Finder: the process owns the window, and an
+/// application-level child's frame lies inside the window's bounds.
+final class DesktopSurfaceWindow: NSWindow {
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .scrollArea }
+
+    override func accessibilityTitle() -> String? { nil }
 }
 
 /// Hosts [`KeyWindowGatedSearchField`] in a real `NSToolbar`, so the control
@@ -599,6 +744,13 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     /// after [`show`] has centered the main window, so it is placed inside
     /// the frame the window actually ends up with.
     var childEditor: ChildEditorSurface?
+    /// The caret scenario's editable text view and the observer that publishes
+    /// the application's own view of its insertion point. Retained for the
+    /// window's life: `NSTextView` holds its delegate weakly.
+    let caretView = NSTextView()
+    let caretObserver = CaretStateObserver()
+    /// The unlabelled row and the three pieces of text it is named by.
+    let unlabelledRow = UnlabelledRowView()
 
     // Pinned content size — every launch MUST produce a byte-identical window
     // so screenshot dimensions (and the hardcoded pixel coords the harness tests
@@ -1011,6 +1163,76 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             editorRow.addArrangedSubview(surface.commitLabel)
             content.addArrangedSubview(editorRow)
             childEditor = surface
+            extraHeight += 60
+        }
+        if HarnessWindowController.envFlag("CUA_APPKIT_CARET") {
+            content.addArrangedSubview(sectionLabel("caret_target"))
+            caretView.setAccessibilityIdentifier(kCaretViewAID)
+            caretView.isEditable = true
+            caretView.isSelectable = true
+            caretView.isRichText = false
+            caretView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            caretView.string = kCaretSeedValue
+            caretView.delegate = caretObserver
+            let caretScroll = NSScrollView()
+            caretScroll.documentView = caretView
+            caretScroll.hasVerticalScroller = true
+            caretScroll.borderType = .lineBorder
+            caretScroll.translatesAutoresizingMaskIntoConstraints = false
+            caretObserver.label.setAccessibilityIdentifier(kCaretStateAID)
+            caretObserver.label.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            let caretRow = NSStackView()
+            caretRow.orientation = .horizontal
+            caretRow.spacing = 12
+            caretRow.addArrangedSubview(caretScroll)
+            caretRow.addArrangedSubview(caretObserver.label)
+            NSLayoutConstraint.activate([
+                caretScroll.widthAnchor.constraint(equalToConstant: 280),
+                caretScroll.heightAnchor.constraint(equalToConstant: 48),
+            ])
+            content.addArrangedSubview(caretRow)
+            extraHeight += 80
+        }
+        if HarnessWindowController.envFlag("CUA_APPKIT_DESCENDANT_ROW") {
+            content.addArrangedSubview(sectionLabel("descendant_text_row"))
+            unlabelledRow.setAccessibilityIdentifier(kDescendantRowAID)
+            unlabelledRow.translatesAutoresizingMaskIntoConstraints = false
+            let firstText = NSTextField(labelWithString: kDescendantRowFirstText)
+            let secondText = NSTextField(labelWithString: kDescendantRowSecondText)
+            // An image with a label of its own: actionable in the tree and
+            // readable as itself, and excluded from the row's synthesised
+            // name because an image is not text a person reads in a row.
+            // Drawn rather than an SF Symbol: a symbol that a future macOS
+            // renames resolves to nil, and an image view with no image is a
+            // different AX node than the one under test.
+            let badgeImage = NSImage(size: NSSize(width: 16, height: 16))
+            badgeImage.lockFocus()
+            NSColor.systemBlue.setFill()
+            NSRect(x: 0, y: 0, width: 16, height: 16).fill()
+            badgeImage.unlockFocus()
+            let badge = NSImageView(image: badgeImage)
+            badge.setAccessibilityLabel(kDescendantRowImageLabel)
+            let groupText = DescriptionOnlyText()
+            groupText.text = kDescendantRowGroupText
+            let rowStack = NSStackView(views: [firstText, badge, secondText, groupText])
+            rowStack.orientation = .horizontal
+            rowStack.spacing = 8
+            rowStack.translatesAutoresizingMaskIntoConstraints = false
+            unlabelledRow.addSubview(rowStack)
+            // Published in reading order, so the name the driver builds is
+            // the fixture's own sentence rather than a layout accident.
+            unlabelledRow.cells = [firstText, badge, secondText, groupText]
+            NSLayoutConstraint.activate([
+                unlabelledRow.heightAnchor.constraint(equalToConstant: 28),
+                unlabelledRow.widthAnchor.constraint(equalToConstant: 520),
+                rowStack.leadingAnchor.constraint(equalTo: unlabelledRow.leadingAnchor),
+                rowStack.centerYAnchor.constraint(equalTo: unlabelledRow.centerYAnchor),
+                groupText.widthAnchor.constraint(equalToConstant: 120),
+                groupText.heightAnchor.constraint(equalToConstant: 16),
+                badge.widthAnchor.constraint(equalToConstant: 16),
+                badge.heightAnchor.constraint(equalToConstant: 16),
+            ])
+            content.addArrangedSubview(unlabelledRow)
             extraHeight += 60
         }
         if extraHeight > 0 {
@@ -1663,10 +1885,46 @@ struct CuaAppKitHarness {
             candidate.makeKeyAndOrderFront(nil)
             secondKeyWindow = candidate
         }
+        // A window at the desktop-icon level, holding one labelled image.
+        // Ordered in without ever being made key: at that level it sits
+        // behind every application window, which is exactly where a desktop
+        // surface sits and why WindowServer files it as one.
+        var desktopSurface: NSWindow?
+        if ProcessInfo.processInfo.environment["CUA_APPKIT_DESKTOP_SURFACE"] == "1" {
+            let screen = NSScreen.main ?? NSScreen.screens.first
+            let origin = NSPoint(
+                x: (screen?.frame.origin.x ?? 0) + kDesktopSurfaceOrigin.x,
+                y: (screen?.frame.origin.y ?? 0) + kDesktopSurfaceOrigin.y)
+            let surface = DesktopSurfaceWindow(
+                contentRect: NSRect(origin: origin, size: kDesktopSurfaceSize),
+                styleMask: [.borderless], backing: .buffered, defer: false)
+            surface.setAccessibilityIdentifier(kDesktopSurfaceAID)
+            surface.isReleasedWhenClosed = false
+            surface.isRestorable = false
+            surface.hasShadow = false
+            surface.backgroundColor = .windowBackgroundColor
+            surface.level = NSWindow.Level(
+                rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)))
+            let item = NSImageView()
+            let itemImage = NSImage(size: NSSize(width: 64, height: 64))
+            itemImage.lockFocus()
+            NSColor.systemGreen.setFill()
+            NSRect(x: 0, y: 0, width: 64, height: 64).fill()
+            itemImage.unlockFocus()
+            item.image = itemImage
+            item.setAccessibilityLabel(kDesktopItemLabel)
+            item.frame = NSRect(x: 24, y: 24, width: 64, height: 64)
+            let content = NSView(frame: NSRect(origin: .zero, size: kDesktopSurfaceSize))
+            content.addSubview(item)
+            surface.contentView = content
+            surface.orderFront(nil)
+            desktopSurface = surface
+        }
         app.activate(ignoringOtherApps: true)
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
         app.run()
         _ = matrixWindows
         _ = secondKeyWindow
+        _ = desktopSurface
     }
 }

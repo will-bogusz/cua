@@ -488,6 +488,42 @@
     }
    },
    {
+    "id": "caret_target",
+    "kind": "caret_placement",
+    "description": "CUA_APPKIT_CARET=1 adds an editable NSTextView in a scroll view, seeded with \"\ud83d\ude00 anchor one, anchor two.\": the anchor word occurs twice so the first-occurrence rule is exercised, and the non-BMP character ahead of it makes the UTF-16 offset of the first occurrence's end (9) differ from its character offset (8), which is the unit AXSelectedTextRange counts in. lbl-caret-state publishes the application's own view of its insertion point as caret_offset=<location>,<length> plus caret_history= of every selection change, because typing moves the caret past what it inserted and the placement offset is no longer the live selection by the time the reply exists. Tests that type_text's caret argument places the insertion point by content before typing, that the offset is UTF-16, and that an anchor the value does not hold refuses without dispatching.",
+    "controls": {
+     "caret_view_aid": "txt-caret",
+     "caret_state_label_aid": "lbl-caret-state",
+     "caret_seed_value": "\ud83d\ude00 anchor one, anchor two.",
+     "caret_repeated_anchor": "anchor",
+     "caret_first_anchor_end_utf16": 9,
+     "caret_env": "CUA_APPKIT_CARET"
+    }
+   },
+   {
+    "id": "descendant_text_row",
+    "kind": "unlabelled_row",
+    "description": "CUA_APPKIT_DESCENDANT_ROW=1 adds a view published as an AXRow that advertises AXPress and has no title, value or description of its own, holding two static texts with a labelled image between them and a third text that names itself through its description alone. This is Notes' note-list row shape, where the text a person reads is entirely in non-actionable descendants. Tests that such a row reaches elements[].label as the text it contains — the two texts and the description-only text joined by single spaces, without the image's own label — while tree_markdown, which is rendered before the fill, never carries it.",
+    "controls": {
+     "row_aid": "row-unlabelled",
+     "row_first_text": "Row title",
+     "row_second_text": "row snippet 5:10 AM",
+     "row_image_label": "row image badge",
+     "row_group_text": "in group: Group A",
+     "descendant_env": "CUA_APPKIT_DESCENDANT_ROW"
+    }
+   },
+   {
+    "id": "desktop_surface",
+    "kind": "desktop_icon_surface",
+    "description": "CUA_APPKIT_DESKTOP_SURFACE=1 orders in a borderless 360x220 window at CGWindowLevelForKey(.desktopIconWindow) inside the main display, published as its own accessibility element with role AXScrollArea and no title, holding one NSImageView labelled DESKTOP_ITEM_MARKER_v1. Finder's desktop is the measured case but nothing on the driver's path is Finder-specific: the CGWindow level alone classifies the row and the listing admits that level from any owner, while the AXScrollArea role leaves the CGWindowID unmappable so the scope has to be proven from ownership plus the child's frame. Tests that a non-Finder desktop-level window is listed with kind desktop and ax_backed, and that get_window_state reads it through tree_scope desktop_surface.",
+    "controls": {
+     "surface_aid": "desktop-surface",
+     "item_label": "DESKTOP_ITEM_MARKER_v1",
+     "desktop_env": "CUA_APPKIT_DESKTOP_SURFACE"
+    }
+   },
+   {
     "id": "exit",
     "kind": "exit_button",
     "controls": {
