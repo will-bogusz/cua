@@ -351,6 +351,7 @@
      "swap_textbox_aid": "txt-swap",
      "discard_textbox_aid": "txt-discard",
      "confirm_textbox_aid": "txt-confirm",
+     "non_bmp_textbox_aid": "txt-nonbmp",
      "state_label_aid": "lbl-end-of-edit"
     }
    },

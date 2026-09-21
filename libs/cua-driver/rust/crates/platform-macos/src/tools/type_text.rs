@@ -1062,7 +1062,7 @@ impl CaretPlacement {
     }
 }
 
-fn utf16_len(s: &str) -> usize {
+pub(super) fn utf16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
 

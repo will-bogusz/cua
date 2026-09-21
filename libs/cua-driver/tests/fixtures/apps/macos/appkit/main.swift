@@ -75,6 +75,11 @@ let kDiscardPlaceholder = "Discards on commit"
 let kDiscardKeptValue = "keep-me"
 let kConfirmInputAID = "txt-confirm"
 let kConfirmPlaceholder = "Confirms its own commit"
+let kNonBmpInputAID = "txt-nonbmp"
+let kNonBmpPlaceholder = "Non-BMP seed"
+/// Four UTF-16 units in three characters: a selection measured in characters
+/// covers three of them and leaves the "B" for typed text to be appended to.
+let kNonBmpSeedValue = "\u{1F600}AB"
 let kEndOfEditStateAID = "lbl-end-of-edit"
 /// menu_popover — a popup button whose press opens a native NSMenu, and a
 /// button that shows an NSPopover tall enough to hang past the window's
@@ -406,6 +411,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     var swapInput = NSTextField(string: "")
     let discardInput = NSTextField(string: kDiscardKeptValue)
     let confirmInput = ConfirmCommitTextField(string: "")
+    let nonBmpInput = NSTextField(string: kNonBmpSeedValue)
     let endOfEditRow = NSStackView()
     let endOfEditLabel = NSTextField(labelWithString: "")
     var reformatCommitted = "none"
@@ -414,6 +420,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     var discardCommitted = "none"
     var confirmCommitted = "none"
     var confirmTyped = 0
+    var nonBmpCommitted = "none"
     let lastActionLabel = NSTextField(labelWithString: "last_action=none")
     let clickCountLabel = NSTextField(labelWithString: "clicks=0")
     var clicks = 0
@@ -737,6 +744,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             discardInput, aid: kDiscardInputAID, placeholder: kDiscardPlaceholder)
         configureEndOfEditField(
             confirmInput, aid: kConfirmInputAID, placeholder: kConfirmPlaceholder)
+        configureEndOfEditField(nonBmpInput, aid: kNonBmpInputAID, placeholder: kNonBmpPlaceholder)
         confirmInput.onConfirm = { [weak self] value in
             guard let self else { return }
             self.confirmCommitted = value
@@ -748,6 +756,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         endOfEditRow.addArrangedSubview(swapInput)
         endOfEditRow.addArrangedSubview(discardInput)
         endOfEditRow.addArrangedSubview(confirmInput)
+        endOfEditRow.addArrangedSubview(nonBmpInput)
         endOfEditLabel.setAccessibilityIdentifier(kEndOfEditStateAID)
         endOfEditLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         publishEndOfEdit()
@@ -1060,6 +1069,10 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             discardCommitted = kDiscardKeptValue
             publishEndOfEdit()
         }
+        if field === nonBmpInput {
+            nonBmpCommitted = field.stringValue
+            publishEndOfEdit()
+        }
         if field === swapInput {
             swapCommitted = field.stringValue
             swaps += 1
@@ -1103,6 +1116,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             "swap_committed=\(swapCommitted) swaps=\(swaps)",
             "discard_committed=\(discardCommitted)",
             "confirm_committed=\(confirmCommitted) confirm_typed=\(confirmTyped)",
+            "nonbmp_committed=\(nonBmpCommitted)",
         ].joined(separator: " | ")
     }
 

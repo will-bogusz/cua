@@ -1054,7 +1054,7 @@ fn retype_blocking(
         );
     }
 
-    let existing = before.as_deref().unwrap_or_default().chars().count();
+    let existing = selection_length(before.as_deref());
     if existing > 0 && !select_all_text(element, existing) {
         anyhow::bail!(
             "[{element_index}] {role} refused both an AXSelectedTextRange selection and an \
@@ -1139,11 +1139,22 @@ fn retype_blocking(
     })
 }
 
+/// How much of the control's current value the selection has to cover for the
+/// first keystroke to replace it instead of extending it.
+///
+/// `AXSelectedTextRange` counts UTF-16 code units, as `NSString` does, so a
+/// non-BMP scalar occupies two of them: a `char` count leaves the tail of an
+/// emoji-bearing value outside the selection, and the typed text is appended to
+/// what stayed behind.
+fn selection_length(existing: Option<&str>) -> usize {
+    super::type_text::utf16_len(existing.unwrap_or_default())
+}
+
 /// Select the control's whole value so the first keystroke replaces it.
 /// A control that refuses a selection write still accepts an `AXValue` clear;
 /// without one of the two, typing would append to the current value.
-fn select_all_text(element: AXUIElementRef, length: usize) -> bool {
-    if unsafe { set_range_attr(element, "AXSelectedTextRange", 0, length as isize) }
+fn select_all_text(element: AXUIElementRef, utf16_length: usize) -> bool {
+    if unsafe { set_range_attr(element, "AXSelectedTextRange", 0, utf16_length as isize) }
         == kAXErrorSuccess
     {
         return true;
@@ -1455,8 +1466,8 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_readback, classify_write,
-        commit_written_value, judge_commit, refused_keystroke_plan, write_plan, CommitReadback,
-        CommitTarget, CommitWitness, SetValueOutcome, ToolResult, WritePlan,
+        commit_written_value, judge_commit, refused_keystroke_plan, selection_length, write_plan,
+        CommitReadback, CommitTarget, CommitWitness, SetValueOutcome, ToolResult, WritePlan,
     };
     use cua_driver_contract::ActionCommit;
 
@@ -1734,6 +1745,23 @@ mod tests {
             classify_readback(Some("25.0"), Some("10"), "25", true),
             CommitReadback::Matches
         );
+    }
+
+    /// `AXSelectedTextRange` is in UTF-16 units: selecting `chars().count()`
+    /// of a value holding a non-BMP scalar leaves its tail unselected, and the
+    /// replacement is appended to what stayed behind ("😀AB" retyped as "zed"
+    /// becomes "zedB").
+    #[test]
+    fn the_replaced_selection_is_measured_in_utf16_units() {
+        assert_eq!(selection_length(Some("😀AB")), 4);
+        assert_eq!(
+            "😀AB".chars().count(),
+            3,
+            "a char count would select 3 of the 4 units"
+        );
+        assert_eq!(selection_length(Some("ramp")), 4);
+        assert_eq!(selection_length(Some("")), 0);
+        assert_eq!(selection_length(None), 0);
     }
 
     /// The control's own `AXConfirm` is its action handler — the one Return

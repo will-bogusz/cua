@@ -1218,6 +1218,51 @@ fn harness_appkit_set_value_uses_an_advertised_confirm_as_the_commit() {
     );
 }
 
+/// `AXSelectedTextRange` is in UTF-16 units, as `NSString` is. `txt-nonbmp`
+/// starts out holding `😀AB` — four units in three characters — so a selection
+/// measured in characters covers three of them and the replacement is appended
+/// to the "B" left behind.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_replaces_a_non_bmp_value_whole() {
+    run_background_case(
+        "set_value_non_bmp",
+        DriverRoute::MacosCgEventPid,
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "txt-nonbmp"),
+                    "value": "zed"
+                }),
+            );
+            assert!(!set.is_error(), "set_value failed: {}", set.text());
+            assert_eq!(
+                set.structured()["committed"],
+                serde_json::json!("committed"),
+                "the replacement did not cover the whole value: {}",
+                set.raw
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                !after.tree_text().contains("nonbmp_committed=zedB"),
+                "the selection stopped one UTF-16 unit short:\n{}",
+                after.tree_text()
+            );
+            assert!(
+                after.tree_text().contains("nonbmp_committed=zed"),
+                "the app never registered the write:\n{}",
+                after.tree_text()
+            );
+        },
+    );
+}
+
 /// `press_key` on the foreground rung built its events with a default source
 /// and no flags, so a chord's base key arrived bare: `cmd+a` typed a literal
 /// `a`. The fixture's accelerator requires the modifiers to be present on the
