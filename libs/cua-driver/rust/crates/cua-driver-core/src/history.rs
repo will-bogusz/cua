@@ -2015,7 +2015,6 @@ fn valid_payload_for_event(event_type: &str, payload: &HistoryPayload) -> bool {
                     | "system_api"
                     | "dom"
                     | "trusted_input"
-                    | "menu_command"
                     | "unknown"
             ) && delivery.as_deref().is_none_or(|value| {
                 matches!(
@@ -2168,7 +2167,6 @@ fn route_name(value: ActionRoute) -> &'static str {
         ActionRoute::SystemApi => "system_api",
         ActionRoute::Dom => "dom",
         ActionRoute::TrustedInput => "trusted_input",
-        ActionRoute::MenuCommand => "menu_command",
     }
 }
 

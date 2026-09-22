@@ -2232,14 +2232,13 @@ fn focus_text_entry(
 /// Whether the application reports the addressed control disabled, giving a
 /// requested activation the time it needs to land before answering.
 ///
-/// This is the same mechanism `hotkey::dispatch_as_menu_command`
-/// already documents for menu items: what a closed control reports is
-/// whatever the application last validated, and for a window that has just
-/// become key that is the stale pre-key value — measured on Notes, a menu
-/// item still read disabled ~170 ms after its window was key while the item
-/// pressed fine. The menu path re-triggers validation instead of waiting,
-/// because opening each menu on the way is itself what makes AppKit validate
-/// the item. A click has no equivalent move — nothing about pressing a
+/// What a closed control reports is whatever the application last validated,
+/// and for a window that has just become key that is the stale pre-key value
+/// — measured on Notes, a menu item still read disabled ~170 ms after its
+/// window was key while the item pressed fine. `invoke_menu` re-triggers
+/// validation instead of waiting, because opening each menu on the way is
+/// itself what makes AppKit validate the item. A click has no equivalent
+/// move — nothing about pressing a
 /// toolbar control re-validates it — so it re-reads within the activation's
 /// own budget ([`crate::input::skylight::ACTIVATION_WAIT_TIMEOUT`], which
 /// already bounds how long that activation is waited for, and covers the

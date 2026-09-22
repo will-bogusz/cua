@@ -298,40 +298,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -339,8 +305,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }
@@ -778,40 +743,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -819,8 +750,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }
@@ -2349,40 +2279,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -2390,8 +2286,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }
@@ -2594,40 +2489,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -2635,8 +2496,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }
@@ -3351,40 +3211,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -3392,8 +3218,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }
@@ -3645,40 +3470,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -3686,8 +3477,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }
@@ -3959,40 +3749,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -4000,8 +3756,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }
@@ -4517,40 +4272,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -4558,8 +4279,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }
@@ -4947,40 +4667,6 @@
               "null"
             ]
           },
-          "key_window": {
-            "additionalProperties": false,
-            "properties": {
-              "app_fronted": {
-                "type": "boolean"
-              },
-              "made_key": {
-                "type": "boolean"
-              },
-              "restored": {
-                "type": [
-                  "boolean",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "made_key",
-              "app_fronted"
-            ],
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "menu_path": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
           "route": {
             "enum": [
               "accessibility",
@@ -4988,8 +4674,7 @@
               "global_input",
               "system_api",
               "dom",
-              "trusted_input",
-              "menu_command"
+              "trusted_input"
             ],
             "type": "string"
           }

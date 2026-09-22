@@ -53,8 +53,8 @@ for the intentional SDK break and unchanged CLI/MCP wire forms.
 
 Everything after 0.8 is additive over it. `ActionResult` gained
 `evidence[].signal` (which observation a `window_change` row names),
-`committed`, `menu_path`, the `element` / `snapshot` escalation targets and
-the `menu_command` route; every input that runs the post-action window poll
+`committed`, and the `element` / `snapshot` escalation targets; every input
+that runs the post-action window poll
 gained an optional `detect_window_change`. The kind name `window_change` and
 every 0.8 field are unchanged. Each typed input has a `new` constructor that
 leaves its optional fields unset (`ClickInput::new(target, position,

@@ -677,14 +677,13 @@ fn listed(resolved_path: Vec<String>, items: Vec<MenuItem>) -> ToolResult {
     }))
 }
 
-fn invoked(path: Vec<String>, reaction: Option<super::delivery_probe::Evidence>) -> ToolResult {
+fn invoked(reaction: Option<super::delivery_probe::Evidence>) -> ToolResult {
     let mut record = ActionExecutionRecord::builder(
         ActionEffect::Unverifiable,
-        ActionTransport::MacosMenuCommand,
+        ActionTransport::MacosAxAction,
         RequestedDelivery::Foreground,
     )
     .actual_delivery(ActualDelivery::Foreground)
-    .menu_path(path)
     .evidence(ActionEvidence {
         kind: EvidenceKind::NativeApiResult,
         detail: "Every menu hop resolved uniquely and AX accepted the final action".into(),
@@ -787,7 +786,7 @@ impl Tool for InvokeMenuTool {
         .await;
 
         match outcome {
-            Ok(Ok((MenuOutcome::Invoked, reaction))) => invoked(resolved_path, reaction),
+            Ok(Ok((MenuOutcome::Invoked, reaction))) => invoked(reaction),
             Ok(Ok((MenuOutcome::Listed(items), _))) => listed(resolved_path, items),
             Ok(Err(refused)) => refusal(refused),
             Err(error) => refusal(MenuRefusal::plain(format!(
@@ -927,13 +926,13 @@ mod tests {
         );
     }
 
-    /// The dispatch is the application's own menu command on a window made
-    /// key, so it publishes as such; a reaction the settle wait saw rides
-    /// along as observed-change evidence, and a menu that never reacted adds
+    /// The dispatch is an accessibility action on a window made key, so it is
+    /// never a background delivery; a reaction the settle wait saw rides along
+    /// as observed-change evidence, and a menu that never reacted adds
     /// nothing.
     #[test]
     fn a_pressed_menu_item_still_carries_its_execution_record() {
-        let pressed = invoked(vec!["File".into(), "New Note".into()], None);
+        let pressed = invoked(None);
         assert_eq!(pressed.is_error, None);
         assert!(pressed.structured_content.is_none());
         let public = serde_json::to_value(
@@ -945,16 +944,14 @@ mod tests {
         )
         .expect("projection serializes");
         assert_eq!(public["effect"], "unverifiable");
-        assert_eq!(public["route"], "menu_command");
+        assert_eq!(public["route"], "accessibility");
         assert_eq!(public["delivery"]["mode"], "foreground");
         assert!(public.get("evidence").is_none(), "{public}");
-        assert_eq!(public["menu_path"], serde_json::json!(["File", "New Note"]));
 
         let reacted = serde_json::to_value(
-            invoked(
-                vec!["File".into(), "New Note".into()],
-                Some(super::super::delivery_probe::Evidence::Changed("app_focus")),
-            )
+            invoked(Some(
+                super::super::delivery_probe::Evidence::Changed("app_focus"),
+            ))
             .action_record
             .expect("execution record")
             .public_result()
