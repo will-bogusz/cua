@@ -22,6 +22,7 @@ pub(crate) mod budget;
 pub mod cache;
 pub mod enablement;
 pub mod exact_target;
+pub mod popup;
 pub mod row_collapse;
 pub mod tree;
 pub mod window_scope;

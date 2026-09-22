@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_children, copy_label_attr, copy_string_attr,
+    copy_action_names, copy_label_attr, copy_string_attr,
     element_at_screen_position, element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction,
     AXUIElementRef,
 };
@@ -590,49 +590,6 @@ impl NextRung {
             }
         }
     }
-}
-
-/// One option of a popup/select control, as the reply lists it.
-///
-/// # Safety
-/// `element` must be a live AX element.
-unsafe fn popup_option_label(element: AXUIElementRef) -> Option<String> {
-    let title = copy_string_attr(element, "AXTitle").unwrap_or_default();
-    let value = copy_string_attr(element, "AXValue").unwrap_or_default();
-    if title.is_empty() && value.is_empty() {
-        return None;
-    }
-    Some(if value.is_empty() || value == title {
-        format!("\"{title}\"")
-    } else {
-        format!("\"{title}\" (value: {value})")
-    })
-}
-
-/// The options an `AXPopUpButton` offers.
-///
-/// A popup's options are the items of its `AXMenu`, not its direct children:
-/// once the menu is open the button has exactly one child, a titleless
-/// `AXMenu`, and reading only direct children reported no options at all —
-/// so the advice that names them never reached a caller who had just opened
-/// one.
-///
-/// # Safety
-/// `element` must be a live AX element; every child copied here is released.
-unsafe fn popup_option_labels(element: AXUIElementRef) -> Vec<String> {
-    let mut options = Vec::new();
-    for child in copy_children(element) {
-        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
-            for item in copy_children(child) {
-                options.extend(popup_option_label(item));
-                CFRelease(item as _);
-            }
-        } else {
-            options.extend(popup_option_label(child));
-        }
-        CFRelease(child as _);
-    }
-    options
 }
 
 /// Why a dispatch the app never reacted to may still have been delivered.
@@ -2506,12 +2463,16 @@ fn perform_ax_click(
         summary.push_str(
             "\n\n⚠️ This is a popup/select button. Its menu is a surface of its own rather \
              than part of this window's subtree, and a native macOS menu closes as soon as \
-             the window stops being key. To choose an option without depending on an open \
-             menu, use:\n  set_value(pid, window_id, element_index, value)\n\
+             the window stops being key. To choose an option in one call — set_value opens \
+             the menu itself when it is closed and reads the choice back — use:\n  \
+             set_value(pid, window_id, element_index, value)\n\
              To work inside the menu instead, re-observe this window: an open menu is \
              rendered under this control.",
         );
-        let options = unsafe { popup_option_labels(element) };
+        let options: Vec<String> = unsafe { crate::ax::popup::copy_popup_options(element) }
+            .iter()
+            .map(crate::ax::popup::PopupOption::label)
+            .collect();
         if !options.is_empty() {
             summary.push_str("\nAvailable options: [");
             summary.push_str(&options.join(", "));

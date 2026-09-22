@@ -2875,6 +2875,85 @@ fn harness_appkit_date_picker_carries_its_value_and_whether_it_is_settable() {
     );
 }
 
+/// A closed native popup publishes no options: AppKit builds its menu's
+/// accessibility items only while the menu is open, so `set_value` used to
+/// refuse every closed popup outside Safari (calendar-recur, preview-rotate,
+/// automator: 13 failures, two turns each). One call now opens the menu,
+/// presses the option titled exactly `value`, reads the popup back and leaves
+/// no menu open; a near miss is refused with the options and closes the menu
+/// it opened.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_chooses_an_option_of_a_closed_popup() {
+    run_background_case_with_env(
+        "set_value_popup",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_APPKIT_MENU_POPOVER", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("popup_choice=none")
+                    && !before.tree_text().contains("15 minutes before"),
+                "the fixture did not start with its popup closed and unchosen:\n{}",
+                before.tree_text()
+            );
+
+            let near_miss = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "pop-menu"),
+                    "value": "15 Minutes Before"
+                }),
+            );
+            assert!(
+                near_miss.is_error() && near_miss.text().contains("\"15 minutes before\""),
+                "a title that differs in case must be refused with the real one: {}",
+                near_miss.raw
+            );
+            let refused = snapshot_elements(driver, pid, wid);
+            assert!(
+                refused.tree_text().contains("popup_choice=none")
+                    && !refused.tree_text().contains("AXMenuItem \"15 minutes before\""),
+                "a refused choice changed the app or left its menu open:\n{}",
+                refused.tree_text()
+            );
+
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&refused, "pop-menu"),
+                    "value": "15 minutes before"
+                }),
+            );
+            assert!(!set.is_error(), "set_value failed: {}", set.text());
+            assert_eq!(
+                set.action_effect(),
+                Some("confirmed"),
+                "the popup's read-back must confirm the choice: {}",
+                set.raw
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after.tree_text().contains("popup_choice=15 minutes before"),
+                "the app's own action never saw the choice:\n{}",
+                after.tree_text()
+            );
+            assert!(
+                !after.tree_text().contains("AXMenuItem \"15 minutes before\""),
+                "the menu the call opened is still open:\n{}",
+                after.tree_text()
+            );
+        },
+    );
+}
+
 /// An app-modal alert is a separate top-level window, not a sheet attached to
 /// the window it blocks, so no parent's child list contains it: the
 /// observation of the blocked window used to show nothing at all while every

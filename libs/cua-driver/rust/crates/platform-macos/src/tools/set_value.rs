@@ -1,12 +1,13 @@
 //! set_value tool — matches the Swift reference in SetValueTool.swift.
 //!
-//! Two modes, determined by the element's AXRole:
+//! The route is determined by the element:
 //!
-//! * **AXPopUpButton**: Find the child option whose AXTitle or AXValue matches
-//!   `value` (case-insensitive) and AXPress it directly.  The native macOS popup
-//!   menu is never opened, so focus is never stolen.  Falls back to Safari
-//!   `osascript do JavaScript` for WebKit `<select>` elements that expose no AX
-//!   children when the popup is closed.
+//! * **AXPopUpButton**: Choose the option whose title is exactly `value` from
+//!   the popup's `AXMenu`, opening a closed menu with the control's own
+//!   `AXPress`/`AXShowMenu`, press it, and read the popup's `AXValue` back.
+//!   A menu this call opened is closed again when the choice fails. A Safari
+//!   `<select>` whose menu publishes no options goes through
+//!   `osascript do JavaScript` instead.
 //!
 //! * **Native single-line text roles**: Replace the text through the keystroke
 //!   rung. An `AXValue` write neither starts nor ends an editing session, so a
@@ -31,14 +32,15 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_children, copy_element_attr, copy_number_attr, copy_string_attr,
-    kAXErrorSuccess, perform_action, release_all, set_number_attr, set_range_attr, set_string_attr,
-    AXUIElementRef,
+    copy_action_names, copy_bool_attr, copy_children, copy_element_attr, copy_number_attr,
+    copy_string_attr, kAXErrorSuccess, perform_action, release_all, set_number_attr,
+    set_range_attr, set_string_attr, AXUIElementRef,
 };
+use crate::ax::popup::{choose_option, copy_open_menu, copy_popup_options, OptionChoice};
 use crate::ax::RetainedElement;
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
-use core_foundation::base::{CFEqual, CFRelease, CFTypeRef};
+use core_foundation::base::{CFEqual, CFTypeRef};
 
 use super::ToolState;
 
@@ -58,13 +60,15 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_value".into(),
         description:
-            "Set a value on a UI element. Two modes depending on element role:\n\
+            "Set a value on a UI element. The route depends on the element:\n\
              \n\
-             - **AXPopUpButton / select dropdown**: finds the child option whose \
-             title or value matches `value` (case-insensitive) and AXPresses it \
-             directly — the native macOS popup menu is never opened, so focus \
-             is never stolen. Use this for HTML <select> elements in Safari or \
-             any native NSPopUpButton.\n\
+             - **AXPopUpButton / select dropdown**: chooses the option whose title \
+             is exactly `value` (an untitled web option goes by its value). A closed \
+             menu is opened with the control's own AXPress/AXShowMenu, the option is \
+             pressed, and the popup's value is read back; a menu this call opened is \
+             closed again when the choice fails. No match, or several options with \
+             that title, is refused with the option list. A Safari <select> whose \
+             menu publishes no options is set through the page's DOM.\n\
              \n\
              - **All other elements**: writes AXValue directly (sliders, steppers, \
              date pickers, native text fields that expose settable AXValue).\n\
@@ -104,7 +108,7 @@ fn def() -> &'static ToolDef {
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "value": {
                     "type": "string",
-                    "description": "New value. AX will coerce to the element's native type."
+                    "description": "New value: a popup's option by its exact title; otherwise the text or number to write."
                 },
                 "detect_window_change": { "type": "boolean", "description": "Default true: after the action the driver polls WindowServer for up to one second so the reply can name a window the action opened. Pass false when you enumerate windows yourself — the poll is then skipped (roughly a second off this call) and the reply carries no opened-window evidence." },
             },
@@ -252,6 +256,7 @@ impl Tool for SetValueTool {
                         window_id,
                         &value,
                         plan,
+                        ax_echo_surface,
                     )
                 })
                 .await
@@ -888,24 +893,14 @@ fn set_value_blocking(
     window_id: u32,
     value: &str,
     plan: WritePlan,
+    web_content: bool,
 ) -> anyhow::Result<SetValueOutcome> {
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
 
     if role == "AXPopUpButton" {
-        let element_title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-        // Menu-item selection, not an AXValue write — no read-back to report.
-        select_popup_option(element, element_index, pid, value, &element_title).map(|detail| {
-            SetValueOutcome {
-                detail,
-                verified: None,
-                changed: None,
-                committed: None,
-                path: "ax",
-                delivered: None,
-            }
-        })
+        select_popup_option(element, element_index, pid, value, web_content)
     } else if let WritePlan::Retype(end) = plan {
         retype_blocking(
             element,
@@ -1270,80 +1265,227 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
 
 // ── AXPopUpButton path ───────────────────────────────────────────────────────
 
+/// How long a closed popup has to build its menu items after the open action.
+const MENU_OPEN_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
+/// How long the popup has to show a pressed option as its value.
+const CHOICE_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long an open menu has to go away after `AXCancel`.
+const MENU_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+const MENU_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Choose one option of a popup, in one call.
+///
+/// A closed native popup publishes no options at all: AppKit builds its
+/// menu's accessibility items only while the menu is open. So a closed menu
+/// is opened with the control's own action, the option whose title is exactly
+/// `value` is pressed, and the popup's `AXValue` is read back — the read-back,
+/// not the press's return code, is what says the app took the choice (a menu
+/// can close under a window that is not key). A menu this call opened is
+/// closed again whenever no choice is made; one the caller opened is left as
+/// it was found.
 fn select_popup_option(
     element: AXUIElementRef,
     element_index: usize,
     pid: i32,
     value: &str,
-    element_title: &str,
-) -> anyhow::Result<String> {
-    let children = unsafe { copy_children(element) };
-
-    if !children.is_empty() {
-        // Strategy 1: AX children (native AppKit NSPopUpButton).
-        let value_lower = value.to_lowercase();
-        let mut matched_idx: Option<usize> = None;
-        let mut available: Vec<String> = Vec::with_capacity(children.len());
-
-        for (i, &child) in children.iter().enumerate() {
-            let child_title = unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_default();
-            let child_value = unsafe { copy_string_attr(child, "AXValue") }.unwrap_or_default();
-            available.push(child_title.clone());
-            if child_title.to_lowercase() == value_lower
-                || child_value.to_lowercase() == value_lower
-            {
-                matched_idx = Some(i);
-                break;
-            }
+    web_content: bool,
+) -> anyhow::Result<SetValueOutcome> {
+    let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+    let popup = if title.is_empty() {
+        format!("[{element_index}] AXPopUpButton")
+    } else {
+        format!("[{element_index}] AXPopUpButton \"{title}\"")
+    };
+    let before = unsafe { copy_string_attr(element, "AXValue") };
+    let mut options = unsafe { copy_popup_options(element) };
+    let mut opened = false;
+    if options.is_empty() {
+        // WebKit publishes no options for a closed `<select>`, and its DOM is
+        // reachable without a menu at all.
+        if web_content && apps::get_app_name_for_pid(pid).as_deref() == Some("Safari") {
+            let detail = set_select_via_js(element_index, &title, value)?;
+            return Ok(SetValueOutcome {
+                detail,
+                verified: None,
+                changed: None,
+                committed: None,
+                path: "ax",
+                delivered: None,
+            });
         }
-
-        let result = if let Some(i) = matched_idx {
-            let child = children[i];
-            let opt_title =
-                unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_else(|| value.to_string());
-            let err = unsafe { perform_action(child, "AXPress") };
-            if err == kAXErrorSuccess {
-                Ok(format!(
-                    "✅ Selected '{opt_title}' in AXPopUpButton [{element_index}] \
-                     \"{element_title}\" via AX child AXPress."
-                ))
-            } else {
-                anyhow::bail!("AXPress on child option failed with error {err}")
-            }
-        } else {
-            let avail = available
-                .iter()
-                .map(|t| format!("\"{t}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "No AX child matching '{value}' in AXPopUpButton [{element_index}] \
-                 \"{element_title}\". Available: [{avail}]"
-            )
-        };
-
-        // Release children (copy_children retains each one).
-        for &child in &children {
-            unsafe {
-                CFRelease(child as _);
-            }
-        }
-
-        return result;
+        options = open_popup_menu(element, &popup)?;
+        opened = true;
     }
 
-    // Strategy 2: Safari/WebKit — no AX children when popup is closed.
-    // Use osascript do JavaScript to set the <select> element's DOM value.
-    let app_name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
-
-    if app_name != "Safari" {
+    let listed = || {
+        options
+            .iter()
+            .map(|option| option.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let chosen = match choose_option(options.iter().map(|option| option.name()), value) {
+        OptionChoice::Unique(index) => &options[index],
+        OptionChoice::Missing { near } => {
+            let hint = near
+                .map(|index| format!(" (did you mean \"{}\"?)", options[index].name()))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "No option of {popup} is titled exactly \"{value}\"{hint}. Nothing was \
+                 selected. Options: [{options}].{menu}",
+                options = listed(),
+                menu = close_opened_menu(element, opened),
+            )
+        }
+        OptionChoice::Ambiguous => anyhow::bail!(
+            "Several options of {popup} are titled \"{value}\", so the title cannot say \
+             which one to choose. Nothing was selected. Options: [{options}].{menu}",
+            options = listed(),
+            menu = close_opened_menu(element, opened),
+        ),
+    };
+    let item = chosen.element.as_ptr() as AXUIElementRef;
+    if unsafe { copy_bool_attr(item, "AXEnabled") } == Some(false) {
         anyhow::bail!(
-            "AXPopUpButton [{element_index}] '{element_title}' has no AX children and \
-             target is '{app_name}' (not Safari) — no fallback available."
+            "Option \"{value}\" of {popup} is disabled, so the app does not offer it right \
+             now. Nothing was selected.{menu}",
+            menu = close_opened_menu(element, opened),
+        )
+    }
+    let err = unsafe { perform_action(item, "AXPress") };
+    if err != kAXErrorSuccess {
+        anyhow::bail!(
+            "AXPress on option \"{value}\" of {popup} failed with AX error {err}.{menu}",
+            menu = close_opened_menu(element, opened),
         )
     }
 
-    set_select_via_js(element_index, element_title, value)
+    let after = read_back_choice(element, chosen.name());
+    let verified = after.as_deref().map(|after| after == chosen.name());
+    let changed = match (before.as_deref(), after.as_deref()) {
+        (Some(before), Some(after)) => Some(before != after),
+        _ => None,
+    };
+    let detail = match (verified, changed) {
+        (Some(true), Some(false)) => format!(
+            "✅ Set {popup} to \"{value}\": it already read \"{value}\"; the choice was \
+             idempotent."
+        ),
+        (Some(true), _) => format!("✅ Set {popup} to \"{value}\"; it reads back \"{value}\"."),
+        (Some(false), _) => format!(
+            "✅ Set {popup}: pressed option \"{value}\", but the popup reads back \"{after}\". \
+             The app did not take the choice.{menu}",
+            after = after.as_deref().unwrap_or_default(),
+            menu = close_opened_menu(element, opened),
+        ),
+        (None, _) => format!(
+            "✅ Set {popup}: pressed option \"{value}\"; the popup publishes no readable \
+             value, so the choice could not be confirmed.{menu}",
+            menu = close_opened_menu(element, opened),
+        ),
+    };
+    Ok(SetValueOutcome {
+        detail,
+        verified,
+        changed,
+        committed: None,
+        path: "ax",
+        delivered: None,
+    })
+}
+
+/// Open a closed popup's menu and return its options once AppKit has built
+/// them. `AXPress` is what a click does; `AXShowMenu` is the other action
+/// AppKit popups answer, tried when the first one opens nothing.
+fn open_popup_menu(
+    element: AXUIElementRef,
+    popup: &str,
+) -> anyhow::Result<Vec<crate::ax::popup::PopupOption>> {
+    let advertised = unsafe { copy_action_names(element) };
+    let mut attempts = Vec::new();
+    for action in ["AXPress", "AXShowMenu"] {
+        if !advertised.is_empty() && !advertised.iter().any(|name| name == action) {
+            continue;
+        }
+        let err = unsafe { perform_action(element, action) };
+        if err != kAXErrorSuccess {
+            attempts.push(format!("{action} failed with AX error {err}"));
+            continue;
+        }
+        let deadline = std::time::Instant::now() + MENU_OPEN_WAIT;
+        loop {
+            let options = unsafe { copy_popup_options(element) };
+            if !options.is_empty() {
+                return Ok(options);
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(MENU_POLL);
+        }
+        // A menu that opened without options is closed before the next try,
+        // so the second action cannot toggle it shut instead.
+        close_popup_menu(element);
+        attempts.push(format!(
+            "{action} produced no options within {} ms",
+            MENU_OPEN_WAIT.as_millis()
+        ));
+    }
+    if attempts.is_empty() {
+        attempts.push(format!(
+            "it advertises neither AXPress nor AXShowMenu (actions: {})",
+            advertised.join(", ")
+        ));
+    }
+    anyhow::bail!(
+        "{popup} offers no options: its menu is closed and opening it did not publish \
+         any ({}). Nothing was selected.",
+        attempts.join("; ")
+    )
+}
+
+/// The popup's value once it shows `expected`, or whatever it settled on.
+fn read_back_choice(element: AXUIElementRef, expected: &str) -> Option<String> {
+    let deadline = std::time::Instant::now() + CHOICE_SETTLE_WAIT;
+    loop {
+        let after = unsafe { copy_string_attr(element, "AXValue") };
+        if after.as_deref() == Some(expected) || std::time::Instant::now() >= deadline {
+            return after;
+        }
+        std::thread::sleep(MENU_POLL);
+    }
+}
+
+/// Close the popup's open menu with the menu's own `AXCancel`. `true` once no
+/// menu is open.
+fn close_popup_menu(element: AXUIElementRef) -> bool {
+    let Some(menu) = (unsafe { copy_open_menu(element) }) else {
+        return true;
+    };
+    unsafe { perform_action(menu.as_ptr() as AXUIElementRef, "AXCancel") };
+    drop(menu);
+    let deadline = std::time::Instant::now() + MENU_CLOSE_WAIT;
+    loop {
+        if unsafe { copy_open_menu(element) }.is_none() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(MENU_POLL);
+    }
+}
+
+/// Close a menu this call opened, and say what state it was left in. A menu
+/// the caller had open is theirs: it is left, and nothing is said.
+fn close_opened_menu(element: AXUIElementRef, opened: bool) -> &'static str {
+    if !opened || unsafe { copy_open_menu(element) }.is_none() {
+        ""
+    } else if close_popup_menu(element) {
+        " The menu this call opened was closed again."
+    } else {
+        " The menu this call opened is still open: it did not answer AXCancel."
+    }
 }
 
 // ── Safari JavaScript fallback ───────────────────────────────────────────────
