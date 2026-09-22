@@ -568,6 +568,21 @@ pub(crate) fn background_refusal_result(
             });
         }
     }
+    // `same_pid_keyboard_ambiguity` only; absent on every other refusal. A
+    // row's `title` is absent when WindowServer published none for it.
+    if !refusal.competing_windows.is_empty() {
+        structured["competing_windows"] = refusal
+            .competing_windows
+            .iter()
+            .map(|window| {
+                let mut row = serde_json::json!({ "window_id": window.window_id });
+                if let Some(title) = &window.title {
+                    row["title"] = serde_json::json!(title);
+                }
+                row
+            })
+            .collect();
+    }
     cua_driver_core::protocol::ToolResult::error(format!(
         "Background input refused ({}): {}",
         refusal.code, refusal.reason

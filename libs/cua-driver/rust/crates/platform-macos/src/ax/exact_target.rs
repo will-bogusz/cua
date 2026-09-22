@@ -9,7 +9,7 @@
 
 use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::background_input::{
-    BackgroundTargetFacts, ElementAncestry, WindowServerOwnership,
+    BackgroundTargetFacts, CompetingWindow, ElementAncestry, WindowServerOwnership,
 };
 use std::ffi::CStr;
 
@@ -590,7 +590,8 @@ pub fn focused_owned_child_surface(pid: i32, target_window_id: u32) -> Option<u3
     }
 }
 
-/// Count independently AX-mapped, non-minimized sibling top-level windows.
+/// The independently AX-mapped, non-minimized sibling top-level windows, by
+/// CGWindowID.
 ///
 /// WindowServer may expose several layer-0 compositor surfaces for one native
 /// Electron, Tauri, or WebKit window. A raw same-pid CGWindow row is therefore
@@ -602,12 +603,12 @@ pub fn focused_owned_child_surface(pid: i32, target_window_id: u32) -> Option<u3
 /// application that publishes its inline editor in `AXWindows` as a control
 /// (see [`is_owned_child_surface`]) has not gained a second keyboard
 /// destination. A sheet has: it keeps its window role and stays counted.
-fn count_competing_keyboard_destinations(
+fn competing_keyboard_destinations(
     pid: i32,
     target_window_id: u32,
     window_server_rows: &[SurfaceRow],
     ax_records: &[AxWindowRecord],
-) -> usize {
+) -> Vec<u32> {
     let target_frame = window_server_rows
         .iter()
         .find(|row| row.window_id == target_window_id)
@@ -626,7 +627,8 @@ fn count_competing_keyboard_destinations(
                     is_owned_child_surface(row, target_window_id, &target_frame, ax_records)
                 })
         })
-        .count()
+        .map(|row| row.window_id)
+        .collect()
 }
 
 /// Whether `element`'s accessibility reference is no longer valid: the
@@ -725,9 +727,21 @@ pub fn gather_background_facts(
     };
 
     let target = records.iter().find(|record| record.window_id == window_id);
-    let rows: Vec<SurfaceRow> = all_windows().iter().map(SurfaceRow::from).collect();
+    let windows = all_windows();
+    let rows: Vec<SurfaceRow> = windows.iter().map(SurfaceRow::from).collect();
     let competing_keyboard_destinations =
-        count_competing_keyboard_destinations(pid, window_id, &rows, &records);
+        competing_keyboard_destinations(pid, window_id, &rows, &records)
+            .into_iter()
+            .map(|competing_id| CompetingWindow {
+                window_id: competing_id,
+                title: windows
+                    .iter()
+                    .find(|window| window.window_id == competing_id)
+                    .map(|window| window.title.trim())
+                    .filter(|title| !title.is_empty())
+                    .map(str::to_owned),
+            })
+            .collect();
 
     BackgroundTargetFacts {
         window_server,
@@ -742,7 +756,7 @@ pub fn gather_background_facts(
 #[cfg(test)]
 mod tests {
     use super::{
-        count_competing_keyboard_destinations, matches_hosted_panel, AxWindowRecord, Frame,
+        competing_keyboard_destinations, matches_hosted_panel, AxWindowRecord, Frame,
         SurfaceRole, SurfaceRow,
     };
 
@@ -816,7 +830,7 @@ mod tests {
         let records = [ax_window(10, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             0
         );
     }
@@ -827,7 +841,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             1
         );
     }
@@ -838,24 +852,25 @@ mod tests {
         let mut overlay = ax_window(11, Some(false));
         overlay.system_sharing_overlay = true;
         assert_eq!(
-            count_competing_keyboard_destinations(
+            competing_keyboard_destinations(
                 42,
                 10,
                 &rows,
                 &[ax_window(10, Some(false)), overlay]
-            ),
+            ).len(),
             0
         );
         let mut overlay = ax_window(11, Some(false));
         overlay.system_sharing_overlay = true;
         assert_eq!(
-            count_competing_keyboard_destinations(
+            competing_keyboard_destinations(
                 42,
                 10,
                 &rows,
                 &[ax_window(10, Some(false)), overlay, ax_window(12, None)],
             ),
-            1
+            [12],
+            "the refusal names the real sibling, never the sharing overlay"
         );
     }
 
@@ -865,7 +880,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(true))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             0
         );
     }
@@ -876,7 +891,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             0
         );
     }
@@ -892,7 +907,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), hosted_control(11)];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             0
         );
     }
@@ -907,7 +922,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             1
         );
     }
@@ -923,7 +938,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), hosted_control(11)];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             1
         );
     }
@@ -939,7 +954,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), hosted_control(11)];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             1
         );
     }
@@ -952,7 +967,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), hosted_control(11)];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, &rows, &records),
+            competing_keyboard_destinations(42, 10, &rows, &records).len(),
             1
         );
     }

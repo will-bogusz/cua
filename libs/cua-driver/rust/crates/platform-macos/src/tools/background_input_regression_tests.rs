@@ -147,3 +147,65 @@ async fn pid_only_keyboard_refuses_same_pid_multi_window_ambiguity_before_dispat
     assert_eq!(refusal["candidates"][0]["window_id"], 7);
     assert_eq!(refusal["candidates"][1]["window_id"], 8);
 }
+
+/// The ambiguity refusal names the windows that could take the keys, and a
+/// row carries a title only when WindowServer published one: a consumer must
+/// never read `null` or `""` as a title. Every other refusal carries no key.
+#[test]
+fn keyboard_ambiguity_refusal_names_its_competing_windows() {
+    use cua_driver_core::background_input::{
+        decide_background_input, BackgroundAction, BackgroundInputDecision,
+        BackgroundTargetFacts, CompetingWindow, ElementAncestry, ExactWindowTarget,
+        WindowServerOwnership,
+    };
+    let facts = BackgroundTargetFacts {
+        window_server: WindowServerOwnership::SamePid,
+        ax_window_present: true,
+        target_minimized: Some(false),
+        app_hidden: Some(false),
+        competing_keyboard_destinations: vec![
+            CompetingWindow {
+                window_id: 37369,
+                title: Some("Recents".into()),
+            },
+            CompetingWindow {
+                window_id: 37370,
+                title: None,
+            },
+        ],
+        element: ElementAncestry::NotAddressed,
+    };
+    let target = ExactWindowTarget {
+        pid: 900,
+        window_id: 30175,
+    };
+    let decide = |facts: &BackgroundTargetFacts| {
+        let BackgroundInputDecision::Refuse(refusal) =
+            decide_background_input(target, facts, BackgroundAction::GenericKey)
+        else {
+            panic!("keys must refuse");
+        };
+        background_refusal_result(900, 30175, &refusal)
+            .structured_content
+            .expect("structured refusal")
+    };
+
+    let refused = decide(&facts);
+    assert_eq!(refused["code"], "same_pid_keyboard_ambiguity");
+    assert_eq!(
+        refused["competing_windows"],
+        serde_json::json!([
+            { "window_id": 37369, "title": "Recents" },
+            { "window_id": 37370 }
+        ])
+    );
+    assert_eq!(refused["escalation"]["target"], "foreground");
+
+    let hidden = BackgroundTargetFacts {
+        app_hidden: Some(true),
+        ..facts
+    };
+    let refused = decide(&hidden);
+    assert_eq!(refused["code"], "minimized_or_hidden_window");
+    assert!(refused.get("competing_windows").is_none(), "{refused}");
+}

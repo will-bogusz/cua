@@ -1328,6 +1328,7 @@ fn semantic_only_refusal(
             refusal.reason
         ),
         advice: refusal.advice,
+        competing_windows: refusal.competing_windows,
     }
 }
 
@@ -2499,6 +2500,7 @@ mod tests {
             code: cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
             reason: "test".into(),
             advice: None,
+            competing_windows: Vec::new(),
         };
         let r = type_text_blocking(
             -1,
@@ -2876,6 +2878,10 @@ mod tests {
                      with an exact element action, or request foreground delivery"
                 .into(),
             advice: Some(cua_driver_core::background_input::BackgroundAdvice::Element),
+            competing_windows: vec![cua_driver_core::background_input::CompetingWindow {
+                window_id: 30713,
+                title: None,
+            }],
         }
     }
 

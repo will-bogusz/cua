@@ -789,7 +789,7 @@ mod tests {
             ax_window_present: true,
             target_minimized: Some(false),
             app_hidden: Some(false),
-            competing_keyboard_destinations: 0,
+            competing_keyboard_destinations: Vec::new(),
             element: ElementAncestry::OutsideTargetWindow {
                 pid: Some(42),
                 window_id: 8,

@@ -101,9 +101,20 @@ pub struct BackgroundTargetFacts {
     /// process-scoped keyboard input (enumerated from WindowServer so an
     /// off-Space sibling that AX cannot see still counts; proven-minimized
     /// siblings are excluded because they cannot be the key window).
-    pub competing_keyboard_destinations: usize,
+    pub competing_keyboard_destinations: Vec<CompetingWindow>,
     /// Ancestry proof for an explicitly addressed element, when one exists.
     pub element: ElementAncestry,
+}
+
+/// A same-pid top-level window that could take process-scoped keyboard input
+/// away from the target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompetingWindow {
+    pub window_id: u32,
+    /// The title WindowServer publishes for the window. `None` when it
+    /// publishes none: an untitled window, or a driver process without the
+    /// Screen Recording grant WindowServer requires before it shares titles.
+    pub title: Option<String>,
 }
 
 /// The background action classes v1 distinguishes. Route order and trust are
@@ -189,6 +200,9 @@ pub struct BackgroundRefusal {
     /// The safe next route when one actually exists (advice for an explicit
     /// caller decision, never an implicit fallback).
     pub advice: Option<BackgroundAdvice>,
+    /// `same_pid_keyboard_ambiguity` only: the windows that could take the
+    /// keys instead of the target. Empty on every other refusal.
+    pub competing_windows: Vec<CompetingWindow>,
 }
 
 /// Verification binding for an executed route: evidence is acceptable only
@@ -233,6 +247,7 @@ fn refuse(
         code,
         reason,
         advice,
+        competing_windows: Vec::new(),
     })
 }
 
@@ -432,7 +447,8 @@ pub fn decide_background_input(
                 );
             }
             debug_assert!(action.is_pid_keyboard());
-            if facts.competing_keyboard_destinations > 0 {
+            let competing = &facts.competing_keyboard_destinations;
+            if !competing.is_empty() {
                 // Text has an exact element route (an AX value write) that no
                 // sibling window can intercept. A key or chord has none: its
                 // effect is whatever the focused control binds it to, and only
@@ -449,16 +465,27 @@ pub fn decide_background_input(
                          keys are sent",
                     ),
                 };
-                return refuse(
-                    refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
-                    format!(
-                        "pid {} owns {} other eligible top-level window(s); process-scoped \
-                         key events cannot be proven to reach window {} and could mutate a \
-                         sibling window. {next}",
-                        target.pid, facts.competing_keyboard_destinations, target.window_id
+                let named = competing
+                    .iter()
+                    .map(|window| match &window.title {
+                        Some(title) => format!("{} \"{title}\"", window.window_id),
+                        None => window.window_id.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return BackgroundInputDecision::Refuse(BackgroundRefusal {
+                    code: refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+                    reason: format!(
+                        "pid {} owns {} other eligible top-level window(s) [{named}]; \
+                         process-scoped key events cannot be proven to reach window {} and \
+                         could mutate a sibling window. {next}",
+                        target.pid,
+                        competing.len(),
+                        target.window_id,
                     ),
-                    Some(advice),
-                );
+                    advice: Some(advice),
+                    competing_windows: competing.clone(),
+                });
             }
             BackgroundInputDecision::Execute {
                 verification: TargetBoundVerification {
@@ -539,7 +566,7 @@ mod tests {
             ax_window_present: true,
             target_minimized: Some(false),
             app_hidden: Some(false),
-            competing_keyboard_destinations: 0,
+            competing_keyboard_destinations: Vec::new(),
             element: ElementAncestry::NotAddressed,
         }
     }
@@ -597,8 +624,16 @@ mod tests {
     /// explicit `window_id` is an address, not delivery proof.
     #[test]
     fn two_window_process_refuses_background_keyboard_for_both_text_and_keys() {
+        let sibling = CompetingWindow {
+            window_id: 701,
+            title: Some("Untitled 2".into()),
+        };
+        let untitled = CompetingWindow {
+            window_id: 702,
+            title: None,
+        };
         let facts = BackgroundTargetFacts {
-            competing_keyboard_destinations: 1,
+            competing_keyboard_destinations: vec![sibling.clone(), untitled.clone()],
             ..matched_facts()
         };
         for (action, advice) in [
@@ -614,6 +649,14 @@ mod tests {
             // Text has an element route no sibling can intercept; a key or
             // chord does not, so its only safe next route is foreground.
             assert_eq!(refusal.advice, Some(advice), "{action:?}");
+            // The refusal names the windows that could take the keys, so a
+            // stray window is visible to whoever reads the reply.
+            assert_eq!(refusal.competing_windows, [sibling.clone(), untitled.clone()]);
+            assert!(
+                refusal.reason.contains("[701 \"Untitled 2\", 702]"),
+                "{}",
+                refusal.reason
+            );
         }
         // Semantic AX and the stamped window-local pointer remain available:
         // they are window-addressed, not process-addressed.
@@ -997,7 +1040,13 @@ mod tests {
             ax_window_present: false,
             target_minimized: Some(true),
             app_hidden: Some(true),
-            competing_keyboard_destinations: 3,
+            competing_keyboard_destinations: vec![
+                CompetingWindow {
+                    window_id: 702,
+                    title: None,
+                };
+                3
+            ],
             element: ElementAncestry::OutsideTargetWindow {
                 pid: Some(9),
                 window_id: 701,
@@ -1078,7 +1127,10 @@ mod tests {
         assert_eq!(report["observation"]["one_shot_capture"], "unavailable");
 
         let two_windows = BackgroundTargetFacts {
-            competing_keyboard_destinations: 1,
+            competing_keyboard_destinations: vec![CompetingWindow {
+                window_id: 701,
+                title: None,
+            }],
             ..matched_facts()
         };
         let report = background_input_capability_report(TARGET, &two_windows, None);
