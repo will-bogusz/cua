@@ -283,7 +283,13 @@ impl Tool for SetValueTool {
                 apply_verification_label(&mut outcome);
                 let mut msg = std::mem::take(&mut outcome.detail);
                 msg.push_str(&changes.result_suffix());
-                ToolResult::text(msg).with_action_record(action_record(&outcome, ax_echo_surface))
+                // The record is built here; the structured payload only
+                // carries the appeared windows core adopts into it.
+                let mut structured = serde_json::json!({});
+                changes.publish_gained_windows(&mut structured);
+                ToolResult::text(msg)
+                    .with_structured(structured)
+                    .with_action_record(action_record(&outcome, ax_echo_surface))
             }
             Ok(Err(e)) => ToolResult::error(format!("set_value failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
