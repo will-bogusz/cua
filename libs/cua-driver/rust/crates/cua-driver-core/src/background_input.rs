@@ -433,16 +433,31 @@ pub fn decide_background_input(
             }
             debug_assert!(action.is_pid_keyboard());
             if facts.competing_keyboard_destinations > 0 {
+                // Text has an exact element route (an AX value write) that no
+                // sibling window can intercept. A key or chord has none: its
+                // effect is whatever the focused control binds it to, and only
+                // foreground delivery makes the target window key first.
+                let (advice, next) = match action {
+                    BackgroundAction::InsertText => (
+                        BackgroundAdvice::Element,
+                        "Address the field itself with an exact element action, or request \
+                         foreground delivery",
+                    ),
+                    _ => (
+                        BackgroundAdvice::Foreground,
+                        "Request foreground delivery, which makes the window key before the \
+                         keys are sent",
+                    ),
+                };
                 return refuse(
                     refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
                     format!(
                         "pid {} owns {} other eligible top-level window(s); process-scoped \
                          key events cannot be proven to reach window {} and could mutate a \
-                         sibling window. Address the field itself with an exact element \
-                         action, or request foreground delivery",
+                         sibling window. {next}",
                         target.pid, facts.competing_keyboard_destinations, target.window_id
                     ),
-                    Some(BackgroundAdvice::Element),
+                    Some(advice),
                 );
             }
             BackgroundInputDecision::Execute {
@@ -586,12 +601,19 @@ mod tests {
             competing_keyboard_destinations: 1,
             ..matched_facts()
         };
-        for action in [BackgroundAction::InsertText, BackgroundAction::GenericKey] {
-            assert_eq!(
-                code_of(decide_background_input(TARGET, &facts, action)),
-                refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
-                "{action:?} must refuse while a sibling keyboard destination exists"
-            );
+        for (action, advice) in [
+            (BackgroundAction::InsertText, BackgroundAdvice::Element),
+            (BackgroundAction::GenericKey, BackgroundAdvice::Foreground),
+        ] {
+            let BackgroundInputDecision::Refuse(refusal) =
+                decide_background_input(TARGET, &facts, action)
+            else {
+                panic!("{action:?} must refuse while a sibling keyboard destination exists");
+            };
+            assert_eq!(refusal.code, refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY);
+            // Text has an element route no sibling can intercept; a key or
+            // chord does not, so its only safe next route is foreground.
+            assert_eq!(refusal.advice, Some(advice), "{action:?}");
         }
         // Semantic AX and the stamped window-local pointer remain available:
         // they are window-addressed, not process-addressed.
