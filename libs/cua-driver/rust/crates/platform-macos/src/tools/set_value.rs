@@ -9,6 +9,10 @@
 //!   `<select>` whose menu publishes no options goes through
 //!   `osascript do JavaScript` instead.
 //!
+//! * **Date and time controls** (the value is a `CFDate`): parse the ISO-8601
+//!   `value` (`crate::ax::date`) and write it as a `CFDate`; the keystroke
+//!   rung is only the fallback for a control that refuses that write.
+//!
 //! * **Native single-line text roles**: Replace the text through the keystroke
 //!   rung. An `AXValue` write neither starts nor ends an editing session, so a
 //!   control whose value is a binding target keeps its own value while every
@@ -32,9 +36,10 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_bool_attr, copy_children, copy_element_attr, copy_number_attr,
-    copy_string_attr, kAXErrorSuccess, perform_action, release_all, set_number_attr,
-    set_range_attr, set_string_attr, AXUIElementRef,
+    copy_action_names, copy_bool_attr, copy_children, copy_date_attr, copy_element_attr,
+    copy_number_attr, copy_string_attr, kAXErrorSuccess, local_iso8601_for_absolute_time,
+    perform_action, release_all, set_date_attr, set_number_attr, set_range_attr, set_string_attr,
+    AXUIElementRef,
 };
 use crate::ax::popup::{choose_option, copy_open_menu, copy_popup_options, OptionChoice};
 use crate::ax::RetainedElement;
@@ -70,8 +75,14 @@ fn def() -> &'static ToolDef {
              that title, is refused with the option list. A Safari <select> whose \
              menu publishes no options is set through the page's DOM.\n\
              \n\
+             - **Date and time controls** (the value is a CFDate, which the tree \
+             renders as ISO-8601): `value` is ISO-8601. YYYY-MM-DD changes the day \
+             and keeps the control's time of day; YYYY-MM-DDTHH:MM[:SS] is local \
+             time; append Z or ±HH:MM for an exact instant. Written as a CFDate and \
+             read back; typed only when the control refuses that write.\n\
+             \n\
              - **All other elements**: writes AXValue directly (sliders, steppers, \
-             date pickers, native text fields that expose settable AXValue).\n\
+             native text fields that expose settable AXValue).\n\
              \n\
              For free-form text entry into web inputs, prefer `type_text_chars` \
              which synthesises key events — AXValue writes are ignored by WebKit.\n\
@@ -108,7 +119,7 @@ fn def() -> &'static ToolDef {
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "value": {
                     "type": "string",
-                    "description": "New value: a popup's option by its exact title; otherwise the text or number to write."
+                    "description": "New value: a popup's option by its exact title; an ISO-8601 date or date-time for a date control; otherwise the text or number to write."
                 },
                 "detect_window_change": { "type": "boolean", "description": "Default true: after the action the driver polls WindowServer for up to one second so the reply can name a window the action opened. Pass false when you enumerate windows yourself — the poll is then skipped (roughly a second off this call) and the reply carries no opened-window evidence." },
             },
@@ -353,6 +364,19 @@ enum WritePlan {
     Retype(&'static str),
     /// No route exists, or one was refused before dispatch.
     Blocked(String),
+    /// The control's value is a `CFDate`: write the parsed ISO-8601 value as
+    /// one, and reach for the keystroke rung only when that write is refused.
+    Date(DateFallback),
+}
+
+/// What a date control that refuses a `CFDate` write is left with, decided
+/// before dispatch like every other keystroke route.
+#[derive(Debug, PartialEq, Eq)]
+enum DateFallback {
+    /// Type the value through the keystroke rung, ending the edit with this key.
+    Retype(&'static str),
+    /// The keystroke gate refused the rung; this is its reason.
+    Refused(String),
 }
 
 /// Settle time between the commit gesture and the read-back that judges it.
@@ -414,13 +438,14 @@ async fn resolve_write_plan(
             "web content never observes an AXValue write, so there is nothing to commit".to_owned(),
         );
     }
-    let Ok((role, subrole, advertised)) =
+    let Ok((role, subrole, advertised, holds_date)) =
         cua_driver_core::operation::spawn_blocking(move || unsafe {
             let element = element_ptr as AXUIElementRef;
             (
                 copy_string_attr(element, "AXRole").unwrap_or_default(),
                 copy_string_attr(element, "AXSubrole").unwrap_or_default(),
                 copy_action_names(element),
+                copy_date_attr(element, "AXValue").is_some(),
             )
         })
         .await
@@ -429,8 +454,15 @@ async fn resolve_write_plan(
             "the element stopped answering AX reads before the write".to_owned(),
         );
     };
-    let plan = write_plan(&role, &subrole, &advertised, value);
-    if matches!(plan, WritePlan::ValueThenKey(_) | WritePlan::Retype(_)) {
+    let plan = if holds_date {
+        WritePlan::Date(DateFallback::Retype("tab"))
+    } else {
+        write_plan(&role, &subrole, &advertised, value)
+    };
+    if matches!(
+        plan,
+        WritePlan::ValueThenKey(_) | WritePlan::Retype(_) | WritePlan::Date(_)
+    ) {
         if let Err(refusal) = lease
             .gate_again(
                 window_id,
@@ -439,6 +471,9 @@ async fn resolve_write_plan(
             )
             .await
         {
+            if matches!(plan, WritePlan::Date(_)) {
+                return WritePlan::Date(DateFallback::Refused(keystroke_refusal_reason(&refusal)));
+            }
             return refused_keystroke_plan(&plan, &advertised, &refusal);
         }
     }
@@ -656,6 +691,7 @@ fn commit_written_value(
             None,
         ),
         WritePlan::Retype(_) => unreachable!("the retype route does not write AXValue"),
+        WritePlan::Date(_) => unreachable!("the date route writes a CFDate, never a string"),
         WritePlan::ValueThenConfirm => {
             let dispatched = unsafe { perform_action(element, "AXConfirm") } == kAXErrorSuccess;
             // A value the control already held survives any gesture, so only a
@@ -901,6 +937,17 @@ fn set_value_blocking(
 
     if role == "AXPopUpButton" {
         select_popup_option(element, element_index, pid, value, web_content)
+    } else if let WritePlan::Date(fallback) = plan {
+        write_date_blocking(
+            element,
+            element_ptr,
+            element_index,
+            pid,
+            window_id,
+            value,
+            fallback,
+            &role,
+        )
     } else if let WritePlan::Retype(end) = plan {
         retype_blocking(
             element,
@@ -1486,6 +1533,123 @@ fn close_opened_menu(element: AXUIElementRef, opened: bool) -> &'static str {
     } else {
         " The menu this call opened is still open: it did not answer AXCancel."
     }
+}
+
+// ── Date and time controls ──────────────────────────────────────────────────
+
+/// Write a date or time control's `CFDate` from an ISO-8601 `value`.
+///
+/// The control publishes its value only as a `CFDate` and refuses a
+/// `CFString` carrying the same date, so the value is parsed
+/// (`crate::ax::date`, local time unless an offset is given) and written as a
+/// `CFDate`, then read back as one. The keystroke rung is used only when the
+/// control refuses that write; a value that is not ISO-8601 is refused before
+/// anything is written, naming the forms that are accepted.
+#[allow(clippy::too_many_arguments)]
+fn write_date_blocking(
+    element: AXUIElementRef,
+    element_ptr: usize,
+    element_index: usize,
+    pid: i32,
+    window_id: u32,
+    value: &str,
+    fallback: DateFallback,
+    role: &str,
+) -> anyhow::Result<SetValueOutcome> {
+    use crate::ax::date::{parse_iso8601, ACCEPTED_FORMS};
+
+    let before = unsafe { copy_date_attr(element, "AXValue") };
+    let render = |absolute: Option<f64>| absolute.and_then(local_iso8601_for_absolute_time);
+    let Some(request) = parse_iso8601(value) else {
+        let reads = render(before)
+            .map(|current| format!(" It reads {current} now."))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "[{element_index}] {role} holds a date, and \"{value}\" is not an ISO-8601 date: \
+             write {ACCEPTED_FORMS}. Nothing was written.{reads}"
+        )
+    };
+    let Some(target) = request.absolute_time(before) else {
+        anyhow::bail!(
+            "\"{value}\" names a local time this Mac's calendar cannot place. Nothing was \
+             written."
+        )
+    };
+    let judge = |after: Option<f64>| {
+        let verified = after.map(|after| request.is_held_by(target, after));
+        let changed = match (before, after) {
+            (Some(before), Some(after)) => Some((after - before).abs() >= 1e-3),
+            _ => None,
+        };
+        (verified, changed)
+    };
+
+    let err = unsafe { set_date_attr(element, "AXValue", target) };
+    if err == kAXErrorSuccess {
+        let after = unsafe { copy_date_attr(element, "AXValue") };
+        let (verified, changed) = judge(after);
+        let reads = render(after).unwrap_or_default();
+        let detail = match (verified, changed) {
+            (Some(true), Some(false)) => format!(
+                "✅ Set [{element_index}] {role}: it already read {reads}; the write was \
+                 idempotent."
+            ),
+            (Some(true), _) => format!("✅ Set [{element_index}] {role} to {reads}."),
+            (Some(false), _) => format!(
+                "✅ Set [{element_index}] {role}, but it reads back {reads}, not \"{value}\"."
+            ),
+            (None, _) => format!(
+                "✅ Set [{element_index}] {role}; its value is no longer a readable date, so \
+                 the write could not be confirmed."
+            ),
+        };
+        return Ok(SetValueOutcome {
+            detail,
+            verified,
+            changed,
+            committed: None,
+            path: "ax",
+            delivered: None,
+        });
+    }
+
+    let end = match fallback {
+        DateFallback::Retype(end) => end,
+        DateFallback::Refused(reason) => anyhow::bail!(
+            "[{element_index}] {role} refused a CFDate write (AX error {err}), and the \
+             keystroke fallback is unavailable: {reason}. Nothing was written."
+        ),
+    };
+    let mut outcome = retype_blocking(
+        element,
+        element_ptr,
+        element_index,
+        pid,
+        window_id,
+        value,
+        end,
+        role,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "[{element_index}] {role} refused a CFDate write (AX error {err}), and typing \
+             the value failed too: {error}"
+        )
+    })?;
+    // The typed route judged a string read-back, which a date control never
+    // publishes; the date it holds now is the evidence.
+    let after = unsafe { copy_date_attr(element, "AXValue") };
+    (outcome.verified, outcome.changed) = judge(after);
+    outcome.detail = format!(
+        "{} It refused a CFDate write (AX error {err}), so the value was typed; {}",
+        outcome.detail,
+        match (outcome.verified, render(after)) {
+            (Some(true), Some(reads)) => format!("it reads back {reads}."),
+            (Some(false), Some(reads)) => format!("it reads back {reads}, not \"{value}\"."),
+            _ => "its date is not readable, so the value could not be confirmed.".to_owned(),
+        }
+    );
+    Ok(outcome)
 }
 
 // ── Safari JavaScript fallback ───────────────────────────────────────────────

@@ -516,6 +516,12 @@ fn local_iso8601(unix_seconds: i64) -> Option<String> {
     Some(format_local_iso8601(&components))
 }
 
+/// A `CFAbsoluteTime` rendered exactly as the tree renders a `CFDate` value,
+/// so a reply quoting a date read-back matches the observation's own text.
+pub fn local_iso8601_for_absolute_time(absolute: f64) -> Option<String> {
+    unix_seconds_for_absolute_time(absolute).and_then(local_iso8601)
+}
+
 fn format_local_iso8601(components: &libc::tm) -> String {
     let offset_minutes = components.tm_gmtoff / 60;
     let sign = if offset_minutes < 0 { '-' } else { '+' };
@@ -1054,6 +1060,43 @@ pub unsafe fn set_number_attr(element: AXUIElementRef, attr_name: &str, value: f
     use core_foundation::number::CFNumber;
     let attr = CFStr::new(attr_name);
     let cf_value = CFNumber::from(value);
+    AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
+}
+
+/// Copy an attribute whose value is a `CFDate`, as its `CFAbsoluteTime`
+/// (seconds since 2001-01-01 00:00:00 UTC). `None` when the read fails or the
+/// value is any other CF type — which is how a caller tells a date control
+/// from a text control that merely displays a date.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn copy_date_attr(element: AXUIElementRef, attr_name: &str) -> Option<f64> {
+    use core_foundation::date::CFDate;
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    if core_foundation::base::CFGetTypeID(value) != CFDate::type_id() {
+        CFRelease(value);
+        return None;
+    }
+    Some(CFDate::wrap_under_create_rule(value as _).abs_time())
+}
+
+/// Set an AX attribute to a `CFDate` built from a `CFAbsoluteTime`. Date and
+/// time controls publish their value only as a `CFDate` and refuse a
+/// `CFString` carrying the same instant.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn set_date_attr(element: AXUIElementRef, attr_name: &str, absolute: f64) -> AXError {
+    use core_foundation::date::CFDate;
+    let attr = CFStr::new(attr_name);
+    let cf_value = CFDate::new(absolute);
     AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
 }
 

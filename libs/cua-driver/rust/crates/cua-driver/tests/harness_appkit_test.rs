@@ -2954,6 +2954,106 @@ fn harness_appkit_set_value_chooses_an_option_of_a_closed_popup() {
     );
 }
 
+/// A date control's value is a `CFDate`, and the tree prints it as ISO-8601.
+/// `set_value` used to write that text as a `CFString`, which the control
+/// refuses (calendar-recur: 4/4 runs, each a 5-7 call detour). The ISO-8601
+/// value is now written as a `CFDate`: a date-time is local time and lands
+/// as the wall clock the control shows, a date alone keeps the control's time
+/// of day, and anything that is not ISO-8601 is refused before a write.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_writes_a_date_control_as_a_cfdate() {
+    run_background_case_with_env(
+        "set_value_date",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_APPKIT_DATE_PICKER", "1")],
+        |pid, wid, driver| {
+            let date_area = |snapshot: &ToolResponse| {
+                element_where(snapshot, |element| {
+                    matches!(
+                        element["role"].as_str(),
+                        Some("AXDateTimeArea") | Some("AXDateField") | Some("AXTimeField")
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no date/time element in the snapshot:\n{}",
+                        snapshot.tree_text()
+                    )
+                })
+            };
+            let write = |driver: &mut McpDriver, value: &str| {
+                let snapshot = snapshot_elements(driver, pid, wid);
+                let token = date_area(&snapshot)["element_token"]
+                    .as_str()
+                    .expect("date control element_token")
+                    .to_owned();
+                driver.call(
+                    "set_value",
+                    serde_json::json!({
+                        "pid": pid as i64,
+                        "window_id": wid,
+                        "element_token": token,
+                        "value": value
+                    }),
+                )
+            };
+
+            let refused = write(driver, "12/21/26");
+            assert!(
+                refused.is_error() && refused.text().contains("ISO-8601"),
+                "a locale-order date must be refused with the accepted forms: {}",
+                refused.raw
+            );
+            let unchanged = snapshot_elements(driver, pid, wid);
+            assert!(
+                date_area(&unchanged)["value"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("2026-09-25T17:00:00"),
+                "a refused value was written anyway:\n{}",
+                unchanged.tree_text()
+            );
+
+            let set = write(driver, "2026-12-21T09:30");
+            assert!(!set.is_error(), "set_value failed: {}", set.text());
+            assert_eq!(
+                set.action_effect(),
+                Some("confirmed"),
+                "the CFDate read-back must confirm the write: {}",
+                set.raw
+            );
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                date_area(&after)["value"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("2026-12-21T09:30:00"),
+                "a date-time without offset must land as the local wall clock:\n{}",
+                after.tree_text()
+            );
+            assert!(
+                after.tree_text().contains("date_value=2026-12-21 09:30"),
+                "the control holds the date but the app's own action never read it:\n{}",
+                after.tree_text()
+            );
+
+            let day_only = write(driver, "2026-12-24");
+            assert!(!day_only.is_error(), "set_value failed: {}", day_only.text());
+            let moved = snapshot_elements(driver, pid, wid);
+            assert!(
+                date_area(&moved)["value"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("2026-12-24T09:30:00"),
+                "a date alone must keep the control's time of day:\n{}",
+                moved.tree_text()
+            );
+        },
+    );
+}
+
 /// An app-modal alert is a separate top-level window, not a sheet attached to
 /// the window it blocks, so no parent's child list contains it: the
 /// observation of the blocked window used to show nothing at all while every

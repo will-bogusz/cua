@@ -20,6 +20,7 @@ pub mod actions;
 pub mod bindings;
 pub(crate) mod budget;
 pub mod cache;
+pub mod date;
 pub mod enablement;
 pub mod exact_target;
 pub mod popup;
