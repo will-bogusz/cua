@@ -61,6 +61,16 @@ leaves its optional fields unset (`ClickInput::new(target, position,
 delivery_mode)` with `..` for the rest), so a typed caller is not broken by
 the next optional field either.
 
+The observation facts added after 0.10 are optional output fields, each with
+its absence spelled out on the Rust type: `WindowStateOutput` gained
+`text_rows`, `collapsed_containers`, `focused_element`, `query_match_count`
+and `query_hidden_rows`, and `WindowElement` gained `element_id`
+(accessibility-object continuity within one driver process — not record
+identity, never an address); `ListWindowsOutput` gained `system_windows`;
+`ActionResult` gained `gained_windows`. The typed `query` input stays a
+string: the macOS runtime also accepts an array of literals (any-of), which
+the portable schema does not promise on every platform.
+
 The canonical session-owned cursor slice is shared exactly by MCP and both
 generated SDKs:
 
