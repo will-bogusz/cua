@@ -578,16 +578,6 @@ impl Tool for PressKeyTool {
         } else {
             None
         };
-        let window_change = if evidence.is_some() && changes.needs_restore() {
-            let appeared = changes.new_windows.clone();
-            cua_driver_core::operation::spawn_blocking(move || {
-                delivery_probe::WindowChangeEvidence::observe(pid, window_id, &appeared)
-            })
-            .await
-            .ok()
-        } else {
-            None
-        };
         let mut msg = format!(
             "✅ Pressed {display_key} on pid {pid}{label}.{}",
             changes.result_suffix()
@@ -597,13 +587,13 @@ impl Tool for PressKeyTool {
             "verified": confirmed,
             "effect": if confirmed { "confirmed" } else { "unverifiable" },
         });
+        changes.publish_gained_windows(&mut structured);
         if let Some(outcome) = evidence {
             delivery_probe::apply_evidence(
                 &mut msg,
                 &mut structured,
                 outcome,
                 key_noop_report(changes.polled),
-                window_change.as_ref(),
             );
         }
         ToolResult::text(msg)

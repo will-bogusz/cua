@@ -467,16 +467,6 @@ impl Tool for DragTool {
                 } else {
                     None
                 };
-                let window_change = if evidence.is_some() && changes.needs_restore() {
-                    let appeared = changes.new_windows.clone();
-                    cua_driver_core::operation::spawn_blocking(move || {
-                        delivery_probe::WindowChangeEvidence::observe(pid, window_id, &appeared)
-                    })
-                    .await
-                    .ok()
-                } else {
-                    None
-                };
                 let mut msg = format!(
                     "✅ Posted drag{btn_suffix}{mod_suffix} to pid {pid} \
                      from window-pixel ({}, {}) → ({}, {}), \
@@ -496,13 +486,13 @@ impl Tool for DragTool {
                 let mut structured = serde_json::json!({
                     "path": if fg { "cgevent_fg" } else { "cgevent" }, "verified": false, "effect": "unverifiable"
                 });
+                changes.publish_gained_windows(&mut structured);
                 if let Some(outcome) = evidence {
                     delivery_probe::apply_evidence(
                         &mut msg,
                         &mut structured,
                         outcome,
                         drag_noop_report(changes.polled),
-                        window_change.as_ref(),
                     );
                 }
                 ToolResult::text(msg).with_structured(structured)
@@ -549,7 +539,6 @@ mod tests {
             &mut structured,
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             drag_noop_report(true),
-            None,
         );
         assert_eq!(structured["effect"], "suspected_noop");
         assert_eq!(structured["delivery_probe"]["waited_ms"], 2000);
@@ -579,7 +568,6 @@ mod tests {
             &mut structured,
             outcome(delivery_probe::Evidence::Unchanged, 2000),
             drag_noop_report(false),
-            None,
         );
         assert!(
             msg.contains("app_focus, window_tree, menu_opened read the same"),
@@ -597,7 +585,6 @@ mod tests {
             &mut structured,
             outcome(delivery_probe::Evidence::Changed("window_tree"), 60),
             drag_noop_report(true),
-            None,
         );
         assert_eq!(structured["effect"], "unverifiable");
         assert_eq!(structured["evidence"][0]["kind"], "window_tree");

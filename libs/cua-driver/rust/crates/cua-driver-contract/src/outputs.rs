@@ -658,6 +658,48 @@ impl ActionCommit {
     }
 }
 
+/// How a window that appeared during an action relates to its application's
+/// other windows, as far as accessibility proves it. `sheet`: an `AXSheet`
+/// whose accessibility parent is the window `attached_to`. `app-modal`: the
+/// application reports it `AXModal`, so no other window of that process
+/// accepts input while it is up — it says nothing about which window opened
+/// it. `unknown`: accessibility proves no relation or could not resolve the
+/// window. (The spellings are the window-snapshot `relation` vocabulary.
+/// Variant docs are deliberately absent: they turn the schema's `enum` into a
+/// `oneOf`.)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+pub enum GainedWindowRelation {
+    #[serde(rename = "sheet")]
+    Sheet,
+    #[serde(rename = "app-modal")]
+    AppModal,
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+/// A window that appeared while an action ran. Appearing during the action is
+/// timing, not causation: any process may open a window inside the watch.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct GainedWindow {
+    pub window_id: u64,
+    pub pid: u32,
+    pub app_name: String,
+    /// The window server's title; empty when the window has none.
+    pub title: String,
+    /// Accessibility role. Absent when accessibility could not resolve the
+    /// window (then `relation` is `unknown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subrole: Option<String>,
+    pub relation: GainedWindowRelation,
+    /// The window a `sheet` hangs off. Present exactly when `relation` is
+    /// `sheet`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_to: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionResult {
@@ -674,6 +716,12 @@ pub struct ActionResult {
     /// step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub committed: Option<ActionCommit>,
+    /// Windows that appeared while the action ran (see [`GainedWindow`]).
+    /// Absent when the platform did not watch for windows — the caller
+    /// declined the post-action poll, or the tool has none — so absence proves
+    /// nothing; an empty array is a watch that saw none within its window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gained_windows: Option<Vec<GainedWindow>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -835,6 +883,7 @@ mod tests {
             }]),
             escalation: None,
             committed: None,
+            gained_windows: None,
         }
     }
 
@@ -877,6 +926,7 @@ mod tests {
                 "effect",
                 "escalation",
                 "evidence",
+                "gained_windows",
                 "route"
             ]
         );

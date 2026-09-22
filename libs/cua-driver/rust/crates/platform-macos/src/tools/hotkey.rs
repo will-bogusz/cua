@@ -589,16 +589,6 @@ impl Tool for HotkeyTool {
                 } else {
                     None
                 };
-                let window_change = if evidence.is_some() && changes.needs_restore() {
-                    let appeared = changes.new_windows.clone();
-                    cua_driver_core::operation::spawn_blocking(move || {
-                        delivery_probe::WindowChangeEvidence::observe(pid, window_id, &appeared)
-                    })
-                    .await
-                    .ok()
-                } else {
-                    None
-                };
                 let not_key = window_id
                     .map(|target| key_window_note(pid, target, focused_window_id))
                     .filter(|note| !note.is_empty());
@@ -615,6 +605,7 @@ impl Tool for HotkeyTool {
                     "verified": false,
                     "effect": "unverifiable",
                 });
+                changes.publish_gained_windows(&mut structured);
                 if let Some(target) = window_id {
                     structured["key_window"] = serde_json::json!({
                         "target_window_id": target,
@@ -637,7 +628,6 @@ impl Tool for HotkeyTool {
                         &mut structured,
                         outcome,
                         chord_noop_report(changes.polled),
-                        window_change.as_ref(),
                     );
                 }
                 ToolResult::text(msg).with_structured(structured)

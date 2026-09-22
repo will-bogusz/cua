@@ -48,6 +48,7 @@ a row without `signal` is the 0.8 window poll:
 | `escalation.target` | `pixel`, `foreground`, `page`, `session`, `element`, `snapshot` |
 | `escalation.reason` | `route_unavailable`, `delivery_failed`, `effect_unconfirmed`, `suspected_noop`, `permission_required` |
 | `committed` | value-setting actions only (`set_value`, `type_text`): `committed`, `not_committed`, `unproven` — what the driver observed of the application's own end-of-edit, beside `effect`; absent on every other action |
+| `gained_windows` | layer-0 windows that appeared while the action ran, each `{window_id, pid, app_name, title, role?, subrole?, relation, attached_to?}`. `relation` is `sheet` (an `AXSheet` whose accessibility parent is `attached_to`), `app-modal` (its application reports it `AXModal`) or `unknown` (no relation proven, or the window has no accessibility element — then `role` is absent). Appearing during the action is timing, not causation. Present (possibly `[]`) only when the platform watched for windows; absent when the caller declined the post-action poll (`detect_window_change: false`) or the tool has none, so absence proves nothing. macOS publishes it from `click`, `drag`, `hotkey`, `press_key`, `type_text` and `scroll` |
 
 The action-result tools are:
 

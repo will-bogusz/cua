@@ -298,6 +298,66 @@
               "null"
             ]
           },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -735,6 +795,66 @@
               },
               "required": [
                 "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
               ],
               "type": "object"
             },
@@ -1972,34 +2092,17 @@
                 ]
               },
               "reason": {
-                "anyOf": [
-                  {
-                    "oneOf": [
-                      {
-                        "const": "no_focus",
-                        "type": "string"
-                      },
-                      {
-                        "const": "unreadable",
-                        "type": "string"
-                      },
-                      {
-                        "const": "not_addressable",
-                        "type": "string"
-                      },
-                      {
-                        "const": "outside_tree",
-                        "type": "string"
-                      },
-                      {
-                        "const": "not_in_partial_tree",
-                        "type": "string"
-                      }
-                    ]
-                  },
-                  {
-                    "type": "null"
-                  }
+                "enum": [
+                  "no_focus",
+                  "unreadable",
+                  "not_addressable",
+                  "outside_tree",
+                  "not_in_partial_tree",
+                  null
+                ],
+                "type": [
+                  "string",
+                  "null"
                 ]
               }
             },
@@ -2485,6 +2588,66 @@
               "null"
             ]
           },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -2687,6 +2850,66 @@
               },
               "required": [
                 "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
               ],
               "type": "object"
             },
@@ -3417,6 +3640,66 @@
               "null"
             ]
           },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -3668,6 +3951,66 @@
               },
               "required": [
                 "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
               ],
               "type": "object"
             },
@@ -3947,6 +4290,66 @@
               },
               "required": [
                 "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
               ],
               "type": "object"
             },
@@ -4478,6 +4881,66 @@
               "null"
             ]
           },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -4865,6 +5328,66 @@
               },
               "required": [
                 "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "gained_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "attached_to": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relation": {
+                  "enum": [
+                    "sheet",
+                    "app-modal",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "subrole": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "relation"
               ],
               "type": "object"
             },

@@ -588,9 +588,13 @@ impl Tool for ScrollTool {
                      driver-verified — confirm via screenshot).{}",
                     changes.result_suffix()
                 ))
-                .with_structured(serde_json::json!({
-                    "path": if fg { "cgevent_fg" } else { "cgevent" }, "verified": false, "effect": "unverifiable"
-                })),
+                .with_structured({
+                    let mut structured = serde_json::json!({
+                        "path": if fg { "cgevent_fg" } else { "cgevent" }, "verified": false, "effect": "unverifiable"
+                    });
+                    changes.publish_gained_windows(&mut structured);
+                    structured
+                }),
                 Ok(Err(e)) => ToolResult::error(format!("Wheel scroll failed: {e}")),
                 Err(e)     => ToolResult::error(format!("Task error: {e}")),
             };
@@ -682,7 +686,11 @@ impl Tool for ScrollTool {
                  (background; not driver-verified — confirm via screenshot).{}",
                 changes.result_suffix()
             ))
-            .with_structured(serde_json::json!({ "path": "key_events", "verified": false })),
+            .with_structured({
+                let mut structured = serde_json::json!({ "path": "key_events", "verified": false });
+                changes.publish_gained_windows(&mut structured);
+                structured
+            }),
             Ok(Err(e)) => ToolResult::error(format!("Scroll failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }

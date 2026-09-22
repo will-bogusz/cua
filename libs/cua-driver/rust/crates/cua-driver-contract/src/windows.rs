@@ -345,24 +345,23 @@ pub struct QueryHiddenRows {
     pub after_index: Option<u64>,
 }
 
-/// Why a snapshot names no focused row.
+/// Why a snapshot names no focused row. `no_focus`: the application reports
+/// no focused element. `unreadable`: the read failed or the observation budget
+/// had expired, so focus is unknown. `not_addressable`: the focused element is
+/// a display-only row of this tree, which has no `element_index`.
+/// `outside_tree`: the walk was complete and the focused element is none of
+/// its rows — it is in another window or surface, or in a layout container the
+/// walk does not render. `not_in_partial_tree`: the walk gave something up and
+/// the focused element is none of the rows it read, so it may be in the unread
+/// part or elsewhere. (Variant docs are deliberately absent: they turn the
+/// schema's `enum` into a `oneOf`.)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum FocusedElementReason {
-    /// The application reports no focused element.
     NoFocus,
-    /// The focused-element read failed or the observation budget had expired;
-    /// focus is unknown.
     Unreadable,
-    /// The focused element is a display-only row of this tree, which has no
-    /// `element_index`.
     NotAddressable,
-    /// The walk was complete and the focused element is none of its rows: it
-    /// is in another window or surface, or in a layout container the walk does
-    /// not render.
     OutsideTree,
-    /// The walk gave something up and the focused element is none of the rows
-    /// it read: it may be in the unread part or elsewhere.
     NotInPartialTree,
 }
 

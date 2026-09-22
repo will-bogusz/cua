@@ -49,13 +49,10 @@
 use std::time::{Duration, Instant};
 
 use crate::ax::bindings::{
-    ax_get_window_id, children_count, copy_ax_windows, copy_bool_attr, copy_string_attr,
-    element_screen_rect, focused_element_of_pid, kAXErrorInvalidUIElement, try_copy_string_attr,
-    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
+    children_count, copy_bool_attr, copy_string_attr, element_screen_rect,
+    focused_element_of_pid, kAXErrorInvalidUIElement, try_copy_string_attr, AXUIElementRef,
 };
 use crate::ax::RetainedElement;
-use crate::window_change_detector::WindowEvent;
-use core_foundation::base::{CFRelease, CFTypeRef};
 
 /// Node cap for the probe's window digest. Large enough to reach the content
 /// area of real app windows, small enough that two extra walks stay cheap.
@@ -263,75 +260,6 @@ impl Watched {
         .into_iter()
         .filter_map(|(compared, signal)| (!compared).then_some(signal))
         .collect()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct AppearedWindow {
-    pub window_id: u32,
-    pub pid: i32,
-    pub app_name: String,
-    pub title: String,
-    pub subrole: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct WindowChangeEvidence {
-    pub appeared_windows: Vec<AppearedWindow>,
-    pub target_window_main: Option<bool>,
-}
-
-impl WindowChangeEvidence {
-    pub fn observe(
-        target_pid: i32,
-        target_window_id: Option<u32>,
-        appeared: &[WindowEvent],
-    ) -> Self {
-        Self {
-            appeared_windows: appeared
-                .iter()
-                .map(|event| AppearedWindow {
-                    window_id: event.window_id,
-                    pid: event.pid,
-                    app_name: event.app_name.clone(),
-                    title: event.title.clone(),
-                    subrole: window_attr(event.pid, event.window_id, |window| unsafe {
-                        copy_string_attr(window, "AXSubrole")
-                    }),
-                })
-                .collect(),
-            target_window_main: target_window_id.and_then(|window_id| {
-                window_attr(target_pid, window_id, |window| unsafe {
-                    copy_bool_attr(window, "AXMain")
-                })
-            }),
-        }
-    }
-}
-
-const WINDOW_LOOKUP_TIMEOUT_SECONDS: f32 = 0.25;
-
-fn window_attr<T>(
-    pid: i32,
-    window_id: u32,
-    read: impl Fn(AXUIElementRef) -> Option<T>,
-) -> Option<T> {
-    unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return None;
-        }
-        AXUIElementSetMessagingTimeout(app, WINDOW_LOOKUP_TIMEOUT_SECONDS);
-        let mut found = None;
-        for window in copy_ax_windows(app) {
-            AXUIElementSetMessagingTimeout(window, WINDOW_LOOKUP_TIMEOUT_SECONDS);
-            if found.is_none() && ax_get_window_id(window) == Some(window_id) {
-                found = read(window);
-            }
-            CFRelease(window as CFTypeRef);
-        }
-        CFRelease(app as CFTypeRef);
-        found
     }
 }
 
@@ -659,7 +587,6 @@ pub fn apply_evidence(
     structured: &mut serde_json::Value,
     outcome: ProbeOutcome,
     noop: NoopReport<'_>,
-    window_change: Option<&WindowChangeEvidence>,
 ) {
     let probe_ms = outcome.probe.as_millis();
     let waited_ms = outcome.waited.as_millis();
@@ -675,13 +602,7 @@ pub fn apply_evidence(
     match outcome.evidence {
         Evidence::Changed(_) | Evidence::ElementGone => {
             let signal = outcome.evidence.signal();
-            let mut entry = serde_json::json!({ "kind": signal });
-            if let Some(observed) = window_change.filter(|_| signal == WINDOW_SIGNAL) {
-                entry["appeared_windows"] =
-                    serde_json::to_value(&observed.appeared_windows).unwrap_or_default();
-                entry["target_window_main"] = serde_json::json!(observed.target_window_main);
-            }
-            structured["evidence"] = serde_json::json!([entry]);
+            structured["evidence"] = serde_json::json!([{ "kind": signal }]);
             msg.push_str(&format!(
                 "\n🔎 Delivered: {} after the dispatch, so the app reacted. \
                  That is delivery, not the intended result — check the postcondition you \
@@ -741,6 +662,8 @@ fn reaction_phrase(evidence: Evidence) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ax::bindings::AXUIElementCreateApplication;
+    use core_foundation::base::{CFRelease, CFTypeRef};
     use core_foundation::base::CFGetRetainCount;
 
     fn state(digest: &str) -> ElementRead {
@@ -872,7 +795,6 @@ mod tests {
                 escalation: Some(serde_json::json!({ "target": "foreground" })),
                 advice: "",
             },
-            None,
         );
         assert_eq!(structured["evidence"][0]["kind"], "element_state");
         assert_eq!(structured["delivery_probe"]["signal"], "element_state");
@@ -924,7 +846,6 @@ mod tests {
                 2000,
             ),
             noop(false),
-            None,
         );
         assert!(
             msg.contains("app_focus, menu_opened read the same"),
@@ -963,7 +884,6 @@ mod tests {
                 2000,
             ),
             noop(true),
-            None,
         );
         assert!(
             polled_msg.contains("menu_opened, window_change read the same"),
@@ -985,7 +905,7 @@ mod tests {
         );
         let mut msg = String::new();
         let mut structured = serde_json::json!({ "path": "key_events" });
-        apply_evidence(&mut msg, &mut structured, outcome, noop(false), None);
+        apply_evidence(&mut msg, &mut structured, outcome, noop(false));
         assert!(!msg.contains(ELEMENT_SIGNAL), "{msg}");
 
         // The same chord against an application that answers: its focused
@@ -1005,7 +925,6 @@ mod tests {
                 633,
             ),
             noop(false),
-            None,
         );
         assert_eq!(
             msg,
@@ -1043,7 +962,6 @@ mod tests {
                 &mut structured,
                 unchanged(watched, 1450),
                 noop(false),
-                None,
             );
             let waited = msg
                 .split_once("watched for ")

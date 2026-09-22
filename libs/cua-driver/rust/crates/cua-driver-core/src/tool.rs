@@ -1617,6 +1617,15 @@ impl ToolRegistry {
                 );
             }
         }
+        // Appeared windows ride in the producer's structured payload whether
+        // the producer built its record itself or left it to the legacy
+        // normalizer.
+        if let (Some(record), Some(structured)) = (
+            result.action_record.as_mut(),
+            result.structured_content.as_ref(),
+        ) {
+            record.adopt_gained_windows(structured);
+        }
         if resolved_name == "launch_app" && result.is_error != Some(true) {
             if let (Some(before), Some(pid)) = (
                 launch_snapshot.as_ref(),

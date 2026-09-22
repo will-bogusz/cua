@@ -581,6 +581,7 @@ impl Tool for TypeTextTool {
                         "verified": verified,
                         "effect": if verified { "confirmed" } else { "unverifiable" },
                     });
+                    changes.publish_gained_windows(&mut s);
                     if commit_unproven {
                         s["committed"] = serde_json::json!(
                             cua_driver_contract::ActionCommit::Unproven.as_wire()

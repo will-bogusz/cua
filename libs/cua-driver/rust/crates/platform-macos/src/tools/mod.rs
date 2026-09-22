@@ -674,10 +674,24 @@ pub(crate) async fn finish_window_observation(
 ) -> crate::window_change_detector::Changes {
     if window_change_detection_declined(args) {
         drop(snapshot);
-        crate::window_change_detector::Changes::not_polled()
-    } else {
-        snapshot.detect_async().await
+        return crate::window_change_detector::Changes::not_polled();
     }
+    let mut changes = snapshot.detect_async().await;
+    if !changes.new_windows.is_empty() {
+        let events = changes.new_windows.clone();
+        changes.gained_windows = tokio::task::spawn_blocking(move || {
+            crate::window_change_detector::gained_windows(&events)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            changes
+                .new_windows
+                .iter()
+                .map(|event| crate::window_change_detector::GainedWindow::classify(event, None))
+                .collect()
+        });
+    }
+    changes
 }
 
 pub(crate) fn window_change_detection_declined(args: &serde_json::Value) -> bool {

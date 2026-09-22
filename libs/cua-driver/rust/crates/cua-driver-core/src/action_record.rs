@@ -259,6 +259,9 @@ pub struct ActionExecutionRecord {
     /// Value-setting actions only: what was observed of the app's own
     /// end-of-edit for the written value.
     pub committed: Option<cua_driver_contract::ActionCommit>,
+    /// Windows that appeared while the action ran; `None` when the platform
+    /// did not watch for them.
+    pub gained_windows: Option<Vec<cua_driver_contract::GainedWindow>>,
 }
 
 impl ActionExecutionRecord {
@@ -279,7 +282,17 @@ impl ActionExecutionRecord {
             delivered_count: None,
             detail: None,
             committed: None,
+            gained_windows: None,
         }
+    }
+
+    /// Adopt the `gained_windows` a platform producer published in its
+    /// structured payload. An absent or malformed list leaves the record
+    /// saying nothing about appeared windows.
+    pub fn adopt_gained_windows(&mut self, structured: &serde_json::Value) {
+        self.gained_windows = structured
+            .get("gained_windows")
+            .and_then(|windows| serde_json::from_value(windows.clone()).ok());
     }
 
     pub fn builder(
@@ -449,6 +462,7 @@ impl ActionExecutionRecord {
                 }
             }),
             committed: self.committed,
+            gained_windows: self.gained_windows.clone(),
         })
     }
 
@@ -1675,6 +1689,36 @@ mod tests {
     /// value", so it has to reach the public result unchanged — and a stale
     /// boolean spelling must not be read as a claim. `type_text` is the one
     /// family still publishing it through the legacy payload.
+    #[test]
+    fn published_gained_windows_reach_the_public_result_and_absence_stays_absent() {
+        let mut record = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"pid": 42, "window_id": 3}),
+            &serde_json::json!({"path": "ax", "effect": "unverifiable"}),
+        )
+        .expect("record");
+        record.adopt_gained_windows(&serde_json::json!({}));
+        assert!(record.public_result().unwrap().gained_windows.is_none());
+
+        let sheet = serde_json::json!({
+            "window_id": 7, "pid": 42, "app_name": "TextEdit", "title": "",
+            "role": "AXSheet", "relation": "sheet", "attached_to": 3
+        });
+        record.adopt_gained_windows(&serde_json::json!({ "gained_windows": [sheet] }));
+        let public = serde_json::to_value(record.public_result().unwrap()).unwrap();
+        assert_eq!(public["gained_windows"][0]["attached_to"], 3);
+        assert_eq!(public["gained_windows"][0]["relation"], "sheet");
+
+        record.adopt_gained_windows(&serde_json::json!({ "gained_windows": [] }));
+        let watched_none = serde_json::to_value(record.public_result().unwrap()).unwrap();
+        assert_eq!(watched_none["gained_windows"], serde_json::json!([]));
+
+        record.adopt_gained_windows(&serde_json::json!({
+            "gained_windows": [{"window_id": 7, "relation": "parent"}]
+        }));
+        assert!(record.public_result().unwrap().gained_windows.is_none());
+    }
+
     #[test]
     fn legacy_commit_verdict_reaches_the_public_result() {
         use cua_driver_contract::ActionCommit;

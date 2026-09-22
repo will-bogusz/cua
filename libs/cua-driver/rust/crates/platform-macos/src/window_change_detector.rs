@@ -52,6 +52,151 @@ pub struct WindowEvent {
     pub title: String,
 }
 
+/// A window that appeared while an action ran, with what accessibility proves
+/// about how it relates to its application's other windows.
+///
+/// Appearing during the action is timing, not causation: any process may open
+/// a window inside the poll. `relation` is `sheet` only when the window is an
+/// `AXSheet` whose accessibility parent is the window `attached_to`, and
+/// `app-modal` only when its application reports it `AXModal` (so no other
+/// window of that process accepts input while it is up). Everything else is
+/// `unknown` — including a window accessibility could not resolve, which also
+/// carries no `role`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GainedWindow {
+    pub window_id: u32,
+    pub pid: i32,
+    pub app_name: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subrole: Option<String>,
+    pub relation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attached_to: Option<u32>,
+}
+
+/// What accessibility says about one window, read by [`read_window_facts`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowFacts {
+    pub role: Option<String>,
+    pub subrole: Option<String>,
+    pub modal: Option<bool>,
+    /// CGWindowID of the window whose accessibility children include this
+    /// window (a sheet's own window), when it is one.
+    pub parent_window: Option<u32>,
+}
+
+pub const SHEET_RELATION: &str = crate::ax::window_scope::SHEET_RELATION;
+pub const APP_MODAL_RELATION: &str = crate::ax::window_scope::MODAL_RELATION;
+pub const UNKNOWN_RELATION: &str = "unknown";
+
+impl GainedWindow {
+    /// Classify one appeared window from its accessibility facts (`None`:
+    /// accessibility could not resolve it).
+    pub fn classify(event: &WindowEvent, facts: Option<WindowFacts>) -> Self {
+        let facts = facts.unwrap_or_default();
+        let (relation, attached_to) = match (&facts.role, facts.parent_window, facts.modal) {
+            (Some(role), Some(parent), _) if role == "AXSheet" => (SHEET_RELATION, Some(parent)),
+            (_, _, Some(true)) => (APP_MODAL_RELATION, None),
+            _ => (UNKNOWN_RELATION, None),
+        };
+        Self {
+            window_id: event.window_id,
+            pid: event.pid,
+            app_name: event.app_name.clone(),
+            title: event.title.clone(),
+            role: facts.role,
+            subrole: facts.subrole,
+            relation,
+            attached_to,
+        }
+    }
+}
+
+/// Windows whose accessibility facts one post-action poll reads; the rest are
+/// reported with `relation: unknown`. An action opens a sheet or a dialog, not
+/// a flock of windows, and each read is a native round trip.
+const MAX_CLASSIFIED_WINDOWS: usize = 8;
+/// Per-element messaging timeout for those reads, so a wedged app cannot hold
+/// the reply.
+const WINDOW_FACT_TIMEOUT_SECONDS: f32 = 0.25;
+/// Top-level windows searched for an appeared sheet.
+const MAX_SHEET_PARENTS: usize = 32;
+
+/// Classify every appeared window. Blocking: native accessibility reads.
+pub fn gained_windows(events: &[WindowEvent]) -> Vec<GainedWindow> {
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let facts = (index < MAX_CLASSIFIED_WINDOWS)
+                .then(|| read_window_facts(event.pid, event.window_id))
+                .flatten();
+            GainedWindow::classify(event, facts)
+        })
+        .collect()
+}
+
+/// Find `window_id` among `pid`'s accessibility windows, or among their
+/// sheets, and read its role, subrole, modality and (for a sheet) the window
+/// it hangs off. `None` when accessibility has no element for it.
+pub fn read_window_facts(pid: i32, window_id: u32) -> Option<WindowFacts> {
+    use crate::ax::bindings::*;
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, WINDOW_FACT_TIMEOUT_SECONDS);
+        let windows = copy_ax_windows(app);
+        CFRelease(app as CFTypeRef);
+        let read = |element: AXUIElementRef, parent_window: Option<u32>| WindowFacts {
+            role: copy_string_attr(element, "AXRole"),
+            subrole: copy_string_attr(element, "AXSubrole"),
+            modal: copy_bool_attr(element, "AXModal"),
+            parent_window,
+        };
+        let mut facts = None;
+        for &window in &windows {
+            AXUIElementSetMessagingTimeout(window, WINDOW_FACT_TIMEOUT_SECONDS);
+            if ax_get_window_id(window) == Some(window_id) {
+                let parent = copy_element_attr(window, "AXParent").and_then(|parent| {
+                    let id = ax_get_window_id(parent);
+                    CFRelease(parent as CFTypeRef);
+                    id
+                });
+                facts = Some(read(window, parent));
+                break;
+            }
+        }
+        if facts.is_none() {
+            'search: for &window in windows.iter().take(MAX_SHEET_PARENTS) {
+                let children = copy_children(window);
+                let mut found = None;
+                for &child in &children {
+                    AXUIElementSetMessagingTimeout(child, WINDOW_FACT_TIMEOUT_SECONDS);
+                    if copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet")
+                        && ax_get_window_id(child) == Some(window_id)
+                    {
+                        found = Some(read(child, ax_get_window_id(window)));
+                        break;
+                    }
+                }
+                release_all(children);
+                if found.is_some() {
+                    facts = found;
+                    break 'search;
+                }
+            }
+        }
+        release_all(windows);
+        facts
+    }
+}
+
 /// Categorical diff entry. We mirror Swift which only emits
 /// `WindowEvent` rows for *new* windows — closed/changed never appear
 /// in the result suffix — but keep them as enum variants for future
@@ -85,6 +230,8 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub struct Changes {
     pub new_windows: Vec<WindowEvent>,
+    /// `new_windows` classified; filled by the tools' post-action observation.
+    pub gained_windows: Vec<GainedWindow>,
     pub foreground_changed: bool,
     /// Whether the post-action window poll ran at all. A caller that declined
     /// it (`detect_window_change: false`) gets `false`, and no reply may then
@@ -96,6 +243,7 @@ impl Changes {
     pub fn no_change() -> Self {
         Self {
             new_windows: Vec::new(),
+            gained_windows: Vec::new(),
             foreground_changed: false,
             polled: true,
         }
@@ -111,6 +259,16 @@ impl Changes {
     /// True when we found evidence that the action triggered a cross-app
     /// side-effect that required (or would have required) a foreground
     /// restore. Matches Swift's `Changes.needsRestore`.
+    /// Publish the windows that appeared as `gained_windows`: an array
+    /// (possibly empty) when the poll ran, nothing when it did not — so an
+    /// absent key is "not watched", never "none appeared".
+    pub fn publish_gained_windows(&self, structured: &mut serde_json::Value) {
+        if self.polled && structured.is_object() {
+            structured["gained_windows"] =
+                serde_json::to_value(&self.gained_windows).unwrap_or_default();
+        }
+    }
+
     pub fn needs_restore(&self) -> bool {
         self.foreground_changed || !self.new_windows.is_empty()
     }
@@ -321,6 +479,7 @@ impl Snapshot {
             if !new_windows.is_empty() || foreground_changed {
                 return Changes {
                     new_windows,
+                    gained_windows: Vec::new(),
                     foreground_changed,
                     polled: true,
                 };
@@ -376,6 +535,83 @@ impl Snapshot {
 mod tests {
     use super::*;
     use crate::windows::WindowBounds;
+
+    fn appeared(window_id: u32) -> WindowEvent {
+        WindowEvent {
+            window_id,
+            pid: 42,
+            app_name: "TextEdit".into(),
+            title: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_accessibility_facts_give_an_appeared_window_a_relation() {
+        let sheet = GainedWindow::classify(
+            &appeared(7),
+            Some(WindowFacts {
+                role: Some("AXSheet".into()),
+                modal: Some(true),
+                parent_window: Some(3),
+                ..WindowFacts::default()
+            }),
+        );
+        assert_eq!((sheet.relation, sheet.attached_to), ("sheet", Some(3)));
+
+        let orphan_sheet = GainedWindow::classify(
+            &appeared(7),
+            Some(WindowFacts {
+                role: Some("AXSheet".into()),
+                ..WindowFacts::default()
+            }),
+        );
+        assert_eq!((orphan_sheet.relation, orphan_sheet.attached_to), ("unknown", None));
+
+        let dialog = GainedWindow::classify(
+            &appeared(8),
+            Some(WindowFacts {
+                role: Some("AXWindow".into()),
+                subrole: Some("AXDialog".into()),
+                modal: Some(true),
+                // A top-level window's parent is the application, never a window.
+                parent_window: None,
+            }),
+        );
+        assert_eq!((dialog.relation, dialog.attached_to), ("app-modal", None));
+
+        let document = GainedWindow::classify(
+            &appeared(9),
+            Some(WindowFacts {
+                role: Some("AXWindow".into()),
+                modal: Some(false),
+                ..WindowFacts::default()
+            }),
+        );
+        assert_eq!(document.relation, "unknown");
+
+        let unresolved = GainedWindow::classify(&appeared(10), None);
+        assert_eq!((unresolved.relation, unresolved.role), ("unknown", None));
+    }
+
+    #[test]
+    fn gained_windows_are_published_only_when_the_poll_ran() {
+        let mut watched = Changes::no_change();
+        watched.gained_windows = vec![GainedWindow::classify(&appeared(7), None)];
+        let mut structured = serde_json::json!({ "path": "ax" });
+        watched.publish_gained_windows(&mut structured);
+        let published: Vec<cua_driver_contract::GainedWindow> =
+            serde_json::from_value(structured["gained_windows"].clone())
+                .expect("the producer's spelling is the contract's");
+        assert_eq!(published[0].window_id, 7);
+
+        let mut empty = serde_json::json!({});
+        Changes::no_change().publish_gained_windows(&mut empty);
+        assert_eq!(empty["gained_windows"], serde_json::json!([]));
+
+        let mut declined = serde_json::json!({});
+        Changes::not_polled().publish_gained_windows(&mut declined);
+        assert!(declined.get("gained_windows").is_none());
+    }
 
     fn win(id: u32, pid: i32, app: &str, title: &str) -> WindowInfo {
         WindowInfo {
@@ -445,6 +681,7 @@ mod tests {
     #[test]
     fn changes_result_suffix_single_new_window_with_title() {
         let c = Changes {
+            gained_windows: Vec::new(),
             polled: true,
             new_windows: vec![WindowEvent {
                 window_id: 99,
@@ -464,6 +701,7 @@ mod tests {
     #[test]
     fn changes_result_suffix_groups_windows_by_app() {
         let c = Changes {
+            gained_windows: Vec::new(),
             polled: true,
             new_windows: vec![
                 WindowEvent {
@@ -498,6 +736,7 @@ mod tests {
     #[test]
     fn changes_result_suffix_foreground_change_only() {
         let c = Changes {
+            gained_windows: Vec::new(),
             polled: true,
             new_windows: vec![],
             foreground_changed: true,
@@ -512,6 +751,7 @@ mod tests {
     #[test]
     fn changes_result_suffix_empty_title_is_dropped() {
         let c = Changes {
+            gained_windows: Vec::new(),
             polled: true,
             new_windows: vec![WindowEvent {
                 window_id: 1,
