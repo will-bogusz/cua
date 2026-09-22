@@ -86,10 +86,6 @@ pub(super) struct MenuRefusal {
     pub(super) message: String,
     failed_segment: Option<usize>,
     items: Vec<MenuItem>,
-    /// The segment resolved and read `AXEnabled=false` once its menu was
-    /// open — the application's own verdict on the command, not a walk
-    /// failure.
-    disabled: bool,
 }
 
 impl MenuRefusal {
@@ -98,7 +94,6 @@ impl MenuRefusal {
             message: message.into(),
             failed_segment: None,
             items: Vec::new(),
-            disabled: false,
         }
     }
 
@@ -107,29 +102,19 @@ impl MenuRefusal {
             message: message.into(),
             failed_segment: Some(depth),
             items: Vec::new(),
-            disabled: false,
         }
     }
 
     fn disabled_at(depth: usize) -> Self {
-        Self {
-            disabled: true,
-            ..Self::at_segment(
-                depth,
-                format!("invoke_menu: path segment {depth} is disabled"),
-            )
-        }
+        Self::at_segment(
+            depth,
+            format!("invoke_menu: path segment {depth} is disabled"),
+        )
     }
 
     fn with_items(mut self, items: Vec<MenuItem>) -> Self {
         self.items = items;
         self
-    }
-
-    /// Whether the final segment of a `path_len`-long path was the one the
-    /// application kept disabled with its menu open.
-    pub(super) fn is_final_segment_disabled(&self, path_len: usize) -> bool {
-        self.disabled && self.failed_segment == Some(path_len.saturating_sub(1))
     }
 }
 
@@ -149,146 +134,9 @@ const MENU_MODIFIER_SHIFT: i64 = 1;
 const MENU_MODIFIER_OPTION: i64 = 1 << 1;
 const MENU_MODIFIER_CONTROL: i64 = 1 << 2;
 const MENU_MODIFIER_NO_COMMAND: i64 = 1 << 3;
-/// Origin: measured on Notes, where `View > Enter Full Screen` (fn F)
-/// publishes `24` and `Window > Move & Resize > Return to Previous Size`
-/// (fn ⌃ R) publishes `28`. Pinned against an application-declared item by
-/// `harness_appkit_disabled_until_key_chord_lands_as_its_menu_command`: the
-/// fixture's `Window > Arrange > Halves > Left Half` declares
-/// `keyEquivalentModifierMask = [.function]`, so a chord that reaches it
-/// proves the bridge publishes this bit for an item nobody at Apple wrote.
+/// Measured on Notes: `View > Enter Full Screen` (fn F) publishes `24`,
+/// `Window > Move & Resize > Return to Previous Size` (fn ⌃ R) `28`.
 const MENU_MODIFIER_FN: i64 = 1 << 4;
-
-/// How many menu levels the key-equivalent walk descends below the menu bar.
-/// Every measured key equivalent sits at depth 2 or 3 (`Edit > Find > Find…`);
-/// the cap bounds a pathological menu, not a real one.
-///
-/// Pinned as a bound, not as "deep enough", by
-/// `harness_appkit_disabled_until_key_chord_lands_as_its_menu_command`: the
-/// fixture owns an equivalent at four titles, which the walk finds, and a
-/// second at five, which it must not.
-const KEY_EQUIVALENT_MAX_DEPTH: usize = 4;
-
-/// The `AXMenuItemCmdModifiers` mask a chord would carry as a menu key
-/// equivalent. `None` for a modifier set no menu item can publish.
-pub(super) fn chord_modifier_mask(modifiers: &[&str]) -> Option<i64> {
-    let mut mask = MENU_MODIFIER_NO_COMMAND;
-    for modifier in modifiers {
-        match modifier.to_lowercase().as_str() {
-            "cmd" | "command" => mask &= !MENU_MODIFIER_NO_COMMAND,
-            "shift" => mask |= MENU_MODIFIER_SHIFT,
-            "option" | "alt" => mask |= MENU_MODIFIER_OPTION,
-            "ctrl" | "control" => mask |= MENU_MODIFIER_CONTROL,
-            "fn" => mask |= MENU_MODIFIER_FN,
-            _ => return None,
-        }
-    }
-    Some(mask)
-}
-
-/// The key-equivalent attributes one menu item publishes.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(super) struct KeyEquivalent {
-    pub cmd_char: Option<String>,
-    pub virtual_key: Option<i64>,
-    pub modifiers: Option<i64>,
-}
-
-impl KeyEquivalent {
-    /// Whether `key` under `mask` is this item's key equivalent.
-    ///
-    /// Measured on Notes' menu bar: a printing equivalent is published as its
-    /// uppercase character with no virtual key (`Find…` → `"F"`, `Zoom In` →
-    /// `"."`); a non-printing one carries the virtual key beside a glyph
-    /// character (`Delete Note` → `"\u{8}"`, key 51; `Force Quit…` →
-    /// `"⎋"`, key 53), so the key code is the comparable half there.
-    pub fn matches(&self, key: &str, mask: i64) -> bool {
-        if self.modifiers.unwrap_or(0) != mask {
-            return false;
-        }
-        if let Some(virtual_key) = self.virtual_key {
-            return crate::input::keyboard::key_name_to_code(key)
-                .ok()
-                .is_some_and(|code| i64::from(code) == virtual_key);
-        }
-        let Some(cmd_char) = self.cmd_char.as_deref() else {
-            return false;
-        };
-        let mut chars = key.chars();
-        matches!((chars.next(), chars.next()), (Some(_), None))
-            && !cmd_char.is_empty()
-            && key.to_uppercase() == cmd_char.to_uppercase()
-    }
-}
-
-/// A menu item found by its key equivalent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct KeyEquivalentItem {
-    /// Titles from the menu bar down, the path `invoke_path` takes.
-    pub path: Vec<String>,
-    pub enabled: Option<bool>,
-}
-
-unsafe fn key_equivalent_of(item: AXUIElementRef) -> KeyEquivalent {
-    KeyEquivalent {
-        cmd_char: copy_string_attr(item, "AXMenuItemCmdChar"),
-        virtual_key: copy_number_attr(item, "AXMenuItemCmdVirtualKey").map(|key| key as i64),
-        modifiers: copy_number_attr(item, "AXMenuItemCmdModifiers").map(|mask| mask as i64),
-    }
-}
-
-unsafe fn find_key_equivalent_under(
-    parent: AXUIElementRef,
-    path: &mut Vec<String>,
-    key: &str,
-    mask: i64,
-) -> Option<KeyEquivalentItem> {
-    let children = semantic_children(parent);
-    let mut found = None;
-    for child in children {
-        if found.is_none() {
-            if let Some(title) = listable_title(copy_string_attr(child, "AXTitle")) {
-                path.push(title);
-                if key_equivalent_of(child).matches(key, mask) {
-                    found = Some(KeyEquivalentItem {
-                        path: path.clone(),
-                        enabled: copy_bool_attr(child, "AXEnabled"),
-                    });
-                } else if path.len() < KEY_EQUIVALENT_MAX_DEPTH {
-                    found = find_key_equivalent_under(child, path, key, mask);
-                }
-                path.pop();
-            }
-        }
-        CFRelease(child as CFTypeRef);
-    }
-    found
-}
-
-/// The menu item of `pid`'s menu bar whose key equivalent is `key` under the
-/// chord's modifiers, or `None` when the chord is bound to no menu item. The
-/// walk reads closed menus the way `invoke_menu`'s listing does; nothing is
-/// opened or pressed.
-pub(super) fn find_key_equivalent(
-    pid: i32,
-    key: &str,
-    modifiers: &[&str],
-) -> Option<KeyEquivalentItem> {
-    let mask = chord_modifier_mask(modifiers)?;
-    unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return None;
-        }
-        set_messaging_timeout(app);
-        let found = menu_bar_of(app).and_then(|menu_bar| {
-            let found = find_key_equivalent_under(menu_bar, &mut Vec::new(), key, mask);
-            CFRelease(menu_bar as CFTypeRef);
-            found
-        });
-        CFRelease(app as CFTypeRef);
-        found
-    }
-}
 
 fn menu_shortcut(cmd_char: Option<&str>, modifiers: Option<f64>) -> Option<String> {
     let key = cmd_char?.trim();
@@ -297,10 +145,9 @@ fn menu_shortcut(cmd_char: Option<&str>, modifiers: Option<f64>) -> Option<Strin
     }
     let mask = modifiers.unwrap_or_default() as i64;
     let mut rendered = String::new();
-    // The fn bit is matched on the way in (`chord_modifier_mask`), so a
-    // listing that dropped it named a chord that does not exist: an item
-    // whose equivalent is fn-F was published to the model as "F", which is
-    // Find on most menu bars. Rendered first, as macOS orders it.
+    // A listing that drops the fn bit names a chord that does not exist: an
+    // item whose equivalent is fn-F would be published to the model as "F",
+    // which is Find on most menu bars. Rendered first, as macOS orders it.
     if mask & MENU_MODIFIER_FN != 0 {
         rendered.push_str("fn ");
     }
@@ -854,32 +701,6 @@ fn invoked(path: Vec<String>, reaction: Option<super::delivery_probe::Evidence>)
     .with_action_record(record.build().expect("invoke_menu record is valid"))
 }
 
-/// What making the window key did to the desktop, for a reply that has to
-/// say it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MenuActivation {
-    /// The target application was not frontmost, so it was activated.
-    pub fronted: bool,
-    /// The target window was not its application's key window, so it was
-    /// made key.
-    pub made_key: bool,
-    /// Whether the prior frontmost window (or application) was put back;
-    /// `None` when nothing had to change.
-    pub restored: Option<bool>,
-}
-
-/// Whether `window_id` is the key window of the front process right now —
-/// the window NSMenu validates a key equivalent against. An inactive
-/// application still reports an `AXFocusedWindow`; it has no key window.
-pub(super) fn window_is_key(pid: i32, window_id: u32) -> bool {
-    exact_window_is_ready(
-        live_frontmost_pid(pid, window_id),
-        pid,
-        crate::ax::bindings::focused_window_id_of_pid(pid),
-        window_id,
-    )
-}
-
 /// Run `body` with the exact window key and frontmost, then put the prior
 /// frontmost back. Blocking; call from a blocking thread.
 ///
@@ -892,40 +713,27 @@ pub(super) fn window_is_key(pid: i32, window_id: u32) -> bool {
 /// The exact prior key window is restored when one was observable,
 /// including across applications; app activation is the fallback for a
 /// prior app without an AX window.
-pub(super) fn with_window_key<T>(
-    pid: i32,
-    window_id: u32,
-    body: impl FnOnce() -> T,
-) -> (Result<T, String>, MenuActivation) {
+fn with_window_key<T>(pid: i32, window_id: u32, body: impl FnOnce() -> T) -> Result<T, String> {
     let prior_frontmost = live_frontmost_app().or_else(crate::apps::frontmost_pid);
     let prior_frontmost_window =
         prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
     let needs_activation = prior_frontmost != Some(pid);
-    let made_key =
-        needs_activation || crate::ax::bindings::focused_window_id_of_pid(pid) != Some(window_id);
 
     let result = focus_exact_window(pid, window_id).map(|()| body());
 
     let already_restored = prior_frontmost
         .is_some_and(|prior_pid| prior_pid == pid && prior_frontmost_window == Some(window_id));
-    let restored = if already_restored {
-        None
-    } else {
-        Some(prior_frontmost.is_some_and(|prior_pid| {
+    if !already_restored {
+        if let Some(prior_pid) = prior_frontmost {
             let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
                 focus_exact_window(prior_pid, prior_window_id).is_ok()
             });
-            restored_exact || (needs_activation && crate::apps::activate_pid(prior_pid))
-        }))
-    };
-    (
-        result,
-        MenuActivation {
-            fronted: needs_activation,
-            made_key,
-            restored,
-        },
-    )
+            if !restored_exact && needs_activation {
+                let _ = crate::apps::activate_pid(prior_pid);
+            }
+        }
+    }
+    result
 }
 
 #[async_trait]
@@ -963,7 +771,7 @@ impl Tool for InvokeMenuTool {
         let resolved_path = path.clone();
 
         let outcome = tokio::task::spawn_blocking(move || {
-            let (result, _activation) = with_window_key(pid, window_id, || {
+            let result = with_window_key(pid, window_id, || {
                 let probe =
                     super::delivery_probe::DeliveryProbe::capture_after_activation(pid, window_id);
                 let outcome = unsafe { invoke_path(pid, &path) };
@@ -1157,68 +965,6 @@ mod tests {
             reacted["evidence"],
             serde_json::json!([{ "kind": "window_change", "signal": "app_focus" }])
         );
-    }
-
-    /// The mask is what `AXMenuItemCmdModifiers` publishes: command is the
-    /// default and its absence is a bit, the others are bits, and a modifier
-    /// no menu item can carry is no mask at all.
-    #[test]
-    fn a_chord_maps_onto_the_menu_modifier_mask() {
-        assert_eq!(chord_modifier_mask(&["cmd"]), Some(0));
-        assert_eq!(chord_modifier_mask(&["cmd", "option"]), Some(2));
-        assert_eq!(chord_modifier_mask(&["shift", "cmd"]), Some(1));
-        assert_eq!(
-            chord_modifier_mask(&["command", "control", "shift"]),
-            Some(5)
-        );
-        assert_eq!(chord_modifier_mask(&["fn"]), Some(24));
-        assert_eq!(chord_modifier_mask(&["ctrl"]), Some(12));
-        assert_eq!(chord_modifier_mask(&[]), Some(8));
-        assert_eq!(chord_modifier_mask(&["hyper"]), None);
-    }
-
-    /// Measured attribute shapes from Notes' menu bar: a printing key
-    /// equivalent is its uppercase character with no virtual key, a
-    /// non-printing one carries the virtual key beside a glyph character.
-    #[test]
-    fn a_key_equivalent_matches_the_chord_it_publishes() {
-        let printing = |cmd_char: &str, modifiers: i64| KeyEquivalent {
-            cmd_char: Some(cmd_char.into()),
-            virtual_key: None,
-            modifiers: Some(modifiers),
-        };
-        // Edit > Find > Note List Search… (⌥⌘F), Find… (⌘F), Find and Replace… (⇧⌘F).
-        assert!(printing("F", 2).matches("f", 2));
-        assert!(printing("F", 0).matches("f", 0));
-        assert!(printing("F", 1).matches("F", 1));
-        assert!(!printing("F", 2).matches("f", 0));
-        assert!(!printing("F", 0).matches("g", 0));
-        // View > Zoom In (⇧⌘.) and Format > Font > Bigger (⌘+): punctuation as is.
-        assert!(printing(".", 1).matches(".", 1));
-        assert!(printing("+", 0).matches("+", 0));
-        // A named key never matches a printing equivalent by spelling.
-        assert!(!printing("F", 0).matches("f1", 0));
-        assert!(!printing("", 0).matches("", 0));
-
-        // Edit > Delete Note (⌫, no command) and Apple > Force Quit… (⌥⌘⎋).
-        let delete = KeyEquivalent {
-            cmd_char: Some("\u{8}".into()),
-            virtual_key: Some(51),
-            modifiers: Some(8),
-        };
-        assert!(delete.matches("delete", 8));
-        assert!(delete.matches("backspace", 8));
-        assert!(!delete.matches("delete", 0));
-        let force_quit = KeyEquivalent {
-            cmd_char: Some("\u{238B}".into()),
-            virtual_key: Some(53),
-            modifiers: Some(2),
-        };
-        assert!(force_quit.matches("escape", 2));
-        assert!(!force_quit.matches("\u{238B}", 2));
-
-        // An item with no key equivalent at all matches nothing.
-        assert!(!KeyEquivalent::default().matches("f", 8));
     }
 
     #[test]

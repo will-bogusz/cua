@@ -365,7 +365,6 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
     harness_appkit_type_text_background \
     harness_appkit_window_scoped_type_reaches_the_focused_field \
     harness_appkit_menu_key_equivalent_through_hotkey \
-    harness_appkit_disabled_until_key_chord_lands_as_its_menu_command \
     harness_appkit_type_text_waits_for_a_lagging_value_readback \
     harness_appkit_press_effect_after_the_first_sample_is_not_a_noop \
     harness_appkit_scroll_foreground \

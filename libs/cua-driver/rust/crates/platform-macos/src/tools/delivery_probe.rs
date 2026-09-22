@@ -431,38 +431,10 @@ impl DeliveryProbe {
     /// reacts pays the whole budget.
     pub fn compare(self) -> ProbeOutcome {
         let budget = settle_budget(&self.before);
-        self.compare_within(budget).0
-    }
-
-    /// `compare`, keeping the post-dispatch sample the verdict was reached
-    /// on, for a caller that changes the desktop afterwards — a restore of
-    /// the prior frontmost — and has to say whether the reaction survived it
-    /// (`reaction_persists`).
-    pub fn compare_keeping_sample(&self) -> (ProbeOutcome, Signals) {
-        let budget = settle_budget(&self.before);
         self.compare_within(budget)
     }
 
-    /// Whether the reaction `evidence` named is still in place: the signal
-    /// that moved reads now as it did in `reacted`. `None` when the signal
-    /// cannot be re-read, or when the verdict was not a reaction.
-    pub fn reaction_persists(&self, evidence: Evidence, reacted: &Signals) -> Option<bool> {
-        let now = self.sample();
-        match evidence {
-            Evidence::Changed(FOCUS_SIGNAL) => Some(now.focus.as_ref()? == reacted.focus.as_ref()?),
-            Evidence::Changed(TREE_SIGNAL) => Some(now.tree? == reacted.tree?),
-            Evidence::Changed(ELEMENT_SIGNAL) => {
-                Some(now.element.state()? == reacted.element.state()?)
-            }
-            Evidence::Changed(MENU_SIGNAL) => {
-                Some(!gained_menus(&self.before.menus, &now.menus).is_empty())
-            }
-            Evidence::ElementGone => Some(now.element == ElementRead::Gone),
-            _ => None,
-        }
-    }
-
-    fn compare_within(&self, budget: Duration) -> (ProbeOutcome, Signals) {
+    fn compare_within(&self, budget: Duration) -> ProbeOutcome {
         let start = Instant::now();
         let deadline = start + budget;
         loop {
@@ -470,12 +442,12 @@ impl DeliveryProbe {
             let evidence = classify(&self.before, &after, self.quiescent);
             let expired = Instant::now() >= deadline;
             if evidence.is_reaction() || expired {
-                return (self.outcome(evidence, start.elapsed(), &after), after);
+                return self.outcome(evidence, start.elapsed(), &after);
             }
             // A cancelled caller stops waiting on a target it no longer wants
             // and keeps the verdict observed so far.
             if cua_driver_core::operation::sleep(SETTLE_POLL).is_err() {
-                return (self.outcome(evidence, start.elapsed(), &after), after);
+                return self.outcome(evidence, start.elapsed(), &after);
             }
         }
     }
