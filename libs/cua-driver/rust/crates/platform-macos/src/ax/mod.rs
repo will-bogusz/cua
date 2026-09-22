@@ -24,6 +24,7 @@ pub mod date;
 pub mod enablement;
 pub mod exact_target;
 pub mod popup;
+pub mod projection;
 pub mod row_collapse;
 pub mod tree;
 pub mod window_scope;

@@ -275,6 +275,63 @@ pub struct WindowElement {
     pub max: Option<f64>,
 }
 
+/// A display-only row of the walked tree that carries text — a heading, a
+/// status line, a label — and has no `element_index` because nothing can be
+/// done to it. Projected by `query` exactly like `elements`.
+///
+/// Placement: `parent_index` is the `element_index` of its nearest actionable
+/// ancestor, absent when it has none; `after_index` is the `element_index` of
+/// the actionable row returned immediately before it in walk order, absent
+/// when no returned actionable row precedes it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct WindowTextRow {
+    pub role: String,
+    /// The row's title, else its accessibility description. Absent when it has
+    /// neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The row's string value. Absent when it has none or it is blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_index: Option<u64>,
+}
+
+/// A list, table or outline whose rows scrolled out of view were not read by
+/// the walk: `collapsed` of its `total` rows are unknown, not absent. Placed
+/// like [`WindowTextRow`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct CollapsedContainer {
+    pub collapsed: u64,
+    pub total: u64,
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_index: Option<u64>,
+}
+
+/// Rows under one matched container that `query` did not return because its
+/// expansion is capped: they were read and did not match, so they are neither
+/// unknown nor absent. `parent_index` is the container's own `element_index`
+/// when it is actionable, else its nearest actionable ancestor's; `after_index`
+/// is the last actionable row returned from the container.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct QueryHiddenRows {
+    pub hidden: u64,
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_index: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct ElementCustomAction {
     pub name: String,
@@ -318,6 +375,24 @@ pub struct WindowStateOutput {
     /// read, an unresolved window — and absence proves nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elements_complete: Option<bool>,
+    /// Display-only rows with text. Absent when no tree was walked or the
+    /// provider does not publish them; an empty array is a walk that found
+    /// none (under `elements_complete` semantics: absence proves nothing when
+    /// the walk gave something up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_rows: Option<Vec<WindowTextRow>>,
+    /// Containers with unread scrolled-out rows. Absent when no tree was
+    /// walked or the provider does not report them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapsed_containers: Option<Vec<CollapsedContainer>>,
+    /// Rows the `query` matched (ancestors and container expansion excluded).
+    /// Absent without a query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_match_count: Option<u64>,
+    /// Per matched container, the rows the query's expansion cap did not
+    /// return. Absent without a query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_hidden_rows: Option<Vec<QueryHiddenRows>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,6 +511,23 @@ mod tests {
             assert!(output.elements.is_some());
             output.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn display_rows_and_query_counts_are_typed_and_closed() {
+        let value = json!({
+            "pid":7,"window_id":9,"elements":[],"elements_complete":true,
+            "text_rows":[{"role":"AXStaticText","value":"Version 2.1","depth":2,"parent_index":0,"after_index":3}],
+            "collapsed_containers":[{"collapsed":5,"total":25,"depth":2,"parent_index":1}],
+            "query_match_count":2,
+            "query_hidden_rows":[{"hidden":9,"depth":2,"parent_index":1,"after_index":13}]
+        });
+        assert!(crate::validate_success_output("get_window_state", value.clone()).is_ok());
+        let output: WindowStateOutput = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(output.text_rows.unwrap()[0].after_index, Some(3));
+        let mut misspelled = value;
+        misspelled["query_hidden_rows"][0]["hiden"] = json!(1);
+        assert!(crate::validate_success_output("get_window_state", misspelled).is_err());
     }
 
     #[test]

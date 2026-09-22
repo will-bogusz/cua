@@ -205,8 +205,27 @@ struct WalkScope {
     related_windows: Vec<RelatedWindow>,
     modal_windows: Vec<RelatedWindow>,
     background_open_restricted: std::collections::HashSet<usize>,
+    node_rows: Vec<usize>,
+    collapsed_containers: Vec<CollapsedContainer>,
 }
 
+/// A list/table/outline whose rows the walk did not read because they are
+/// scrolled out of view ([`super::row_collapse`]). Its markdown note row sits
+/// at `row` in the walk's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollapsedContainer {
+    pub row: usize,
+    /// `element_index` of the nearest actionable ancestor of the unread rows:
+    /// the container itself when it is actionable.
+    pub parent_index: Option<usize>,
+    pub depth: usize,
+    /// Rows not read.
+    pub collapsed: usize,
+    /// Rows the container reported in all.
+    pub total: usize,
+}
+
+#[derive(Default)]
 pub struct TreeWalkResult {
     /// Background capability classification is read under the same native budget.
     pub background_open_restricted: std::collections::HashSet<usize>,
@@ -245,6 +264,14 @@ pub struct TreeWalkResult {
     /// the app reports it nowhere — absence is unknown, never "saved".
     pub document_edited: Option<bool>,
     pub collapsed_rows: usize,
+    /// Parallel to `nodes`: the row (rendered line, before any query) each
+    /// node printed as. Rows are the unit the query projection works on.
+    pub node_rows: Vec<usize>,
+    /// Every container whose scrolled-out rows the walk left unread, in walk
+    /// order.
+    pub collapsed_containers: Vec<CollapsedContainer>,
+    /// What the query returned of the walk's rows; `None` without a query.
+    pub query: Option<super::projection::QueryProjection>,
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -261,7 +288,7 @@ pub struct TreeWalkResult {
 ///
 /// # Safety
 /// Calls macOS AX API. Must be called on a thread that has a CF run loop.
-pub fn walk_tree(pid: i32, window_id: Option<u32>, query: Option<&str>) -> TreeWalkResult {
+pub fn walk_tree(pid: i32, window_id: Option<u32>, query: Option<&[String]>) -> TreeWalkResult {
     walk_tree_bounded(
         pid,
         window_id,
@@ -282,7 +309,7 @@ pub fn walk_tree(pid: i32, window_id: Option<u32>, query: Option<&str>) -> TreeW
 pub fn walk_tree_bounded(
     pid: i32,
     window_id: Option<u32>,
-    query: Option<&str>,
+    query: Option<&[String]>,
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
@@ -299,7 +326,7 @@ pub fn walk_tree_bounded(
 pub(crate) fn walk_tree_with_timeout(
     pid: i32,
     window_id: Option<u32>,
-    query: Option<&str>,
+    query: Option<&[String]>,
     max_elements: usize,
     max_depth: usize,
     timeout: std::time::Duration,
@@ -311,6 +338,8 @@ pub(crate) fn walk_tree_with_timeout(
         related_windows: Vec::new(),
         modal_windows: Vec::new(),
         background_open_restricted: std::collections::HashSet::new(),
+        node_rows: Vec::new(),
+        collapsed_containers: Vec::new(),
     };
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
@@ -343,6 +372,9 @@ pub(crate) fn walk_tree_with_timeout(
                 document: None,
                 document_edited: None,
                 collapsed_rows: 0,
+                node_rows: Vec::new(),
+                collapsed_containers: Vec::new(),
+                query: None,
             };
         }
 
@@ -629,11 +661,12 @@ pub(crate) fn walk_tree_with_timeout(
     let stop_reason = super::budget::stop_reason();
     let timed_out = stop_reason == Some(super::budget::StopReason::Deadline);
     let truncated_flag = truncation.any() || stop_reason.is_some();
-    let raw_markdown = render_lines(&lines);
-    let mut tree_markdown = if let Some(q) = query {
-        filter_tree(&raw_markdown, q)
-    } else {
-        raw_markdown
+    let projection = query.map(|literals| super::projection::project(&lines, literals));
+    let mut tree_markdown = match &projection {
+        Some(projection) => {
+            render_lines(&super::projection::projected_rows(&lines, projection))
+        }
+        None => render_lines(&lines),
     };
 
     if timed_out {
@@ -675,6 +708,9 @@ pub(crate) fn walk_tree_with_timeout(
         document,
         document_edited,
         collapsed_rows: truncation.collapsed_rows,
+        node_rows: scope.node_rows,
+        collapsed_containers: scope.collapsed_containers,
+        query: projection,
     }
 }
 
@@ -1007,6 +1043,7 @@ unsafe fn walk_element(
     let next_parent = node.element_index.or(parent_index);
 
     let line = format_node_line(&node);
+    scope.node_rows.push(lines.len());
     lines.push((depth, line));
     nodes.push(node);
 
@@ -1069,6 +1106,13 @@ unsafe fn walk_children(
     }
     if let Some(rows) = collapsed {
         truncation.collapsed_rows += rows.count();
+        scope.collapsed_containers.push(CollapsedContainer {
+            row: lines.len(),
+            parent_index,
+            depth: child_depth,
+            collapsed: rows.count(),
+            total: rows.total(),
+        });
         lines.push((
             child_depth,
             format!(
@@ -1276,64 +1320,6 @@ fn render_lines(lines: &[(usize, String)]) -> String {
         out.push('\n');
     }
     out
-}
-
-/// Filter the tree markdown to lines matching `query` plus their ancestor chain.
-fn filter_tree(markdown: &str, query: &str) -> String {
-    let needle = query.to_lowercase();
-    let lines: Vec<&str> = markdown.lines().collect();
-
-    let mut current_ancestor: Vec<&str> = Vec::new();
-    let mut last_emitted_at: Vec<Option<&str>> = Vec::new();
-    let mut output: Vec<&str> = Vec::new();
-
-    for line in &lines {
-        let depth = leading_indent_depth(line);
-
-        while current_ancestor.len() <= depth {
-            current_ancestor.push("");
-            last_emitted_at.push(None);
-        }
-        for emitted_at in last_emitted_at.iter_mut().skip(depth + 1) {
-            *emitted_at = None;
-        }
-        current_ancestor[depth] = line;
-
-        if line.to_lowercase().contains(&needle) {
-            for ancestor_depth in 0..depth {
-                let ancestor = current_ancestor[ancestor_depth];
-                if ancestor.is_empty() {
-                    continue;
-                }
-                if last_emitted_at[ancestor_depth] == Some(ancestor) {
-                    continue;
-                }
-                last_emitted_at[ancestor_depth] = Some(ancestor);
-                output.push(ancestor);
-            }
-            last_emitted_at[depth] = Some(line);
-            output.push(line);
-        }
-    }
-
-    if output.is_empty() {
-        return String::new();
-    }
-    let mut result = output.join("\n");
-    result.push('\n');
-    result
-}
-
-fn leading_indent_depth(line: &str) -> usize {
-    let mut count = 0;
-    for ch in line.chars() {
-        if ch == ' ' {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count / 2
 }
 
 #[cfg(test)]

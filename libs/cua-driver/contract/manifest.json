@@ -1708,6 +1708,54 @@
               "null"
             ]
           },
+          "collapsed_containers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "after_index": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "collapsed": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "depth": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "parent_index": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "total": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "collapsed",
+                "total",
+                "depth"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "degraded": {
             "type": [
               "boolean",
@@ -1912,6 +1960,56 @@
             "minimum": 0,
             "type": "integer"
           },
+          "query_hidden_rows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "after_index": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "depth": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "hidden": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "parent_index": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "hidden",
+                "depth"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "query_match_count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "returned_element_count": {
             "format": "uint64",
             "minimum": 0,
@@ -1964,6 +2062,58 @@
           "snapshot_id": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "text_rows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "after_index": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "depth": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "parent_index": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "role": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "role",
+                "depth"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },

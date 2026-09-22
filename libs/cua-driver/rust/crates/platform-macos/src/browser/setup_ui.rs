@@ -1749,18 +1749,9 @@ mod tests {
 
     fn tree(nodes: Vec<AXNode>) -> TreeWalkResult {
         TreeWalkResult {
-            background_open_restricted: std::collections::HashSet::new(),
-            related_windows: Vec::new(),
-            modal_windows: Vec::new(),
-            tree_markdown: String::new(),
             nodes,
-            truncated: false,
-            timed_out: false,
-            stop_reason: None,
             window_scope: Some(crate::ax::WindowScope::Matched),
-            document: None,
-            document_edited: None,
-            collapsed_rows: 0,
+            ..TreeWalkResult::default()
         }
     }
 
@@ -1885,18 +1876,9 @@ mod tests {
     #[test]
     fn pixel_fallback_requires_committed_navigation_and_complete_ax_proof() {
         let truncated = TreeWalkResult {
-            background_open_restricted: std::collections::HashSet::new(),
-            related_windows: Vec::new(),
-            modal_windows: Vec::new(),
-            tree_markdown: String::new(),
-            nodes: Vec::new(),
             truncated: true,
-            timed_out: false,
-            stop_reason: None,
             window_scope: Some(crate::ax::WindowScope::Matched),
-            document: None,
-            document_edited: None,
-            collapsed_rows: 0,
+            ..TreeWalkResult::default()
         };
         assert!(
             exact_pixel_setup_checkbox(0, &truncated, 0, chrome(), false)

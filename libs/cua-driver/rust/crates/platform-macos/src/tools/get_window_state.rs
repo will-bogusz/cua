@@ -120,11 +120,22 @@ fn def() -> &'static ToolDef {
             app's own save action (`press_key` cmd+s, or `invoke_menu` File > Save) \
             and re-check `document_edited`; when the file's bytes matter, re-read \
             `document_path` from disk.\n\n\
-            Optional `query` projects both tree_markdown and structured `elements` to \
-            matching lines plus their ancestor chain (case-insensitive substring). The \
-            element_index values are unchanged, the complete snapshot remains actionable, \
-            and `element_count` continues to report its total size; \
-            `filtered_element_count` reports the projected response size.\n\n\
+            Optional `query` (a string, or an array of strings any of which may match) \
+            projects both tree_markdown and the structured rows to the rows it matches \
+            (case-insensitive substring of the rendered row; a literal may contain any \
+            character, `|` included) plus their ancestor chain. A matched row that holds \
+            rows beneath it also returns the first 12 rows of its subtree unless a deeper \
+            match lies inside it; what that cap left out is counted in \
+            `query_hidden_rows` and in a markdown note row. `query_match_count` is the \
+            number of matched rows. The element_index values are unchanged, the complete \
+            snapshot remains actionable, and `element_count` continues to report its \
+            total size; `filtered_element_count` reports the projected response size.\n\n\
+            `text_rows` carries the display-only rows that have text (no element_index: \
+            a heading, a status line, a label), and `collapsed_containers` each list \
+            whose scrolled-out rows the walk did not read (`collapsed` of `total`). Both \
+            are projected by `query` like `elements`, and each row is placed by \
+            `parent_index` (its nearest actionable ancestor) and `after_index` (the \
+            actionable row returned immediately before it; absent when none precedes it).\n\n\
             Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
             context-window blow-up on Electron / Obsidian / large web apps that \
             produce 10k+ element trees. When applied, BOTH the markdown \
@@ -137,7 +148,7 @@ fn def() -> &'static ToolDef {
                 "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
-                "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching actionable rows plus their actionable ancestors without renumbering element_index values." },
+                "query": { "type": ["string", "array"], "description": "Case-insensitive substring filter for tree_markdown and the structured rows: one literal, or an array of literals (non-empty, strings only) any of which may match. Returns matching rows plus their ancestors, and the first 12 rows under a matched container, without renumbering element_index values." },
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree": {
                     "type": "boolean",
@@ -260,7 +271,10 @@ impl Tool for GetWindowStateTool {
             }
         }
 
-        let query = args.opt_str("query");
+        let query = match parse_query(args.get("query")) {
+            Ok(query) => query,
+            Err(message) => return ToolResult::error(message),
+        };
         let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
             // Expand ~ prefix.
             if let Some(relative) = s.strip_prefix("~/") {
@@ -669,11 +683,20 @@ impl Tool for GetWindowStateTool {
             (None, Some(r)) if scope_matched => build_elements_array_with_token(&r.nodes, None),
             _ => Vec::new(),
         };
-        let elements_json = cua_driver_core::element_query::project_elements_for_query(
-            elements_json,
-            query.as_deref(),
-            &tree_md,
-        );
+        let elements_json = match tree_result.as_ref() {
+            Some(walk) if walk.query.is_some() => {
+                let returned = returned_element_indices(walk);
+                elements_json
+                    .into_iter()
+                    .filter(|entry| {
+                        entry["element_index"]
+                            .as_u64()
+                            .is_some_and(|index| returned.contains(&(index as usize)))
+                    })
+                    .collect()
+            }
+            _ => elements_json,
+        };
         let filtered_element_count = elements_json.len();
         let elements_complete =
             elements_are_complete(scope_matched, tree_result.as_ref().map(|r| r.truncated));
@@ -701,6 +724,15 @@ impl Tool for GetWindowStateTool {
         });
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
+        }
+        if let Some(walk) = tree_result.as_ref().filter(|_| scope_matched) {
+            let rows = annotated_rows(walk);
+            structured["text_rows"] = serde_json::json!(rows.text_rows);
+            structured["collapsed_containers"] = serde_json::json!(rows.collapsed_containers);
+            if let Some(projection) = walk.query.as_ref() {
+                structured["query_match_count"] = serde_json::json!(projection.matched);
+                structured["query_hidden_rows"] = serde_json::json!(rows.query_hidden_rows);
+            }
         }
         // Absent when no walk ran, so absent stays "unknown", not "nothing cut".
         if let Some(walk) = tree_result.as_ref() {
@@ -1023,6 +1055,138 @@ fn desktop_surface_scope_json(
 /// domain, so a filtered array stays complete for that query.
 fn elements_are_complete(scope_matched: bool, walk_truncated: Option<bool>) -> bool {
     scope_matched && walk_truncated == Some(false)
+}
+
+/// The `query` argument: one literal, or an array of literals any of which
+/// may match. `None` when absent or null.
+fn parse_query(value: Option<&serde_json::Value>) -> Result<Option<Vec<String>>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(literal)) => Ok(Some(vec![literal.clone()])),
+        Some(serde_json::Value::Array(items)) if !items.is_empty() => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "query array entries must be strings".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(serde_json::Value::Array(_)) => {
+            Err("query array must name at least one literal".to_owned())
+        }
+        Some(_) => Err("query must be a string or an array of strings".to_owned()),
+    }
+}
+
+/// `element_index` of every actionable node whose row the walk's query
+/// projection returned (every actionable node when there is no query).
+fn returned_element_indices(walk: &crate::ax::TreeWalkResult) -> std::collections::HashSet<usize> {
+    walk.nodes
+        .iter()
+        .zip(&walk.node_rows)
+        .filter(|(_, &row)| row_returned(walk, row))
+        .filter_map(|(node, _)| node.element_index)
+        .collect()
+}
+
+fn row_returned(walk: &crate::ax::TreeWalkResult, row: usize) -> bool {
+    walk.query
+        .as_ref()
+        .is_none_or(|projection| projection.kept.get(row).copied().unwrap_or(false))
+}
+
+/// The structured rows that carry no `element_index`, each placed by
+/// `parent_index` (nearest actionable ancestor) and `after_index` (the
+/// actionable row returned just before it).
+struct AnnotatedRows {
+    text_rows: Vec<serde_json::Value>,
+    collapsed_containers: Vec<serde_json::Value>,
+    query_hidden_rows: Vec<serde_json::Value>,
+}
+
+fn nonblank(text: &Option<String>) -> Option<&str> {
+    text.as_deref().filter(|text| !text.trim().is_empty())
+}
+
+fn place(entry: &mut serde_json::Value, parent_index: Option<usize>, after_index: Option<usize>) {
+    if let Some(parent) = parent_index {
+        entry["parent_index"] = serde_json::json!(parent);
+    }
+    if let Some(after) = after_index {
+        entry["after_index"] = serde_json::json!(after);
+    }
+}
+
+fn annotated_rows(walk: &crate::ax::TreeWalkResult) -> AnnotatedRows {
+    let placer = crate::ax::projection::Placer::new(
+        walk.nodes
+            .iter()
+            .zip(&walk.node_rows)
+            .filter_map(|(node, &row)| node.element_index.map(|index| (row, index))),
+        |row| row_returned(walk, row),
+    );
+    let text_rows = walk
+        .nodes
+        .iter()
+        .zip(&walk.node_rows)
+        .filter(|(node, &row)| node.element_index.is_none() && row_returned(walk, row))
+        .filter_map(|(node, &row)| {
+            let label = nonblank(&node.title).or_else(|| nonblank(&node.description));
+            let value = nonblank(&node.value);
+            if label.is_none() && value.is_none() {
+                return None;
+            }
+            let mut entry = serde_json::json!({ "role": node.role, "depth": node.depth });
+            if let Some(label) = label {
+                entry["label"] = serde_json::json!(label);
+            }
+            if let Some(value) = value {
+                entry["value"] = serde_json::json!(value);
+            }
+            place(&mut entry, node.parent_element_index, placer.at(row));
+            Some(entry)
+        })
+        .collect();
+    let collapsed_containers = walk
+        .collapsed_containers
+        .iter()
+        .filter(|container| row_returned(walk, container.row))
+        .map(|container| {
+            let mut entry = serde_json::json!({
+                "collapsed": container.collapsed,
+                "total": container.total,
+                "depth": container.depth,
+            });
+            place(&mut entry, container.parent_index, placer.at(container.row));
+            entry
+        })
+        .collect();
+    let node_at_row: std::collections::HashMap<usize, &crate::ax::AXNode> =
+        walk.node_rows.iter().copied().zip(&walk.nodes).collect();
+    let query_hidden_rows = walk
+        .query
+        .iter()
+        .flat_map(|projection| &projection.hidden)
+        .map(|capped| {
+            let container = node_at_row.get(&capped.container);
+            let mut entry = serde_json::json!({
+                "hidden": capped.hidden,
+                "depth": capped.depth,
+            });
+            place(
+                &mut entry,
+                container.and_then(|node| node.element_index.or(node.parent_element_index)),
+                placer.after(capped.last_shown),
+            );
+            entry
+        })
+        .collect();
+    AnnotatedRows {
+        text_rows,
+        collapsed_containers,
+        query_hidden_rows,
+    }
 }
 
 /// Render the actionable nodes from the AX walk into the
@@ -1429,7 +1593,6 @@ mod window_scope_contract_tests {
 mod tests {
     use super::*;
     use crate::ax::tree::AXNode;
-    use cua_driver_core::element_query::project_elements_for_query;
     use serde_json::json;
 
     fn node(
@@ -1595,92 +1758,116 @@ mod tests {
     }
 
     #[test]
-    fn query_projection_keeps_only_rendered_actionable_rows() {
+    fn query_projection_returns_matched_rows_with_their_anchors_and_text() {
+        // rows: 0 window, 1 static text, 2 menu, 3 "Left", 4 unrelated button
+        let mut label = node(None, "AXStaticText", None, 1, Some(0), None, vec![]);
+        label.value = Some("Arrange windows".into());
         let nodes = vec![
             node(Some(0), "AXWindow", Some("Document"), 0, None, None, vec![]),
-            node(
-                Some(1),
-                "AXMenuItem",
-                Some("Window"),
-                1,
-                Some(0),
-                None,
-                vec![],
-            ),
-            node(
-                Some(2),
-                "AXMenuItem",
-                Some("Move & Resize"),
-                2,
-                Some(1),
-                None,
-                vec![],
-            ),
-            node(
-                Some(3),
-                "AXMenuItem",
-                Some("Left"),
-                3,
-                Some(2),
-                None,
-                vec![],
-            ),
-            node(
-                Some(4),
-                "AXButton",
-                Some("Unrelated"),
-                1,
-                Some(0),
-                None,
-                vec![],
-            ),
+            label,
+            node(Some(1), "AXMenuItem", Some("Arrange"), 1, Some(0), None, vec![]),
+            node(Some(2), "AXMenuItem", Some("Left"), 2, Some(1), None, vec![]),
+            node(Some(3), "AXButton", Some("Unrelated"), 1, Some(0), None, vec![]),
         ];
-        let elements = build_elements_array_with_token(&nodes, None);
-        let filtered_markdown = concat!(
-            "- [0] AXWindow \"Document\"\n",
-            "  - [1] AXMenuItem \"Window\"\n",
-            "    - [2] AXMenuItem \"Move & Resize\"\n",
-            "      - [3] AXMenuItem \"Left\"\n",
-        );
-
-        let projected = project_elements_for_query(elements, Some("Left"), filtered_markdown);
-        let indices: Vec<u64> = projected
+        let rows: Vec<(usize, String)> = nodes
             .iter()
-            .map(|entry| entry["element_index"].as_u64().unwrap())
+            .map(|n| (n.depth, format!("- {} {:?} {:?}", n.role, n.title, n.value)))
             .collect();
-
-        assert_eq!(indices, vec![0, 1, 2, 3]);
+        let walk = crate::ax::TreeWalkResult {
+            node_rows: (0..nodes.len()).collect(),
+            query: Some(crate::ax::projection::project(
+                &rows,
+                &["arrange".to_owned()],
+            )),
+            nodes,
+            ..Default::default()
+        };
+        let mut returned: Vec<_> = returned_element_indices(&walk).into_iter().collect();
+        returned.sort_unstable();
+        // "Arrange" matched twice: the text row and the menu, which expands to
+        // "Left"; the unrelated button is not returned.
+        assert_eq!(returned, [0, 1, 2]);
+        let annotated = annotated_rows(&walk);
+        assert_eq!(
+            annotated.text_rows,
+            [json!({"role": "AXStaticText", "value": "Arrange windows", "depth": 1,
+                    "parent_index": 0, "after_index": 0})]
+        );
+        assert!(annotated.query_hidden_rows.is_empty());
+        // The producer's spelling is the contract's: the typed rows are closed.
+        serde_json::from_value::<Vec<cua_driver_contract::WindowTextRow>>(json!(
+            annotated.text_rows
+        ))
+        .expect("text rows match the contract");
     }
 
     #[test]
-    fn query_projection_returns_no_elements_when_markdown_has_no_match() {
-        let nodes = vec![node(
-            Some(0),
-            "AXButton",
-            Some("Unrelated"),
-            0,
-            None,
-            None,
-            vec![],
-        )];
-        let elements = build_elements_array_with_token(&nodes, None);
-
-        let projected = project_elements_for_query(elements, Some("zoomLeft"), "");
-
-        assert!(projected.is_empty());
-    }
-
-    #[test]
-    fn unfiltered_projection_preserves_every_element() {
-        let nodes = vec![
-            node(Some(0), "AXButton", Some("One"), 0, None, None, vec![]),
-            node(Some(1), "AXButton", Some("Two"), 0, None, None, vec![]),
+    fn unread_rows_and_capped_expansions_are_placed_after_the_last_returned_row() {
+        let mut nodes = vec![
+            node(Some(0), "AXWindow", Some("Finder"), 0, None, None, vec![]),
+            node(Some(1), "AXOutline", Some("Files"), 1, Some(0), None, vec![]),
         ];
-        let elements = build_elements_array_with_token(&nodes, None);
+        let mut rows: Vec<(usize, String)> = vec![
+            (0, "- [0] AXWindow \"Finder\"".into()),
+            (1, "- [1] AXOutline \"Files\"".into()),
+        ];
+        for n in 0..20 {
+            nodes.push(node(Some(n + 2), "AXRow", Some("row"), 2, Some(1), None, vec![]));
+            rows.push((2, format!("- [{}] AXRow \"row {n}\"", n + 2)));
+        }
+        let collapsed_row = rows.len();
+        rows.push((2, "- 5 of 25 rows are scrolled out of view and were not read".into()));
+        let walk = crate::ax::TreeWalkResult {
+            node_rows: (0..nodes.len()).collect(),
+            collapsed_containers: vec![crate::ax::tree::CollapsedContainer {
+                row: collapsed_row,
+                parent_index: Some(1),
+                depth: 2,
+                collapsed: 5,
+                total: 25,
+            }],
+            query: Some(crate::ax::projection::project(&rows, &["files".to_owned()])),
+            nodes,
+            ..Default::default()
+        };
+        let annotated = annotated_rows(&walk);
+        // The note beyond the expansion cap is not returned, so neither is its
+        // structured twin; the cap itself is counted under the outline.
+        assert!(annotated.collapsed_containers.is_empty());
+        assert_eq!(
+            annotated.query_hidden_rows,
+            [json!({"hidden": 9, "depth": 2, "parent_index": 1, "after_index": 13})]
+        );
+        let unfiltered = crate::ax::TreeWalkResult {
+            query: None,
+            ..walk
+        };
+        assert_eq!(
+            annotated_rows(&unfiltered).collapsed_containers,
+            [json!({"collapsed": 5, "total": 25, "depth": 2,
+                    "parent_index": 1, "after_index": 21})]
+        );
+        serde_json::from_value::<Vec<cua_driver_contract::QueryHiddenRows>>(json!(
+            annotated.query_hidden_rows
+        ))
+        .expect("hidden rows match the contract");
+        serde_json::from_value::<Vec<cua_driver_contract::CollapsedContainer>>(json!(
+            annotated_rows(&unfiltered).collapsed_containers
+        ))
+        .expect("collapsed containers match the contract");
+    }
 
-        let projected = project_elements_for_query(elements, None, "");
-
-        assert_eq!(projected.len(), 2);
+    #[test]
+    fn a_query_is_a_literal_or_a_nonempty_array_of_literals() {
+        assert_eq!(parse_query(None), Ok(None));
+        assert_eq!(parse_query(Some(&json!("a|b"))), Ok(Some(vec!["a|b".to_owned()])));
+        assert_eq!(
+            parse_query(Some(&json!(["a", "b"]))),
+            Ok(Some(vec!["a".to_owned(), "b".to_owned()]))
+        );
+        assert!(parse_query(Some(&json!([]))).is_err());
+        assert!(parse_query(Some(&json!(["a", 1]))).is_err());
+        assert!(parse_query(Some(&json!(7))).is_err());
     }
 
     #[test]
