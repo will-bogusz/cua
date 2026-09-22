@@ -1221,10 +1221,7 @@ impl Tool for ClickTool {
             } else {
                 false
             };
-            // `show_menu` needs the same coordinate frame: AXShowMenu can
-            // report success without opening a menu, and only a real pointer
-            // right-click at the element centre reaches one then.
-            let mut element_pixel = if selection_candidate || effective_action == "show_menu" {
+            let mut selection_pixel = if selection_candidate {
                 if let Some((cx, cy)) = center {
                     super::px_frame::resolve_or_refuse(wid)
                         .await
@@ -1241,12 +1238,12 @@ impl Tool for ClickTool {
             } else {
                 None
             };
-            // Both fallbacks deliver a routed window-local pixel event — a
-            // stricter (WindowPointer) rung than the semantic gate above. In
-            // background, drop the fallback rather than silently escalate when
-            // the pointer rung would refuse (e.g. a minimized/hidden target);
-            // the semantic path still runs.
-            if element_pixel.is_some()
+            // The selection fallback delivers a routed window-local pixel
+            // click — a stricter (WindowPointer) rung than the semantic gate
+            // above. In background, drop the fallback rather than silently
+            // escalate when the pointer rung would refuse (e.g. a
+            // minimized/hidden target); the semantic path still runs.
+            if selection_pixel.is_some()
                 && !delivery_mode.is_foreground()
                 && _mutation_lease
                     .as_ref()
@@ -1259,12 +1256,8 @@ impl Tool for ClickTool {
                     .await
                     .is_err()
             {
-                element_pixel = None;
+                selection_pixel = None;
             }
-            let selection_pixel = selection_candidate.then_some(element_pixel).flatten();
-            let menu_pixel = (effective_action == "show_menu")
-                .then_some(element_pixel)
-                .flatten();
 
             // Background delivery cannot produce trusted pointer events, so a
             // control driven by pointerdown ignores this press while AX still
@@ -1325,7 +1318,6 @@ impl Tool for ClickTool {
                                     },
                                     &ck,
                                     selection_pixel,
-                                    menu_pixel,
                                     &selection_modifiers,
                                     foreground,
                                 )?);
@@ -1362,7 +1354,6 @@ impl Tool for ClickTool {
                                 },
                                 &ck,
                                 selection_pixel,
-                                menu_pixel,
                                 &selection_modifiers,
                                 false,
                             )
@@ -2289,7 +2280,6 @@ fn perform_ax_click(
     requested: RequestedAction<'_>,
     cursor_key: &str,
     selection_pixel: Option<SelectionPixelTarget>,
-    menu_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
 ) -> anyhow::Result<AxClickOutcome> {
@@ -2499,47 +2489,15 @@ fn perform_ax_click(
 
     let mut summary = ax_reply_summary(unverified.as_ref(), &ax_action, idx, &role, &title);
 
-    // AXShowMenu returns success on controls that never open a menu, which
-    // left `click(button:"right")` with no way to reach a context menu at all.
-    // A real pointer right-click at the element centre is the actuation a user
-    // performs, so cross that rung once the AX action proved empty. A reply
-    // that cannot say what the app did is not that proof: naming the rung is
-    // then the whole escalation, because a second actuation could act twice.
+    // AXShowMenu returns success on controls that never open a menu. Say so
+    // rather than improvising a second actuator: a pointer right-click after
+    // an effect nobody observed could act twice.
     if ax_action == "AXShowMenu" && !crate::windows::menu_appeared_since(pid, &menus_before) {
-        match menu_pixel.filter(|_| unverified.is_none()) {
-            Some(target) => {
-                crate::input::mouse::right_click_at_xy_with_window_local(
-                    pid,
-                    target.screen_x,
-                    target.screen_y,
-                    target.window_x,
-                    target.window_y,
-                    window_id,
-                    &[],
-                )?;
-                return Ok(AxClickOutcome {
-                    summary: format!(
-                        "✅ Right-clicked [{idx}] {role} \"{title}\" at its centre \
-                         ({:.0}, {:.0}): AXShowMenu opened no menu, so a real pointer \
-                         right-click was delivered.",
-                        target.screen_x, target.screen_y
-                    ),
-                    selection_via_pixel: true,
-                    ..AxClickOutcome::default()
-                });
-            }
-            None => summary.push_str(&format!(
-                "\n⚠️ No menu appeared and no pointer right-click was delivered ({}). \
-                 Re-observe, then right-click by pixel with delivery_mode:\"foreground\".",
-                if unverified.is_some() {
-                    "the AXShowMenu reply cannot establish what the app did, so a second \
-                     actuation was not improvised"
-                } else {
-                    "AXShowMenu reported success; the pixel right-click was unavailable — no \
-                     resolvable frame, or the pointer rung is refused for this target"
-                }
-            )),
-        }
+        summary.push_str(
+            "\n⚠️ No menu appeared after AXShowMenu, and nothing else was sent. Re-observe; \
+             to reach a context menu this control does not open through accessibility, \
+             right-click it by pixel.",
+        );
     }
 
     // AXPopUpButton: name the options and the route that does not depend on
