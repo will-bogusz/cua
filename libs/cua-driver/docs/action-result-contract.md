@@ -116,6 +116,13 @@ changes that. Its payload names the control and the state the decision read:
 `front_in_process`, and `obscured_by` when another window of the same process
 is in front.
 
+`same_pid_keyboard_ambiguity` escalates with `target: "foreground"` for keys
+and chords, which have no element route, and `target: "element"` for text,
+which an exact element write can still reach. Its payload names the rivals as
+`competing_windows: [{window_id, title}]`; `title` is absent when WindowServer
+publishes none (an untitled window, or a driver without the Screen Recording
+grant), and `competing_windows` is absent on every other refusal.
+
 These payloads may also carry `effect: "not_dispatched"`. That value is
 deliberately not a member of the closed `ActionEffect` enum: an `ActionResult`
 is only produced once an actuator ran, so nothing that reaches the typed
