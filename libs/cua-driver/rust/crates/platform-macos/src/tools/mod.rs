@@ -1139,6 +1139,8 @@ impl Default for SessionConfigRegistry {
 pub struct ToolState {
     pub(crate) rendering_leases: Arc<crate::capture_lease::WindowRenderingLeases>,
     pub element_cache: Arc<ElementCache>,
+    /// Cross-snapshot accessibility-object continuity (`element_id`).
+    pub element_ids: Arc<crate::ax::continuity::ElementIds>,
     pub cursor_registry: Arc<CursorRegistry>,
     pub zoom_registry: Arc<ZoomRegistry>,
     pub resize_registry: Arc<ResizeRegistry>,
@@ -1178,6 +1180,7 @@ impl ToolState {
     ) -> Self {
         Self {
             element_cache: Arc::new(ElementCache::new()),
+            element_ids: Arc::default(),
             rendering_leases: Arc::new(crate::capture_lease::WindowRenderingLeases::default()),
             cursor_registry: Arc::new(CursorRegistry::new()),
             zoom_registry: Arc::new(ZoomRegistry::new()),

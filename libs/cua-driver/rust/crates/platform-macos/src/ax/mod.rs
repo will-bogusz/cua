@@ -21,6 +21,7 @@ pub mod bindings;
 pub(crate) mod budget;
 pub mod cache;
 pub mod date;
+pub mod continuity;
 pub mod enablement;
 pub mod exact_target;
 pub mod popup;

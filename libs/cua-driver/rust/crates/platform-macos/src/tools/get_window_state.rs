@@ -142,6 +142,11 @@ fn def() -> &'static ToolDef {
             `no_focus`, `unreadable`, `not_addressable` (a display-only row), \
             `outside_tree` (a complete walk does not contain it) or \
             `not_in_partial_tree`.\n\n\
+            Each element also carries `element_id`, which repeats across snapshots in \
+            this driver process only while the row is provably the same accessibility \
+            object (same process instance and role, CFEqual). It is object continuity, \
+            not record identity (an app may reuse an object for other content), and it \
+            is not an address: act through element_token.\n\n\
             Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
             context-window blow-up on Electron / Obsidian / large web apps that \
             produce 10k+ element trees. When applied, BOTH the markdown \
@@ -358,8 +363,11 @@ impl Tool for GetWindowStateTool {
             .map(|v| v.max(1) as usize)
             .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
 
+        let mut element_ids: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
         let (tree_result, prepared_snapshot) = if want_tree {
             let q = query.clone();
+            let registry = self.state.element_ids.clone();
             // The walk shares one deadline across native requests. Await its
             // actual completion: dropping a timed-out blocking JoinHandle would
             // leave AX work running after the tool reported that it had stopped.
@@ -371,11 +379,36 @@ impl Tool for GetWindowStateTool {
                     max_elements,
                     max_depth,
                 );
+                // Continuity is proven while the walk still holds every
+                // actionable element it publishes.
+                let sightings: Vec<_> = tree
+                    .nodes
+                    .iter()
+                    .filter_map(|node| {
+                        node.element_index.map(|index| {
+                            (
+                                index,
+                                crate::ax::continuity::Sighting {
+                                    element: node.element_ptr,
+                                    role: &node.role,
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                let (indices, sightings): (Vec<usize>, Vec<_>) = sightings.into_iter().unzip();
+                let ids: std::collections::HashMap<usize, String> = indices
+                    .into_iter()
+                    .zip(unsafe { registry.assign(pid, &sightings) })
+                    .collect();
                 let payload = crate::ax::cache::CachedSnapshot::from_nodes(&tree.nodes);
-                (tree, payload)
+                (tree, payload, ids)
             });
             match walk_future.await {
-                Ok((tree, payload)) => (Some(tree), Some(payload)),
+                Ok((tree, payload, ids)) => {
+                    element_ids = ids;
+                    (Some(tree), Some(payload))
+                }
                 Err(e) => return ToolResult::error(format!("AX tree walk failed: {e}")),
             }
         } else {
@@ -703,6 +736,15 @@ impl Tool for GetWindowStateTool {
             }
             _ => elements_json,
         };
+        let mut elements_json = elements_json;
+        for entry in &mut elements_json {
+            if let Some(id) = entry["element_index"]
+                .as_u64()
+                .and_then(|index| element_ids.get(&(index as usize)))
+            {
+                entry["element_id"] = serde_json::json!(id);
+            }
+        }
         let filtered_element_count = elements_json.len();
         let elements_complete =
             elements_are_complete(scope_matched, tree_result.as_ref().map(|r| r.truncated));

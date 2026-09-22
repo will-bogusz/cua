@@ -1814,6 +1814,12 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "element_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "element_index": {
                   "format": "uint64",
                   "minimum": 0,

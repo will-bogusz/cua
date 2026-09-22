@@ -244,6 +244,15 @@ pub struct WindowElement {
     pub depth: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_token: Option<String>,
+    /// Accessibility-object continuity across snapshots within one driver
+    /// process: two snapshots carry the same `element_id` only when the
+    /// provider proved the row is the same native object (same process
+    /// instance, same role, the platform's own object equality). It is NOT
+    /// record identity — an application may reuse one object for different
+    /// content — and it is never an address: act through `element_token`.
+    /// A different or absent id proves nothing about the object being new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// The element's own description (`AXDescription`), omitted when it is
