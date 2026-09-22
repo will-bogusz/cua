@@ -24,6 +24,10 @@ fn nullable_pid_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":["integer","null"], "minimum":0, "maximum":4294967295_u64})
 }
 
+fn nullable_index_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({"type":["integer","null"], "minimum":0})
+}
+
 fn nullable_z_index_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":["integer","null"]})
 }
@@ -332,6 +336,44 @@ pub struct QueryHiddenRows {
     pub after_index: Option<u64>,
 }
 
+/// Why a snapshot names no focused row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusedElementReason {
+    /// The application reports no focused element.
+    NoFocus,
+    /// The focused-element read failed or the observation budget had expired;
+    /// focus is unknown.
+    Unreadable,
+    /// The focused element is a display-only row of this tree, which has no
+    /// `element_index`.
+    NotAddressable,
+    /// The walk was complete and the focused element is none of its rows: it
+    /// is in another window or surface, or in a layout container the walk does
+    /// not render.
+    OutsideTree,
+    /// The walk gave something up and the focused element is none of the rows
+    /// it read: it may be in the unread part or elsewhere.
+    NotInPartialTree,
+}
+
+/// The application's focused accessibility element relative to this
+/// snapshot, sampled once before the walk (focus can move while it runs).
+/// Matching is by accessibility object equality, not by appearance.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct FocusedElement {
+    /// `element_index` of the focused row — in the snapshot's index space, so
+    /// a `query` may have left the row itself out of `elements`. `null` when
+    /// no row is the focused element; `reason` then says why.
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required, schema_with = "nullable_index_schema")]
+    pub element_index: Option<u64>,
+    /// Present exactly when `element_index` is null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<FocusedElementReason>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct ElementCustomAction {
     pub name: String,
@@ -385,6 +427,10 @@ pub struct WindowStateOutput {
     /// walked or the provider does not report them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapsed_containers: Option<Vec<CollapsedContainer>>,
+    /// Where the application's focused element is. Absent when no tree was
+    /// walked or the provider does not sample focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_element: Option<FocusedElement>,
     /// Rows the `query` matched (ancestors and container expansion excluded).
     /// Absent without a query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -433,6 +479,11 @@ impl ToolOutput for WindowStateOutput {
             .is_some_and(|scale| !scale.is_finite() || scale <= 0.0)
         {
             return Err("screenshot_scale must be finite and positive".into());
+        }
+        if let Some(focused) = &self.focused_element {
+            if focused.element_index.is_some() == focused.reason.is_some() {
+                return Err("focused_element names an index or a reason, never both or neither".into());
+            }
         }
         if let (Some(elements), Some(returned)) = (&self.elements, self.returned_element_count) {
             if elements.len() as u64 != returned {
@@ -525,6 +576,21 @@ mod tests {
         assert!(crate::validate_success_output("get_window_state", value.clone()).is_ok());
         let output: WindowStateOutput = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(output.text_rows.unwrap()[0].after_index, Some(3));
+        for (focused, valid) in [
+            (json!({"element_index": 4}), true),
+            (json!({"element_index": null, "reason": "outside_tree"}), true),
+            (json!({"element_index": null}), false),
+            (json!({"element_index": 4, "reason": "no_focus"}), false),
+            (json!({"reason": "no_focus"}), false),
+        ] {
+            let mut payload = value.clone();
+            payload["focused_element"] = focused.clone();
+            assert_eq!(
+                crate::validate_success_output("get_window_state", payload).is_ok(),
+                valid,
+                "{focused}"
+            );
+        }
         let mut misspelled = value;
         misspelled["query_hidden_rows"][0]["hiden"] = json!(1);
         assert!(crate::validate_success_output("get_window_state", misspelled).is_err());

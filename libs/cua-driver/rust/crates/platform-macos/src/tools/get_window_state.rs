@@ -136,6 +136,12 @@ fn def() -> &'static ToolDef {
             are projected by `query` like `elements`, and each row is placed by \
             `parent_index` (its nearest actionable ancestor) and `after_index` (the \
             actionable row returned immediately before it; absent when none precedes it).\n\n\
+            `focused_element` is the app's focused accessibility element in this \
+            snapshot, sampled once before the walk and matched by object identity: \
+            `{element_index}`, or `{element_index: null, reason}` with reason \
+            `no_focus`, `unreadable`, `not_addressable` (a display-only row), \
+            `outside_tree` (a complete walk does not contain it) or \
+            `not_in_partial_tree`.\n\n\
             Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
             context-window blow-up on Electron / Obsidian / large web apps that \
             produce 10k+ element trees. When applied, BOTH the markdown \
@@ -729,6 +735,9 @@ impl Tool for GetWindowStateTool {
             let rows = annotated_rows(walk);
             structured["text_rows"] = serde_json::json!(rows.text_rows);
             structured["collapsed_containers"] = serde_json::json!(rows.collapsed_containers);
+            if let Some(focused) = focused_element_json(walk) {
+                structured["focused_element"] = focused;
+            }
             if let Some(projection) = walk.query.as_ref() {
                 structured["query_match_count"] = serde_json::json!(projection.matched);
                 structured["query_hidden_rows"] = serde_json::json!(rows.query_hidden_rows);
@@ -1077,6 +1086,25 @@ fn parse_query(value: Option<&serde_json::Value>) -> Result<Option<Vec<String>>,
         }
         Some(_) => Err("query must be a string or an array of strings".to_owned()),
     }
+}
+
+/// Where the application's focused element sits in this snapshot: its
+/// `element_index`, or `null` and why not. `None` when the walk sampled no
+/// focus.
+fn focused_element_json(walk: &crate::ax::TreeWalkResult) -> Option<serde_json::Value> {
+    use crate::ax::tree::FocusedElement;
+    let reason = match walk.focused {
+        FocusedElement::NotSampled => return None,
+        FocusedElement::Node(position) => match walk.nodes[position].element_index {
+            Some(index) => return Some(serde_json::json!({ "element_index": index })),
+            None => "not_addressable",
+        },
+        FocusedElement::NoFocus => "no_focus",
+        FocusedElement::Unreadable => "unreadable",
+        FocusedElement::NotWalked if walk.truncated => "not_in_partial_tree",
+        FocusedElement::NotWalked => "outside_tree",
+    };
+    Some(serde_json::json!({ "element_index": null, "reason": reason }))
 }
 
 /// `element_index` of every actionable node whose row the walk's query
@@ -1855,6 +1883,56 @@ mod tests {
             annotated_rows(&unfiltered).collapsed_containers
         ))
         .expect("collapsed containers match the contract");
+    }
+
+    #[test]
+    fn the_focused_element_is_an_index_or_null_with_the_reason() {
+        use crate::ax::tree::FocusedElement;
+        let walk = |focused, truncated| crate::ax::TreeWalkResult {
+            nodes: vec![
+                node(Some(0), "AXWindow", Some("W"), 0, None, None, vec![]),
+                node(None, "AXStaticText", Some("t"), 1, Some(0), None, vec![]),
+                node(Some(1), "AXTextField", Some("Name"), 1, Some(0), None, vec![]),
+            ],
+            focused,
+            truncated,
+            ..Default::default()
+        };
+        let cases = [
+            (FocusedElement::Node(2), false, json!({"element_index": 1})),
+            (
+                FocusedElement::Node(1),
+                false,
+                json!({"element_index": null, "reason": "not_addressable"}),
+            ),
+            (
+                FocusedElement::NotWalked,
+                false,
+                json!({"element_index": null, "reason": "outside_tree"}),
+            ),
+            (
+                FocusedElement::NotWalked,
+                true,
+                json!({"element_index": null, "reason": "not_in_partial_tree"}),
+            ),
+            (
+                FocusedElement::NoFocus,
+                false,
+                json!({"element_index": null, "reason": "no_focus"}),
+            ),
+            (
+                FocusedElement::Unreadable,
+                true,
+                json!({"element_index": null, "reason": "unreadable"}),
+            ),
+        ];
+        for (focused, truncated, expected) in cases {
+            let published = focused_element_json(&walk(focused, truncated)).unwrap();
+            assert_eq!(published, expected);
+            serde_json::from_value::<cua_driver_contract::FocusedElement>(published)
+                .expect("focused element matches the contract");
+        }
+        assert!(focused_element_json(&walk(FocusedElement::NotSampled, false)).is_none());
     }
 
     #[test]

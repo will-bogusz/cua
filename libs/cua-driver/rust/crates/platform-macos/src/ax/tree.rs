@@ -207,6 +207,53 @@ struct WalkScope {
     background_open_restricted: std::collections::HashSet<usize>,
     node_rows: Vec<usize>,
     collapsed_containers: Vec<CollapsedContainer>,
+    /// The application's focused element, sampled before the walk; retained.
+    focused: Option<AXUIElementRef>,
+    focused_node: Option<usize>,
+}
+
+/// Where the application's `AXFocusedUIElement` sits in a walk, sampled once
+/// before the walk starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusedElement {
+    /// The walk did not sample focus (it had no application element).
+    #[default]
+    NotSampled,
+    /// The application reports no focused element.
+    NoFocus,
+    /// The read failed or the walk's native budget had expired.
+    Unreadable,
+    /// Position in `nodes` of the node that is the focused element (the same
+    /// accessibility object, by `CFEqual`).
+    Node(usize),
+    /// The focused element is none of the walked nodes.
+    NotWalked,
+}
+
+/// Read `AXFocusedUIElement` off the application element. The returned
+/// element is retained.
+unsafe fn sample_focus(app: AXUIElementRef) -> (FocusedElement, Option<AXUIElementRef>) {
+    if super::budget::exhausted() {
+        return (FocusedElement::Unreadable, None);
+    }
+    let attr = core_foundation::string::CFString::from_static_string("AXFocusedUIElement");
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(
+        app,
+        core_foundation::base::TCFType::as_concrete_TypeRef(&attr),
+        &mut value,
+    );
+    if err == kAXErrorNoValue || (err == kAXErrorSuccess && value.is_null()) {
+        return (FocusedElement::NoFocus, None);
+    }
+    if err != kAXErrorSuccess {
+        return (FocusedElement::Unreadable, None);
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXUIElementGetTypeID() {
+        CFRelease(value);
+        return (FocusedElement::Unreadable, None);
+    }
+    (FocusedElement::NotWalked, Some(value as AXUIElementRef))
 }
 
 /// A list/table/outline whose rows the walk did not read because they are
@@ -272,6 +319,8 @@ pub struct TreeWalkResult {
     pub collapsed_containers: Vec<CollapsedContainer>,
     /// What the query returned of the walk's rows; `None` without a query.
     pub query: Option<super::projection::QueryProjection>,
+    /// The application's focused element relative to `nodes`.
+    pub focused: FocusedElement,
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -340,6 +389,8 @@ pub(crate) fn walk_tree_with_timeout(
         background_open_restricted: std::collections::HashSet::new(),
         node_rows: Vec::new(),
         collapsed_containers: Vec::new(),
+        focused: None,
+        focused_node: None,
     };
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
@@ -353,6 +404,7 @@ pub(crate) fn walk_tree_with_timeout(
     // Document state of the requested window, read off that one element below.
     let mut document: Option<String> = None;
     let mut document_edited: Option<bool> = None;
+    let mut focus: FocusedElement;
 
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid);
@@ -372,9 +424,7 @@ pub(crate) fn walk_tree_with_timeout(
                 document: None,
                 document_edited: None,
                 collapsed_rows: 0,
-                node_rows: Vec::new(),
-                collapsed_containers: Vec::new(),
-                query: None,
+                ..TreeWalkResult::default()
             };
         }
 
@@ -388,6 +438,10 @@ pub(crate) fn walk_tree_with_timeout(
         // pay no settle cost. This relies on the MAX_ELEMENTS node cap to keep
         // the now-materialized (potentially large) tree bounded.
         super::enablement::ensure_chromium_ax_enabled(pid, app_elem);
+
+        let focus_sample = sample_focus(app_elem);
+        focus = focus_sample.0;
+        scope.focused = focus_sample.1;
 
         // Union AXChildren + AXWindows — the only way to see background windows.
         // AXChildren omits windows when the app isn't frontmost (AppKit limitation).
@@ -654,6 +708,12 @@ pub(crate) fn walk_tree_with_timeout(
         }
 
         CFRelease(app_elem as CFTypeRef);
+        if let Some(focused) = scope.focused.take() {
+            CFRelease(focused as CFTypeRef);
+            focus = scope
+                .focused_node
+                .map_or(FocusedElement::NotWalked, FocusedElement::Node);
+        }
     }
 
     fill_descendant_text(&mut nodes);
@@ -711,6 +771,7 @@ pub(crate) fn walk_tree_with_timeout(
         node_rows: scope.node_rows,
         collapsed_containers: scope.collapsed_containers,
         query: projection,
+        focused: focus,
     }
 }
 
@@ -1042,6 +1103,12 @@ unsafe fn walk_element(
     // indexed rows are addressable in click(element_index=N)).
     let next_parent = node.element_index.or(parent_index);
 
+    if scope
+        .focused
+        .is_some_and(|focused| CFEqual(focused as CFTypeRef, element as CFTypeRef) != 0)
+    {
+        scope.focused_node = Some(nodes.len());
+    }
     let line = format_node_line(&node);
     scope.node_rows.push(lines.len());
     lines.push((depth, line));

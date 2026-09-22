@@ -1955,6 +1955,56 @@
               "null"
             ]
           },
+          "focused_element": {
+            "additionalProperties": false,
+            "properties": {
+              "element_index": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "anyOf": [
+                  {
+                    "oneOf": [
+                      {
+                        "const": "no_focus",
+                        "type": "string"
+                      },
+                      {
+                        "const": "unreadable",
+                        "type": "string"
+                      },
+                      {
+                        "const": "not_addressable",
+                        "type": "string"
+                      },
+                      {
+                        "const": "outside_tree",
+                        "type": "string"
+                      },
+                      {
+                        "const": "not_in_partial_tree",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "element_index"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "pid": {
             "format": "uint32",
             "minimum": 0,
