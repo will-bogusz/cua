@@ -51,7 +51,7 @@ explicit `ActionTarget`, and an explicit `InputDeliveryMode`, and returns
 See the [0.8 SDK contract migration](../docs/native-window-sdk-migration.md)
 for the intentional SDK break and unchanged CLI/MCP wire forms.
 
-Everything after 0.8 is additive over it. `ActionResult` gained
+0.9 and 0.10 are additive over 0.8. `ActionResult` gained
 `evidence[].signal` (which observation a `window_change` row names),
 `committed`, and the `element` / `snapshot` escalation targets; every input
 that runs the post-action window poll
@@ -61,8 +61,11 @@ leaves its optional fields unset (`ClickInput::new(target, position,
 delivery_mode)` with `..` for the rest), so a typed caller is not broken by
 the next optional field either.
 
-The observation facts added after 0.10 are optional output fields, each with
-its absence spelled out on the Rust type: `WindowStateOutput` gained
+0.11 is a breaking release: the `menu_command` route, `ActionResult.menu_path`
+and `ActionResult.key_window` (`KeyWindowFact`) are removed with the
+chord-to-menu-command substitution they described; `invoke_menu` reports route
+`accessibility`. Its additions are optional output fields, each with its
+absence spelled out on the Rust type: `WindowStateOutput` gained
 `text_rows`, `collapsed_containers`, `focused_element`, `query_match_count`
 and `query_hidden_rows`, and `WindowElement` gained `element_id`
 (accessibility-object continuity within one driver process — not record
@@ -136,7 +139,7 @@ Compatibility is tracked separately at each boundary:
 
 | Field | Current | Meaning |
 | --- | --- | --- |
-| `contract_version` | `0.10.0` | Generated manifest and typed SDK shape |
+| `contract_version` | `0.11.0` | Generated manifest and typed SDK shape |
 | `tools_list_schema_version` | `1` | cua-driver `tools/list` extension shape |
 | `capability_version` | `1` | Additive capability-token vocabulary |
 | `mcp_protocol_version` | `2025-06-18` | Legacy `initialize.params.protocolVersion` and loopback HTTP compatibility version; modern stdio negotiation is endpoint-owned |
