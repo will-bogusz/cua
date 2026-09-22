@@ -208,6 +208,43 @@ pub struct AccessibilityWindows {
     pub error: Option<String>,
 }
 
+/// What system UI a [`SystemWindow`] is. `auth`: keychain, admin-rights and
+/// Touch ID / password prompts. `permission`: consent dialogs and permission
+/// warnings (their host may also show other alerts: read the window). `lock`:
+/// the lock screen, user switching, the screen saver. `unknown`: a window an
+/// unnamed process draws at or above the screen-saver level — something covers
+/// the screen and the provider cannot say what; not a verdict that input is
+/// blocked. (Variant docs are deliberately absent: they turn the schema's
+/// `enum` into a `oneOf`.)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemWindowKind {
+    Auth,
+    Permission,
+    Lock,
+    Unknown,
+}
+
+/// A visible window another process draws to take the screen away from the
+/// application being driven, usually above layer 0. Input keeps reaching a
+/// background target while one is up, so a caller that must not act under it
+/// has to look.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct SystemWindow {
+    pub window_id: u64,
+    pub pid: u32,
+    /// The owning process's name as the window server reports it.
+    pub app_name: String,
+    /// Often empty: system prompts rarely title their windows.
+    pub title: String,
+    pub bounds: WindowBounds,
+    pub layer: i32,
+    /// Higher values are closer to the front.
+    pub z_index: i64,
+    pub kind: SystemWindowKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct ListWindowsOutput {
     pub windows: Vec<WindowInfo>,
@@ -215,6 +252,11 @@ pub struct ListWindowsOutput {
     pub current_space_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accessibility_windows: Option<AccessibilityWindows>,
+    /// System windows on screen now, front to back, not filtered by `pid`.
+    /// Absent when the provider does not enumerate them; an empty array means
+    /// none is on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_windows: Option<Vec<SystemWindow>>,
 }
 
 impl ToolOutput for ListWindowsOutput {
@@ -570,6 +612,23 @@ mod tests {
             assert!(output.elements.is_some());
             output.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn system_windows_carry_one_of_the_published_kinds() {
+        let row = |kind: &str| {
+            json!({"windows": [], "system_windows": [{
+                "window_id": 41, "pid": 402, "app_name": "SecurityAgent", "title": "",
+                "bounds": {"x": 0, "y": 0, "width": 400, "height": 300},
+                "layer": 1000, "z_index": 90, "kind": kind
+            }]})
+        };
+        for kind in ["auth", "permission", "lock", "unknown"] {
+            assert!(crate::validate_success_output("list_windows", row(kind)).is_ok(), "{kind}");
+        }
+        assert!(crate::validate_success_output("list_windows", row("app-modal")).is_err());
+        let absent: ListWindowsOutput = serde_json::from_value(json!({"windows": []})).unwrap();
+        assert!(absent.system_windows.is_none());
     }
 
     #[test]

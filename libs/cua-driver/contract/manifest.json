@@ -3277,6 +3277,85 @@
               "null"
             ]
           },
+          "system_windows": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "app_name": {
+                  "type": "string"
+                },
+                "bounds": {
+                  "properties": {
+                    "height": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "width": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "x": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "y": {
+                      "format": "double",
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                  ],
+                  "type": "object"
+                },
+                "kind": {
+                  "enum": [
+                    "auth",
+                    "permission",
+                    "lock",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "layer": {
+                  "format": "int32",
+                  "type": "integer"
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "z_index": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "window_id",
+                "pid",
+                "app_name",
+                "title",
+                "bounds",
+                "layer",
+                "z_index",
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "windows": {
             "items": {
               "properties": {

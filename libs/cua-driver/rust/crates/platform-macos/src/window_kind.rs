@@ -23,6 +23,105 @@ pub const DESKTOP_KIND: &str = "desktop";
 /// requested — a CGWindow row alone cannot say whether a window is modal.
 pub const APP_MODAL_KIND: &str = "app-modal";
 
+/// System UI that takes the screen away from the application a caller is
+/// driving, drawn by processes other than that application and mostly above
+/// layer 0, where `list_windows`' own rows never look. Input keeps flowing to
+/// the target while one is up (background routes are pid-addressed), so a
+/// caller has to ask.
+///
+/// `auth`: keychain, admin-rights and Touch ID / password prompts.
+/// `permission`: TCC consent dialogs and the accessibility-permission warning
+/// (UserNotificationCenter also hosts other alerts: read the window).
+/// `lock`: the lock screen, fast user switching, the screen saver.
+/// `unknown`: a window drawn at or above the screen-saver level by a process
+/// this table does not name — something covers the screen and the driver
+/// cannot say what; it is not a verdict that input is blocked.
+pub const AUTH_KIND: &str = "auth";
+pub const PERMISSION_KIND: &str = "permission";
+pub const LOCK_KIND: &str = "lock";
+pub const UNKNOWN_SYSTEM_KIND: &str = "unknown";
+
+/// CGWindow owner name (`kCGWindowOwnerName`, lowercased) to system kind.
+/// Owner names, not bundle ids: `SecurityAgent` runs as uid 92, where no
+/// bundle or accessibility lookup is possible. Observed ground truth for a
+/// login-keychain prompt: owner `SecurityAgent`, layer 1000, alpha 1, empty
+/// title, with `frontmostApplication` flipping back to the previous app while
+/// the panel stayed up — so the owner, not frontmost, is the signal.
+const SYSTEM_OWNERS: &[(&str, &str)] = &[
+    ("securityagent", AUTH_KIND),
+    ("coreautha", AUTH_KIND),
+    ("coreauthd", AUTH_KIND),
+    ("localauthenticationremoteservice", AUTH_KIND),
+    ("usernotificationcenter", PERMISSION_KIND),
+    ("universalaccessauthwarn", PERMISSION_KIND),
+    ("loginwindow", LOCK_KIND),
+    ("screensaverengine", LOCK_KIND),
+];
+
+/// One on-screen system window, as `list_windows` publishes it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SystemWindow {
+    pub window_id: u32,
+    pub pid: i32,
+    pub app_name: String,
+    pub title: String,
+    pub bounds: WindowBounds,
+    pub layer: i32,
+    pub z_index: usize,
+    pub kind: &'static str,
+}
+
+/// The system windows among `windows` (front to back, with `alphas`
+/// parallel). Invisible and degenerate windows are skipped — the login window
+/// keeps zero-alpha placeholders up at all times — and so are `own_pid`'s,
+/// which are this driver's overlays.
+pub fn system_windows(
+    windows: &[WindowInfo],
+    alphas: &[f64],
+    own_pid: i32,
+    screen_saver_level: i32,
+) -> Vec<SystemWindow> {
+    windows
+        .iter()
+        .zip(alphas)
+        .filter(|(window, &alpha)| {
+            window.pid != own_pid
+                && alpha > 0.0
+                && window.bounds.width >= 1.0
+                && window.bounds.height >= 1.0
+        })
+        .filter_map(|(window, _)| {
+            let owner = window.app_name.trim().to_lowercase();
+            let kind = SYSTEM_OWNERS
+                .iter()
+                .find(|(name, _)| *name == owner)
+                .map(|(_, kind)| *kind)
+                .or_else(|| (window.layer >= screen_saver_level).then_some(UNKNOWN_SYSTEM_KIND))?;
+            Some(SystemWindow {
+                window_id: window.window_id,
+                pid: window.pid,
+                app_name: window.app_name.clone(),
+                title: window.title.clone(),
+                bounds: window.bounds.clone(),
+                layer: window.layer,
+                z_index: window.z_index,
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// The system windows on screen now.
+pub fn onscreen_system_windows() -> Vec<SystemWindow> {
+    let enumeration = crate::windows::onscreen_windows_any_layer();
+    system_windows(
+        &enumeration.windows,
+        &enumeration.alphas,
+        std::process::id() as i32,
+        crate::windows::screen_saver_window_level(),
+    )
+}
+
 const INDICATOR_PROVIDER_EXECUTABLE: &str = "/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService";
 
 const APP_WINDOW_LAYER: i32 = 0;
@@ -121,6 +220,46 @@ fn executable_path(pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owned(window_id: u32, owner: &str, layer: i32, alpha: f64) -> (WindowInfo, f64) {
+        let mut row = window(window_id, 500 + window_id as i32, layer, (0.0, 0.0, 400.0, 300.0));
+        row.app_name = owner.into();
+        (row, alpha)
+    }
+
+    #[test]
+    fn system_windows_are_classified_by_owner_and_high_unnamed_layers_are_unknown() {
+        const SAVER: i32 = 1000;
+        let rows = vec![
+            owned(1, "SecurityAgent", 1000, 1.0),
+            owned(2, "loginwindow", 0, 0.0), // zero-alpha placeholder
+            owned(3, "UserNotificationCenter", 23, 1.0),
+            owned(4, "Finder", 0, 1.0),     // ordinary app window
+            owned(5, "Dock", 20, 1.0),      // accessory UI below the band
+            owned(6, "Mystery", 1500, 1.0), // covers the screen, unnamed
+            owned(7, "loginwindow", 2002, 1.0),
+            owned(8, "coreautha", 1000, 1.0),
+        ];
+        let (windows, alphas): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+        let found = system_windows(&windows, &alphas, 999, SAVER);
+        let kinds: Vec<(u32, &str)> = found.iter().map(|w| (w.window_id, w.kind)).collect();
+        assert_eq!(
+            kinds,
+            [(1, "auth"), (3, "permission"), (6, "unknown"), (7, "lock"), (8, "auth")]
+        );
+        let published = serde_json::to_value(&found).unwrap();
+        serde_json::from_value::<Vec<cua_driver_contract::SystemWindow>>(published)
+            .expect("the producer's spelling is the contract's");
+    }
+
+    #[test]
+    fn the_drivers_own_and_degenerate_windows_are_not_system_windows() {
+        let (mut overlay, alpha) = owned(1, "cua-driver", 2000, 1.0);
+        overlay.pid = 77;
+        let (mut sliver, _) = owned(2, "SecurityAgent", 1000, 1.0);
+        sliver.bounds.height = 0.5;
+        assert!(system_windows(&[overlay, sliver], &[alpha, 1.0], 77, 1000).is_empty());
+    }
 
     const CAPTURED_APP_PID: i32 = 758;
     const PROVIDER_PID: i32 = 22402;

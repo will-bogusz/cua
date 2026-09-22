@@ -42,7 +42,14 @@ fn def() -> &'static ToolDef {
             include_accessibility_metadata and an explicit pid. Callers enumerating an \
             application's own windows will usually want to filter out system_overlay and \
             desktop rows; an app-modal row is the application's own window and the only one \
-            worth addressing while it is up. Ordinary windows omit the key entirely.".into(),
+            worth addressing while it is up. Ordinary windows omit the key entirely.\n\n\
+            `system_windows` lists, front to back and regardless of `pid` / `on_screen_only`, \
+            the visible windows other processes draw to take the screen away: `kind` \
+            `auth` (keychain, admin, Touch ID/password prompts), `permission` (TCC consent \
+            and accessibility warnings), `lock` (lock screen, user switching, screen saver), \
+            or `unknown` (an unnamed process drawing at or above the screen-saver level; \
+            not a verdict that input is blocked). Input still reaches a background target \
+            while one is up. An empty array means none is on screen.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -152,6 +159,9 @@ impl Tool for ListWindowsTool {
         if let Some(roster) = roster {
             data["accessibility_windows"] = roster.json;
         }
+        data["system_windows"] =
+            serde_json::to_value(crate::window_kind::onscreen_system_windows())
+                .unwrap_or_default();
         ToolResult::text(format!("Found {} window(s).", windows_json.len())).with_structured(data)
     }
 }

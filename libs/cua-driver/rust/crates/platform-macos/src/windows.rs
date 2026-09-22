@@ -37,6 +37,8 @@ pub struct WindowInfo {
 pub(crate) struct WindowEnumeration {
     pub(crate) windows: Vec<WindowInfo>,
     pub(crate) current_space_id: Option<u64>,
+    /// Parallel to `windows`: `kCGWindowAlpha`, the window's opacity.
+    pub(crate) alphas: Vec<f64>,
 }
 
 // ── CGWindow option flags ─────────────────────────────────────────────────────
@@ -58,6 +60,8 @@ const kCGNullWindowID: u32 = 0;
 /// `CGWindowLevelForKey`, never hard-coded: it has moved between releases.
 #[allow(non_upper_case_globals)]
 const kCGDesktopIconWindowLevelKey: i32 = 18;
+#[allow(non_upper_case_globals)]
+const kCGScreenSaverWindowLevelKey: i32 = 13;
 
 // ── Internal CGWindowInfo parsing ─────────────────────────────────────────────
 //
@@ -195,12 +199,14 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
         return WindowEnumeration {
             windows: vec![],
             current_space_id,
+            alphas: vec![],
         };
     }
 
     let raw: CFArray<CFTypeRef> = unsafe { CFArray::wrap_under_create_rule(raw_ref as _) };
     let total = raw.len() as usize;
     let mut results = Vec::new();
+    let mut alphas = Vec::new();
 
     for (idx, item) in raw.iter().enumerate() {
         let item = *item;
@@ -301,6 +307,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
         // z_index: CGWindowList front-to-back → assign reverse index.
         let z_index = z_index_from_front_to_back(total, idx);
 
+        alphas.push(get_bounds_num(&dict, "kCGWindowAlpha"));
         results.push(WindowInfo {
             window_id,
             pid,
@@ -321,6 +328,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
             return WindowEnumeration {
                 windows: results,
                 current_space_id,
+                alphas,
             };
         };
         for window in &mut results {
@@ -335,6 +343,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
     WindowEnumeration {
         windows: results,
         current_space_id,
+        alphas,
     }
 }
 
@@ -384,6 +393,23 @@ fn get_bounds_num(
             }
         })
         .unwrap_or(0.0)
+}
+
+/// Every on-screen window on every layer, front to back, with its opacity —
+/// the population system UI (authentication, permission, lock) is drawn in.
+pub(crate) fn onscreen_windows_any_layer() -> WindowEnumeration {
+    enumerate_windows(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        LayerFilter::AnyLayer,
+    )
+}
+
+/// The window level of the screen saver: the band system UI that takes the
+/// screen away is drawn at or above.
+pub fn screen_saver_window_level() -> i32 {
+    static LEVEL: std::sync::LazyLock<i32> =
+        std::sync::LazyLock::new(|| unsafe { CGWindowLevelForKey(kCGScreenSaverWindowLevelKey) });
+    *LEVEL
 }
 
 /// Look up a window by its CGWindowID across every layer.
