@@ -7,7 +7,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 RUST_ROOT="$REPO_ROOT/libs/cua-driver/rust"
-TEST_FILE="$RUST_ROOT/crates/cua-driver/tests/harness_appkit_test.rs"
+TEST_PACKAGE=cua-driver-e2e
+TEST_FILE="$RUST_ROOT/crates/cua-driver-e2e/tests/harness_appkit_test.rs"
+if [ ! -f "$TEST_FILE" ]; then
+	TEST_PACKAGE=cua-driver
+	TEST_FILE="$RUST_ROOT/crates/cua-driver/tests/harness_appkit_test.rs"
+fi
 E2E_SCRIPT="$REPO_ROOT/scripts/ci/macos/run-rust-e2e.sh"
 FIXTURE_BUILD="$REPO_ROOT/libs/cua-driver/tests/fixtures/build/macos.sh"
 FIXTURE_SRC="$REPO_ROOT/libs/cua-driver/tests/fixtures"
@@ -259,7 +264,7 @@ EOF
 cmd_run() {
 	local filter="${1:-}"
 	need_target_dir
-	local -a cargo_test=(cargo test --locked -p cua-driver --test harness_appkit_test --)
+	local -a cargo_test=(cargo test --locked -p "$TEST_PACKAGE" --test harness_appkit_test --)
 	local -a env_lines=(
 		"CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 		"CUA_TEST_DRIVER_BIN=$SHIM"
