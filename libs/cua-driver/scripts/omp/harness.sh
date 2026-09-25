@@ -18,6 +18,8 @@ FIXTURE_BUILD="$REPO_ROOT/libs/cua-driver/tests/fixtures/build/macos.sh"
 FIXTURE_SRC="$REPO_ROOT/libs/cua-driver/tests/fixtures"
 FIXTURE_APP="$RUST_ROOT/test-apps/harness-appkit/CuaTestHarness.AppKit.app"
 ELECTRON_APP="$RUST_ROOT/test-apps/harness-electron/CuaTestHarness.Electron.app"
+SWIFTUI_APP="$RUST_ROOT/test-apps/harness-swiftui/CuaTestHarness.SwiftUI.app"
+HARNESS_TEST="${HARNESS_TEST:-harness_appkit_test}"
 SHIM="$SCRIPT_DIR/direct-shim.sh"
 
 INSTALL_DIR="${OMP_CUA_DRIVER_DIR:-$HOME/.omp/natives/cua-driver}"
@@ -105,15 +107,17 @@ fixture_sources() {
 			printf '%s\n' "$FIXTURE_SRC"/apps/cross-platform/electron/{build.sh,main.js,preload.js,package.json,package-lock.json} \
 				"$FIXTURE_SRC"/shared/web/index.html
 			;;
+		swiftui) printf '%s\n' "$FIXTURE_SRC"/apps/macos/swiftui/*.swift ;;
 		*) die "unknown fixture: $1" ;;
 	esac
 }
 fixture_sources_sha() { fixture_sources "$1" | sort | tr '\n' '\0' | xargs -0 cat | shasum -a 256 | cut -d' ' -f1; }
-fixture_bundle() { case "$1" in appkit) printf '%s' "$FIXTURE_APP" ;; electron) printf '%s' "$ELECTRON_APP" ;; esac; }
+fixture_bundle() { case "$1" in appkit) printf '%s' "$FIXTURE_APP" ;; electron) printf '%s' "$ELECTRON_APP" ;; swiftui) printf '%s' "$SWIFTUI_APP" ;; esac; }
 fixture_exe() {
 	case "$1" in
 		appkit) printf '%s' "$FIXTURE_APP/Contents/MacOS/CuaTestHarness.AppKit" ;;
 		electron) printf '%s' "$ELECTRON_APP/Contents/MacOS/Electron" ;;
+		swiftui) printf '%s' "$SWIFTUI_APP/Contents/MacOS/CuaTestHarness.SwiftUI" ;;
 	esac
 }
 stamp_fixture() { fixture_sources_sha "$1" >"$(fixture_bundle "$1")/Contents/Resources/sources.sha256"; }
@@ -134,6 +138,7 @@ cmd_preflight() {
 	check "shim present" test -x "$SHIM"
 	check "AppKit fixture built from HEAD sources" fixture_current appkit
 	check "Electron fixture built from HEAD sources" fixture_current electron
+	check "SwiftUI fixture built from HEAD sources" fixture_current swiftui
 	check "CARGO_TARGET_DIR private" target_dir_private
 	check "cargo on PATH" command -v cargo
 	if [ "$DRY" = 1 ]; then return 0; fi
@@ -143,14 +148,16 @@ cmd_preflight() {
 cmd_fixture() {
 	run_cmd "$FIXTURE_BUILD" --only appkit
 	run_cmd "$FIXTURE_BUILD" --only electron
+	run_cmd "$FIXTURE_BUILD" --only swiftui
 	if [ "$DRY" = 1 ]; then
-		say "+ write sources.sha256 into $FIXTURE_APP and $ELECTRON_APP"
+		say "+ write sources.sha256 into $FIXTURE_APP, $ELECTRON_APP and $SWIFTUI_APP"
 		return 0
 	fi
-	mkdir -p "$FIXTURE_APP/Contents/Resources" "$ELECTRON_APP/Contents/Resources"
+	mkdir -p "$FIXTURE_APP/Contents/Resources" "$ELECTRON_APP/Contents/Resources" "$SWIFTUI_APP/Contents/Resources"
 	stamp_fixture appkit
 	stamp_fixture electron
-	say "fixtures stamped: appkit $(fixture_sources_sha appkit) electron $(fixture_sources_sha electron)"
+	stamp_fixture swiftui
+	say "fixtures stamped: appkit $(fixture_sources_sha appkit) electron $(fixture_sources_sha electron) swiftui $(fixture_sources_sha swiftui)"
 }
 
 cmd_build() {
@@ -264,7 +271,7 @@ EOF
 cmd_run() {
 	local filter="${1:-}"
 	need_target_dir
-	local -a cargo_test=(cargo test --locked -p "$TEST_PACKAGE" --test harness_appkit_test --)
+	local -a cargo_test=(cargo test --locked -p "$TEST_PACKAGE" --test "$HARNESS_TEST" --)
 	local -a env_lines=(
 		"CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 		"CUA_TEST_DRIVER_BIN=$SHIM"
@@ -272,8 +279,14 @@ cmd_run() {
 		"CUA_E2E_MACOS_DAEMON_SOCKET=$DUMMY_SOCK"
 		"CUA_TEST_APPS_ROOT=$RUST_ROOT/test-apps"
 		"CUA_TEST_REQUIRE_FIXTURES=1"
-		"CUA_E2E_RECORDINGS_ROOT=$RECORDINGS_DIR"
 	)
+	# run-rust-e2e.sh runs bring_to_front_macos_test with CUA_E2E_RECORDINGS_ROOT unset:
+	# its oracles are System Events and CoreGraphics, not recorded trajectories.
+	if [ "$HARNESS_TEST" = bring_to_front_macos_test ]; then
+		unset CUA_E2E_RECORDINGS_ROOT
+	else
+		env_lines+=("CUA_E2E_RECORDINGS_ROOT=$RECORDINGS_DIR")
+	fi
 	if [ "$DRY" = 1 ]; then
 		say "+ python3 (unix listener) $DUMMY_SOCK &"
 		say "+ cd $RUST_ROOT && ${env_lines[*]} ${cargo_test[*]} --list --ignored --format terse | sed -n 's/: test\$//p' | grep -F -- '$filter'"
@@ -284,6 +297,7 @@ cmd_run() {
 	[ -x "$INSTALLED" ] || die "no installed driver at $INSTALLED"
 	fixture_current appkit || die "AppKit fixture missing or stale against HEAD sources; run: $0 fixture"
 	fixture_current electron || die "Electron fixture missing or stale against HEAD sources; run: $0 fixture"
+	fixture_current swiftui || die "SwiftUI fixture missing or stale against HEAD sources; run: $0 fixture"
 	no_driver_processes || die "a driver/harness process is still running; run preflight"
 	mkdir -p "$LOG_DIR"
 	local head bin_sha bin_head=unknown identity macos
@@ -298,7 +312,7 @@ cmd_run() {
 	cd "$RUST_ROOT"
 	local tests
 	tests="$("${cargo_test[@]}" --list --ignored --format terse | sed -n 's/: test$//p' | grep -F -- "$filter" || true)"
-	[ -n "$tests" ] || die "no harness_appkit test matches '$filter'"
+	[ -n "$tests" ] || die "no $HARNESS_TEST test matches '$filter'"
 	local test result start end duration log
 	while IFS= read -r test; do
 		log="$LOG_DIR/${test//::/__}.log"
