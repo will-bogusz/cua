@@ -233,7 +233,7 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 | P11 | as P5 |
 | P12 | #3781: re-review at b26880250; seam, z-order removal and native proof answered 09-13 |
 | P13 | #3783 approved at a0dc87e15 (09-13T15:27); merge pending; nothing owed |
-| P14 | #3785 approved at 42052d0e9 (09-13T15:00); merge pending; W5-16 follows after merge. The fork carries #3785's approved cell rewrite since cfbadaf1a (`…ignores_competing_application_window`); a8636718a's per-display scoping is PR-branch only |
+| P14 | #3785 approved at 42052d0e9 (09-13T15:00); rebased textual-only onto a959b2a23 and pushed 09-25 at 215d7bd1a (approval kept), exact-head evidence in the body (cell 3/3, bring_to_front 3/3, matrix 26/29 with main's 3 failures); merge pending on the fork CI approval. W5-16 follows after merge. The fork carries #3785's approved cell rewrite since cfbadaf1a (`…ignores_competing_application_window`); a8636718a's per-display scoping is PR-branch only |
 | P15 | as P6 |
 | L1 | #3791: re-review at 6ea2a9531 (pushed 09-20 over #3864; ladder advertises ElementClickNeedsForeground / ClickActionUnavailable; reply with the Ubuntu 21/21 matrix posted); clock restarted 09-20 |
 | L2 | - |
@@ -245,9 +245,9 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 |---|---|
 | B1 | - (#3816 closed 09-20 into #3858; #3857 closed the same way; #3858 parked as draft until RFC #4009 records a decision) |
 | B2 | - |
-| B3 | - (folded into #3946, pushed 09-20 at f3ccc1b27; #3806 closed) |
+| B3 | - (folded into #3946; re-cut on #3929 and pushed 09-25 at 747ff16ec; #3806 closed) |
 | B4 | #3811 (injaneity 09-16): hold acknowledged 09-20; #3842/#3921 closed "for now"; parked as draft until #3897 lands or closes |
-| B5 | withdrawn in wave B (ef1930d95, see "Wave B review"): drop B5's `AXShowMenu` pixel fallback from #3922 at its next push (folded there 09-20 at a798a5773; #3810/#3856 closed) |
+| B5 | withdrawn in wave B (ef1930d95, see "Wave B review"): B5's `AXShowMenu` pixel fallback dropped from #3922 at 5b7e84f7e (pushed 09-25; #3810/#3856 closed) |
 | B6 | - (folded into #3787, pushed 09-20 at 87d032b9f; #3813 closed; `description` still blocked by the manifest generator, #3802) |
 | B7 | - (folded into #3787, pushed 09-20 at 87d032b9f; #3817 closed) |
 | B8 | - (#3864 conflict: test nodes need identity: None) |
@@ -259,9 +259,9 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 |---|---|
 | B10 | hold: #3897 returns TypedProgress; re-express with #3811 |
 | B11 | as P6 |
-| B12 | - (retitle fix(cua-driver): before the next push) |
-| B13 | - (chord PR after T11) |
-| B14 | - (folds into #3922) |
+| B12 | - (retitled; kvnloo's four #3843 assertions pushed 09-25 at e69cbe8ba and answered; draft) |
+| B13 | - (#3855 pushed 09-25 at de1a640c4 with exact-head evidence: chord cell 4/4, fails on main's driver; draft until the contribution-process answer) |
+| B14 | - (folds into #3922, pushed 09-25 at 5b7e84f7e with exact-head evidence; draft) |
 | B15 | CONTRIBUTING: public ActionResult change needs the RFC first; closing #3857 into #3858 |
 | B16 | RFC before the committed verdict lands; the macOS typed write path can go first |
 | B17 | as B9 |
@@ -274,8 +274,8 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 | B24 | as P6 |
 | B25 | - (folds into #3950) |
 | B26 | - |
-| B27 | detect_window_change is an input contract change: Refs the RFC; #3373 adjacent |
-| B28 | - (folds into #3946) |
+| B27 | #3946 re-cut on upstream #3929 (1435052d6) and pushed 09-25 at 747ff16ec, retitled `fix(cua-driver): let SDK hosts bound the post-action window poll`: SDK allowlist for #3929's variables + `Changes::not_polled()` (both sides pinned) + scroll clamp; no public input (the #3971 agreement), kvnloo answered. The fork's public `detect_window_change` is superseded by #3929's env bound at the next sync |
+| B28 | - (superseded upstream by 681bc4480; dropped from #3946) |
 | B29 | - (stacked on #3781) |
 | B30 | as P6 |
 | B31 | - |
