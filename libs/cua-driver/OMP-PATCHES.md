@@ -237,7 +237,7 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 | P13 | #3783 approved at a0dc87e15 (09-13T15:27); merge pending; nothing owed |
 | P14 | #3785 approved at 42052d0e9 (09-13T15:00); head 215d7bd1a (09-25, approval kept). Body re-labelled 09-25 for #4094: harness table supporting, canonical Lume run a known gap, mutation checks named. Merge pending. W5-16 follows after merge. The fork carries #3785's approved cell rewrite since cfbadaf1a (`…ignores_competing_application_window`); a8636718a's per-display scoping is PR-branch only |
 | P15 | as P6 |
-| L1 | #3791: recommend CLOSE (09-25). #3882 rewrote the Linux background ladder (MPX/uinput keyboard, PointerRoute, isolated Hyprland), so the shared-ladder report no longer matches the tools. The closing text awaits Will's approval; re-express later as a report derived from the current routes |
+| L1 | #3791 closed 2026-09-25 with Will's approved comment: #3882 rewrote the Linux background ladder (MPX/uinput keyboard, PointerRoute, isolated Hyprland), so the shared-ladder report no longer matches the tools. Re-express later as a report derived from the current routes if wanted |
 | L2 | - |
 | L3 | #3814 cut 09-25 to the frame-valid write (e10b5827b, retitled `fix(cua-driver): mark a delivered Linux window screenshot's frame valid`); the element cap and elements_complete half is carried by #3882. Parked draft; canonical Linux run pending; RFC 3931 calls the field non-portable |
 
