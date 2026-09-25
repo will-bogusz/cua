@@ -287,9 +287,11 @@ cmd_run() {
 	else
 		env_lines+=("CUA_E2E_RECORDINGS_ROOT=$RECORDINGS_DIR")
 	fi
+	local -a match=(grep -F -- "$filter")
+	case "$filter" in =*) match=(grep -Fx -- "${filter#=}") ;; esac
 	if [ "$DRY" = 1 ]; then
 		say "+ python3 (unix listener) $DUMMY_SOCK &"
-		say "+ cd $RUST_ROOT && ${env_lines[*]} ${cargo_test[*]} --list --ignored --format terse | sed -n 's/: test\$//p' | grep -F -- '$filter'"
+		say "+ cd $RUST_ROOT && ${env_lines[*]} ${cargo_test[*]} --list --ignored --format terse | sed -n 's/: test\$//p' | ${match[*]}"
 		say "+ for each listed test: ${env_lines[*]} ${cargo_test[*]} --ignored --exact <test> --nocapture --test-threads=1 > $LOG_DIR/<test>.log; append {test,result,duration_s,...} to $EVIDENCE"
 		say "+ kill dummy listener; rm -f $DUMMY_SOCK"
 		return 0
@@ -311,7 +313,7 @@ cmd_run() {
 	export "${env_lines[@]}"
 	cd "$RUST_ROOT"
 	local tests
-	tests="$("${cargo_test[@]}" --list --ignored --format terse | sed -n 's/: test$//p' | grep -F -- "$filter" || true)"
+	tests="$("${cargo_test[@]}" --list --ignored --format terse | sed -n 's/: test$//p' | "${match[@]}" || true)"
 	[ -n "$tests" ] || die "no $HARNESS_TEST test matches '$filter'"
 	local test result start end duration log
 	while IFS= read -r test; do
