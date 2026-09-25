@@ -34,7 +34,8 @@ RECORDINGS_DIR="$OUT_DIR/recordings"
 DUMMY_SOCK="$OUT_DIR/daemon.sock"
 IDENTITY="${CODESIGN_IDENTITY:-OMP Computer Use}"
 BUNDLE_ID="com.ohmypi.cua-driver"
-PROCESS_PATTERN='^(cua-driver|CuaDriver|CuaTestHarness)'
+# pgrep -f matches the full command line, which starts with the executable's path.
+PROCESS_PATTERN='(^|/)(cua-driver|CuaDriver)( |$)|CuaTestHarness'
 STALE_SOCKETS=("$HOME/Library/Caches/cua-driver/cua-driver.sock" "$HOME/Library/Caches/cua-driver-local/cua-driver-local.sock" "$DUMMY_SOCK")
 
 DRY=0
