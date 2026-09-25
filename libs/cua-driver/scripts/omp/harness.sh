@@ -13,7 +13,7 @@ if [ ! -f "$TEST_FILE" ]; then
 	TEST_PACKAGE=cua-driver
 	TEST_FILE="$RUST_ROOT/crates/cua-driver/tests/harness_appkit_test.rs"
 fi
-E2E_SCRIPT="$REPO_ROOT/scripts/ci/macos/run-rust-e2e.sh"
+INVENTORY_TEST="$REPO_ROOT/.github/scripts/tests/test_cua_driver_e2e_inventory.py"
 FIXTURE_BUILD="$REPO_ROOT/libs/cua-driver/tests/fixtures/build/macos.sh"
 FIXTURE_SRC="$REPO_ROOT/libs/cua-driver/tests/fixtures"
 FIXTURE_APP="$RUST_ROOT/test-apps/harness-appkit/CuaTestHarness.AppKit.app"
@@ -350,6 +350,7 @@ def one(key):
 passed = sum(1 for row in rows if row["result"] == "ok")
 print("| field | value |")
 print("|---|---|")
+print("| authority | supporting: local desktop run, not the canonical macOS runner (`libs/cua-driver/tests/runners/macos-lume/run-all.sh`, see `scripts/ci/README.md`) |")
 print(f"| head (tests) | `{one('head')}` |")
 print(f"| head (driver binary) | `{one('binary_head')}` |")
 print(f"| driver binary | `{one('binary')}` |")
@@ -366,17 +367,8 @@ EOF
 }
 
 cmd_allowlist_check() {
-	local declared missing=0 name
-	declared="$(sed -n 's/^[[:space:]]*fn \(harness_appkit_[A-Za-z0-9_]*\)().*/\1/p' "$TEST_FILE")"
-	while IFS= read -r name; do
-		if grep -Eq "^[[:space:]]*([A-Za-z0-9_]+::)?${name}([^A-Za-z0-9_].*)?$" "$E2E_SCRIPT"; then
-			printf 'PASS  %s\n' "$name"
-		else
-			printf 'FAIL  %s (absent from %s)\n' "$name" "${E2E_SCRIPT#"$REPO_ROOT/"}"
-			missing=$((missing + 1))
-		fi
-	done <<<"$declared"
-	[ "$missing" = 0 ] || die "$missing harness_appkit case(s) missing from the canonical allowlist"
+	[ -f "$INVENTORY_TEST" ] || die "no ${INVENTORY_TEST#"$REPO_ROOT/"}: this tree predates upstream #4118; run the check at a PR head on origin/main"
+	(cd "$REPO_ROOT" && uv run --quiet --no-project --with pytest python -m pytest -q -p no:cacheprovider "$INVENTORY_TEST")
 }
 
 main() {

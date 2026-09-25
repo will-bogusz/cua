@@ -21,9 +21,9 @@ testkit's reachability probe; nothing is ever spoken on it and no daemon is star
 | `build` | `cargo build --locked --release -p cua-driver`, stages a copy, codesigns it (`OMP Computer Use` / `com.ohmypi.cua-driver`), records head + sha256 in `build.json`; refuses a dirty `libs/cua-driver/rust` unless `--allow-dirty` |
 | `install` | rm-then-copy the staged build into the installed location, keeps the previous binary and manifest as `*.prev`, verifies the installed sha256 equals the built one, writes `manifest.json` |
 | `run [filter]` | one `cargo test … --ignored --exact <test> --nocapture --test-threads=1` per case whose name contains `filter` (`=<name>` selects exactly one) of `HARNESS_TEST` (default `harness_appkit_test`) through the shim, with `CUA_E2E_RECORDINGS_ROOT=<out>/recordings` as the canonical `scripts/ci/macos/run-rust-e2e.sh` sets it (the snapshot-publication cell requires it; every cell then leaves its trajectory under `recordings/`), except for `bring_to_front_macos_test`, which that script runs with it unset; appends `{test,result,duration_s,head,binary_sha256,…}` rows to `evidence.jsonl`, logs under `logs/` |
-| `evidence [file]` | markdown table: head, binary sha256, daemon identity, macOS, per-test result and duration |
+| `evidence [file]` | markdown table: authority (always *supporting*), head, binary sha256, daemon identity, macOS, per-test result and duration |
 | `restore` | puts `cua-driver.prev` (and `manifest.json.prev`) back, rm-then-copy |
-| `allowlist-check` | every `fn harness_appkit_*` in `tests/harness_appkit_test.rs` must appear in the allowlist in `scripts/ci/macos/run-rust-e2e.sh` |
+| `allowlist-check` | runs upstream's `.github/scripts/tests/test_cua_driver_e2e_inventory.py` (#4118) through `uv`: every ignored test in `cua-driver` and `cua-driver-e2e` is selected by a canonical runner (for macOS cells, `scripts/ci/macos/run-rust-e2e.sh`) or listed with a reason in `libs/cua-driver/tests/manual-e2e-allowlist.txt`; refuses on trees older than #4118 |
 
 `--dry-run` prints the commands a mutating subcommand would run. Environment: `CARGO_TARGET_DIR`
 (required, private per lane), `HARNESS_OUT_DIR` (default `~/tmp/cua/harness-out`),
@@ -50,6 +50,11 @@ SIGKILLs every later reader of that path. `install` and `restore` unlink first f
 
 ## What the evidence can and cannot say
 
+- It is supporting evidence. Upstream's `scripts/ci/README.md` § *Canonical and supporting runners*
+  (#4147) reserves certification of macOS desktop behavior for the Lume runner
+  (`libs/cua-driver/tests/runners/macos-lume/run-all.sh`) run in full at the exact SHA; a local
+  desktop run like this one diagnoses and supports a claim, it does not certify it. A PR body says so
+  and names the canonical run as the remaining gate.
 - `harness_appkit_exact_activation_with_agent_cursor` fails under `mcp --direct`: the cell's live
   cursor producer asks the driver to move the agent cursor overlay and the driver refuses with
   `macOS agent cursor overlay is unavailable: this runtime owner has no certified AppKit
