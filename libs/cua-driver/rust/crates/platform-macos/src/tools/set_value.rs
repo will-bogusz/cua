@@ -50,6 +50,7 @@ use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::{CFEqual, CFTypeRef};
 
+use super::delivery_probe::WindowAnswer;
 use super::ToolState;
 
 pub struct SetValueTool {
@@ -102,7 +103,11 @@ fn def() -> &'static ToolDef {
              gesture; false means unproven, and the app may still hold its \
              pre-edit value. Web content is never committed this way (the \
              renderer never observes an AXValue write), and a multi-line \
-             AXTextArea has no end-of-edit gesture.\n\
+             AXTextArea has no end-of-edit gesture. A search field's AXConfirm \
+             asks the app to run the search, and an app may take it without \
+             searching: it counts as the commit only when the window changes \
+             after it, and is `unproven` otherwise — type the query into the \
+             field when the results did not change.\n\
              \n\
              A committed edit is STILL NOT ON DISK: measured on TextEdit, an \
              AXTextArea write appeared in the AX tree while the document stayed \
@@ -365,9 +370,16 @@ fn action_record(outcome: &SetValueOutcome, ax_echo_surface: bool) -> ActionExec
 enum WritePlan {
     /// Not a text control: the `AXValue` write is the whole edit.
     ValueOnly,
-    /// `AXValue`, ended by the control's own advertised `AXConfirm`. For a
-    /// search field that action *is* the commit: it runs the search.
+    /// `AXValue`, ended by the control's own advertised `AXConfirm`.
     ValueThenConfirm,
+    /// `AXValue`, ended by a search field's advertised `AXConfirm`, which asks
+    /// the application to run the search — and an application is free to take
+    /// the action and not search. Font Book's field did exactly that: the
+    /// value read back, the reply said committed, and the list stayed on all
+    /// 362 typefaces (V3D fontbook, 4 of 4 runs), while Automator's library
+    /// search filters on the same action. Only the window answering the
+    /// action witnesses the search.
+    ValueThenSearch,
     /// `AXValue`, ended by focusing the control and pressing this key.
     ValueThenKey(&'static str),
     /// Replace the control's text through the keystroke rung, then end the
@@ -404,8 +416,9 @@ const COMMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(120)
 const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(60);
 
 /// Native single-line text roles whose value AppKit carries in a field editor.
-/// `AXSearchField` is deliberately absent: its `AXConfirm` is the commit, and
-/// an `AXValue` write plus that action is measurably enough.
+/// `AXSearchField` is deliberately absent: its `AXConfirm` asks the app to run
+/// the search, and the window answering it is judged instead
+/// ([`WritePlan::ValueThenSearch`]).
 pub(super) fn is_binding_target_role(role: &str, subrole: &str) -> bool {
     matches!(role, "AXTextField" | "AXSecureTextField") && subrole != "AXSearchField"
 }
@@ -429,9 +442,14 @@ fn write_plan(role: &str, subrole: &str, advertised: &[String], value: &str) -> 
         }
         "AXTextField" | "AXSecureTextField" | "AXSearchField" | "AXComboBox" | "AXDateField"
         | "AXTimeField" => {
+            let search = role == "AXSearchField" || subrole == "AXSearchField";
             if advertised.iter().any(|action| action == "AXConfirm") {
-                WritePlan::ValueThenConfirm
-            } else if role == "AXSearchField" || subrole == "AXSearchField" {
+                if search {
+                    WritePlan::ValueThenSearch
+                } else {
+                    WritePlan::ValueThenConfirm
+                }
+            } else if search {
                 WritePlan::ValueThenKey("return")
             } else {
                 WritePlan::ValueThenKey("tab")
@@ -851,6 +869,7 @@ impl CommitJudgement {
 fn commit_written_value(
     element: AXUIElementRef,
     pid: i32,
+    window_id: u32,
     plan: WritePlan,
     changed: Option<bool>,
     target: &CommitTarget<'_>,
@@ -874,6 +893,20 @@ fn commit_written_value(
                 CommitWitness::OwnConfirmAction
             } else {
                 CommitWitness::ReadbackOnly
+            };
+            target.judge(element, dispatched, witness, "AXConfirm")
+        }
+        WritePlan::ValueThenSearch => {
+            // Settled after the write, so the field's own echo of it is in
+            // the baseline and only what the app does next can differ.
+            let watch = (changed == Some(true))
+                .then(|| super::delivery_probe::WindowWatch::capture(pid, window_id));
+            let dispatched = unsafe { perform_action(element, "AXConfirm") } == kAXErrorSuccess;
+            // A value the control already held proves nothing about this call,
+            // whatever the window does.
+            let witness = match watch {
+                Some(watch) if dispatched => CommitWitness::SearchWindow(watch.answer()),
+                _ => CommitWitness::ReadbackOnly,
             };
             target.judge(element, dispatched, witness, "AXConfirm")
         }
@@ -903,6 +936,9 @@ enum CommitWitness {
     OwnConfirmAction,
     /// Nothing but an accessibility read-back.
     ReadbackOnly,
+    /// A search field's confirm ran over a value this call moved it to, and
+    /// this is what the rest of its window did afterwards.
+    SearchWindow(super::delivery_probe::WindowAnswer),
 }
 
 /// What the read-back after a commit gesture saw.
@@ -1043,6 +1079,31 @@ fn judge_commit(
                      whether or not the app took the value. Check the app's own output."
                 ),
             ),
+            CommitWitness::SearchWindow(WindowAnswer::Changed) => (
+                Some(ActionCommit::Committed),
+                format!(
+                    " Committed via {gesture}: the search field's own confirm ran over this \
+                     value and the window changed after it."
+                ),
+            ),
+            CommitWitness::SearchWindow(WindowAnswer::Unchanged { waited }) => (
+                Some(ActionCommit::Unproven),
+                format!(
+                    " Commit unproven: the search field holds this value and its {gesture} ran, \
+                     but nothing else in the window changed within {} ms — an app can take a \
+                     search field's confirm and search only on typed input. Judge by its \
+                     results; if they did not change, type the query into the field.",
+                    waited.as_millis()
+                ),
+            ),
+            CommitWitness::SearchWindow(WindowAnswer::Unwatched) => (
+                Some(ActionCommit::Unproven),
+                format!(
+                    " Commit unproven: the search field holds this value and its {gesture} ran, \
+                     but the window could not be watched for the search (it never held still, \
+                     or did not answer). Judge by the app's own results."
+                ),
+            ),
         },
     }
 }
@@ -1177,7 +1238,8 @@ fn set_value_blocking(
                 numeric: numeric_target.is_some(),
                 identity: identity.as_ref(),
             };
-            let judgement = commit_written_value(element, pid, plan, written_change, &target);
+            let judgement =
+                commit_written_value(element, pid, window_id, plan, written_change, &target);
             // What the caller acts on is the control's settled state, so the
             // read that judged the gesture outranks the one taken before it.
             let after = judgement.settled.or(written);
@@ -1948,7 +2010,7 @@ mod tests {
         apply_surface_trust, apply_verification_label, classify_readback, classify_write,
         commit_written_value, judge_commit, refused_keystroke_plan, selection_length,
         unwritable_value, write_plan, CommitReadback, CommitTarget, CommitWitness, SetValueOutcome,
-        ToolResult, ValueAttribute, ValueNotSettable, WritePlan,
+        ToolResult, ValueAttribute, ValueNotSettable, WindowAnswer, WritePlan,
     };
     use cua_driver_contract::ActionCommit;
 
@@ -2021,8 +2083,9 @@ mod tests {
         );
     }
 
-    /// A search field's `AXConfirm` runs the search, which is the commit, and
-    /// the Automator library search field is measurably filtered by it.
+    /// A search field keeps the `AXValue` route, and its advertised
+    /// `AXConfirm` is judged by the window it searches, not by the value
+    /// surviving it: Font Book's field took the action and ran no search.
     #[test]
     fn a_search_field_keeps_the_ax_value_route() {
         assert_eq!(
@@ -2032,6 +2095,11 @@ mod tests {
                 &["AXConfirm".to_owned()],
                 "name.txt"
             ),
+            WritePlan::ValueThenSearch
+        );
+        // Any other control's own confirm is its end-of-edit.
+        assert_eq!(
+            write_plan("AXComboBox", "", &["AXConfirm".to_owned()], "name.txt"),
             WritePlan::ValueThenConfirm
         );
         assert_eq!(
@@ -2057,6 +2125,7 @@ mod tests {
         let judgement = commit_written_value(
             std::ptr::null_mut(),
             0,
+            0,
             WritePlan::ValueOnly,
             Some(true),
             &target("value", Some("old")),
@@ -2076,6 +2145,7 @@ mod tests {
         assert!(matches!(plan, WritePlan::Blocked(_)), "{plan:?}");
         let judgement = commit_written_value(
             std::ptr::null_mut(),
+            0,
             0,
             plan,
             Some(true),
@@ -2533,5 +2603,52 @@ mod tests {
         let plain = not_settable("", &[], ValueAttribute::ReadOnly).payload();
         assert_eq!(plain["value_attribute"], "read_only");
         assert!(plain.get("subrole").is_none());
+    }
+
+    /// Font Book's search field took `AXValue` and `AXConfirm`, read back as
+    /// written, and ran no search: the window stayed on "All Fonts – 362
+    /// typefaces" while the reply said committed (V3D fontbook, 4 of 4 runs).
+    /// A search field's confirm is a commit only when the window answers it.
+    #[test]
+    fn a_search_the_window_never_answered_is_unproven() {
+        let (committed, detail) = judge_commit(
+            CommitReadback::Matches,
+            CommitWitness::SearchWindow(WindowAnswer::Unchanged {
+                waited: std::time::Duration::from_millis(2000),
+            }),
+            "AXConfirm",
+        );
+        assert_eq!(committed, Some(ActionCommit::Unproven));
+        assert!(detail.contains("within 2000 ms"), "{detail}");
+        assert!(detail.contains("type the query into the field"), "{detail}");
+
+        let (committed, detail) = judge_commit(
+            CommitReadback::Matches,
+            CommitWitness::SearchWindow(WindowAnswer::Unwatched),
+            "AXConfirm",
+        );
+        assert_eq!(committed, Some(ActionCommit::Unproven));
+        assert!(detail.contains("could not be watched"), "{detail}");
+    }
+
+    /// Automator's library search filters on the same action: the window
+    /// changing after it is the app running the search.
+    #[test]
+    fn a_search_the_window_answered_commits() {
+        let (committed, detail) = judge_commit(
+            CommitReadback::Matches,
+            CommitWitness::SearchWindow(WindowAnswer::Changed),
+            "AXConfirm",
+        );
+        assert_eq!(committed, Some(ActionCommit::Committed));
+        assert!(detail.contains("the window changed after it"), "{detail}");
+
+        // The window answering never outranks the value not surviving.
+        let (committed, _) = judge_commit(
+            CommitReadback::Restored,
+            CommitWitness::SearchWindow(WindowAnswer::Changed),
+            "AXConfirm",
+        );
+        assert_eq!(committed, Some(ActionCommit::NotCommitted));
     }
 }

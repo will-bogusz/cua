@@ -4118,3 +4118,68 @@ fn harness_appkit_set_value_on_a_collapsed_search_is_refused_with_its_press() {
         },
     );
 }
+
+/// A search field's `AXConfirm` is a commit only when its window answers it.
+///
+/// Font Book's search field took `AXValue` and `AXConfirm`, read back as
+/// written, and ran no search: the window stayed on "All Fonts – 362
+/// typefaces" while the reply said `committed` and OMP printed a clean
+/// `✓ setValue` (V3D fontbook, 4 of 4 runs). The fixture field has the same
+/// shape — it answers the confirm with success and searches only on typed
+/// input — so the verdict has to be `unproven`, and say how the search runs.
+/// `harness_appkit_set_value_uses_an_advertised_confirm_as_the_commit` is the
+/// other half: a confirm the window answers still commits.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_on_a_search_the_app_never_ran_is_unproven() {
+    run_background_case_with_env(
+        "set_value_typed_search",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_APPKIT_TYPED_SEARCH", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("typed_search=none typed_search_runs=0"),
+                "the fixture did not start without a search:\n{}",
+                before.tree_text()
+            );
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "txt-search-typed"),
+                    "value": "Papyrus"
+                }),
+            );
+            assert!(!set.is_error(), "set_value failed: {}", set.raw);
+            assert_eq!(
+                set.action_route(),
+                Some("accessibility"),
+                "a search field keeps the value-then-confirm route: {}",
+                set.raw
+            );
+            assert_eq!(
+                set.structured()["committed"],
+                serde_json::json!("unproven"),
+                "a confirm the window never answered was credited as the commit: {}",
+                set.raw
+            );
+            assert!(
+                set.text().contains("type the query into the field"),
+                "the verdict must name the route that runs the search: {}",
+                set.text()
+            );
+
+            std::thread::sleep(Duration::from_millis(250));
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(
+                after.tree_text().contains("typed_search=none typed_search_runs=0")
+                    && after.tree_text().contains("Papyrus"),
+                "the fixture no longer shows a value that ran no search:\n{}",
+                after.tree_text()
+            );
+        },
+    );
+}

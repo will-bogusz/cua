@@ -417,6 +417,118 @@ impl DeliveryProbe {
     }
 }
 
+/// Whether a window answered an action with a change of its own, read by the
+/// probe's subtree digest alone and captured after the caller's own write, so
+/// that write is part of the baseline.
+///
+/// For an action aimed at a control that holds still while it runs — a search
+/// field's `AXConfirm` over a value already written — the control's own state
+/// and the application's focus can move without the application doing what
+/// was asked, so neither is watched: only the rest of the window reads what
+/// the application did with the action.
+pub struct WindowWatch {
+    pid: i32,
+    window_id: u32,
+    /// The digest two back-to-back samples agreed on, or `None` when the
+    /// window never held still (or never answered) inside the capture.
+    settled: Option<u64>,
+}
+
+/// What a [`WindowWatch`] saw after the action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowAnswer {
+    /// The window's subtree differed from the settled digest.
+    Changed,
+    /// Every readable sample matched the settled digest for `waited`.
+    Unchanged { waited: Duration },
+    /// Nothing could be compared: the window never settled before the action,
+    /// or never answered after it.
+    Unwatched,
+}
+
+impl WindowWatch {
+    /// Settle the window's digest before the action. Blocking AX work — call
+    /// from a blocking thread. A window still redrawing the caller's own write
+    /// gets the same bounded re-sampling a window the driver just activated
+    /// does before it is written off as unquiescent.
+    pub fn capture(pid: i32, window_id: u32) -> Self {
+        Self {
+            pid,
+            window_id,
+            settled: settle_digest(|| tree_digest(pid, window_id), ACTIVATION_SETTLE_ATTEMPTS, || {
+                cua_driver_core::operation::sleep(ACTIVATION_SETTLE_GAP).is_ok()
+            }),
+        }
+    }
+
+    /// Sample the window until it differs or the settle budget runs out.
+    /// Blocking AX work — call from a blocking thread.
+    pub fn answer(&self) -> WindowAnswer {
+        let start = Instant::now();
+        answer_within(
+            self.settled,
+            || tree_digest(self.pid, self.window_id),
+            || start.elapsed(),
+            SETTLE_BUDGET,
+            || cua_driver_core::operation::sleep(SETTLE_POLL).is_ok(),
+        )
+    }
+}
+
+/// The digest two back-to-back samples agree on, re-sampling at most
+/// `attempts` more times while they disagree; `wait` returning false (a
+/// cancelled caller) ends the capture unsettled.
+fn settle_digest(
+    mut sample: impl FnMut() -> Option<u64>,
+    attempts: usize,
+    mut wait: impl FnMut() -> bool,
+) -> Option<u64> {
+    let mut previous = sample();
+    for attempt in 0..=attempts {
+        let next = sample();
+        if next.is_some() && next == previous {
+            return next;
+        }
+        if attempt == attempts || !wait() {
+            break;
+        }
+        previous = next;
+    }
+    None
+}
+
+/// Compare post-action samples against `settled` until one differs or
+/// `budget` has elapsed. An unreadable sample compares nothing, so a watch
+/// whose every sample was unreadable saw nothing rather than no change.
+fn answer_within(
+    settled: Option<u64>,
+    mut sample: impl FnMut() -> Option<u64>,
+    mut elapsed: impl FnMut() -> Duration,
+    budget: Duration,
+    mut wait: impl FnMut() -> bool,
+) -> WindowAnswer {
+    let Some(settled) = settled else {
+        return WindowAnswer::Unwatched;
+    };
+    let mut compared = false;
+    loop {
+        if let Some(after) = sample() {
+            if after != settled {
+                return WindowAnswer::Changed;
+            }
+            compared = true;
+        }
+        let waited = elapsed();
+        if waited >= budget || !wait() {
+            return if compared {
+                WindowAnswer::Unchanged { waited }
+            } else {
+                WindowAnswer::Unwatched
+            };
+        }
+    }
+}
+
 fn settle_budget(before: &Signals) -> Duration {
     if before.element.state().is_some() {
         SETTLE_BUDGET
@@ -1131,5 +1243,84 @@ mod tests {
         let unreachable = unsafe { AXUIElementCreateApplication(999_999) }; // above pid_max
         let guard = unsafe { RetainedElement::adopt(unreachable) }.expect("element");
         assert_eq!(element_state(&guard), ElementRead::Unreadable);
+    }
+
+    /// Samples handed out in order; once exhausted, the last one repeats.
+    fn samples(values: &[Option<u64>]) -> impl FnMut() -> Option<u64> + '_ {
+        let mut next = 0;
+        move || {
+            let value = values[next.min(values.len() - 1)];
+            next += 1;
+            value
+        }
+    }
+
+    /// A clock that advances one poll per read.
+    fn ticking(step_ms: u64) -> impl FnMut() -> Duration {
+        let mut now = 0;
+        move || {
+            now += step_ms;
+            Duration::from_millis(now)
+        }
+    }
+
+    #[test]
+    fn a_window_still_redrawing_the_write_settles_before_the_watch_starts() {
+        // The first pair disagrees (the write still drawing), the second agrees.
+        assert_eq!(
+            settle_digest(samples(&[Some(1), Some(2), Some(2)]), 3, || true),
+            Some(2)
+        );
+        // A window that never holds still is not watched.
+        assert_eq!(
+            settle_digest(samples(&[Some(1), Some(2), Some(3), Some(4), Some(5)]), 3, || true),
+            None
+        );
+        // Two unreadable samples agree on nothing.
+        assert_eq!(settle_digest(samples(&[None]), 3, || true), None);
+    }
+
+    #[test]
+    fn a_window_that_changed_after_the_action_answered_it() {
+        let answer = answer_within(
+            Some(7),
+            samples(&[Some(7), Some(8)]),
+            ticking(50),
+            SETTLE_BUDGET,
+            || true,
+        );
+        assert_eq!(answer, WindowAnswer::Changed);
+    }
+
+    #[test]
+    fn a_window_that_held_still_for_the_budget_did_not_answer() {
+        let answer = answer_within(Some(7), samples(&[Some(7)]), ticking(500), SETTLE_BUDGET, || true);
+        assert_eq!(
+            answer,
+            WindowAnswer::Unchanged {
+                waited: SETTLE_BUDGET
+            }
+        );
+    }
+
+    /// Neither an unsettled capture nor a window that never answered after
+    /// the action is a window that held still.
+    #[test]
+    fn a_watch_that_compared_nothing_saw_nothing() {
+        assert_eq!(
+            answer_within(None, samples(&[Some(1)]), ticking(500), SETTLE_BUDGET, || true),
+            WindowAnswer::Unwatched
+        );
+        assert_eq!(
+            answer_within(Some(7), samples(&[None]), ticking(500), SETTLE_BUDGET, || true),
+            WindowAnswer::Unwatched
+        );
+        // An unreadable sample never reads as the change either.
+        assert_eq!(
+            answer_within(Some(7), samples(&[None, Some(7)]), ticking(500), SETTLE_BUDGET, || true),
+            WindowAnswer::Unchanged {
+                waited: SETTLE_BUDGET
+            }
+        );
     }
 }

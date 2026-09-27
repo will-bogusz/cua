@@ -24,6 +24,8 @@
 //                    display-only descendants (CUA_APPKIT_DESCENDANT_ROW=1)
 //   desktop_surface — a window at the desktop-icon level holding one
 //                    labelled image (CUA_APPKIT_DESKTOP_SURFACE=1)
+//   typed_search   — a search field that takes AXConfirm and searches only
+//                    on typed input (CUA_APPKIT_TYPED_SEARCH=1)
 //   collapsed_search — a collapsed search control that publishes no value
 //                    and expands into a search field when pressed
 //                    (CUA_APPKIT_COLLAPSED_SEARCH=1)
@@ -198,6 +200,11 @@ let kDesktopSurfaceSize = NSSize(width: 360, height: 220)
 /// bottom-left-origin coordinates. Away from the menu bar and the Dock so it
 /// is fully on screen, which is what puts it in an on-screen-only listing.
 let kDesktopSurfaceOrigin = NSPoint(x: 80, y: 120)
+/// typed_search — Font Book's search field shape (`CUA_APPKIT_TYPED_SEARCH=1`):
+/// it takes `AXConfirm` and searches only on typed input.
+let kTypedSearchAID = "txt-search-typed"
+let kTypedSearchPlaceholder = "Searches as you type"
+let kTypedSearchStateAID = "lbl-typed-search"
 /// collapsed_search — the collapsed toolbar search shape
 /// (`CUA_APPKIT_COLLAPSED_SEARCH=1`): a button that publishes itself as a
 /// search field and has no value, and the field its press reveals.
@@ -371,6 +378,25 @@ final class HarnessWindow: NSWindow {
 final class KeyWindowGatedSearchField: NSSearchField {
     override func isAccessibilityEnabled() -> Bool { window?.isKeyWindow == true }
 }
+
+/// Font Book's search field, as far as accessibility shows it: it advertises
+/// `AXConfirm` and answers the action with success, and it searches only when
+/// its field editor reports typed input. An `AXValue` write followed by the
+/// confirm leaves the value in the field and runs no search — measured on
+/// Font Book, whose window stayed on "All Fonts – 362 typefaces" — while the
+/// same query typed into it searches at once.
+final class TypedOnlySearchField: NSSearchField {
+    override func accessibilityActionNames() -> [NSAccessibility.Action] {
+        let actions = super.accessibilityActionNames()
+        return actions.contains(.confirm) ? actions : actions + [.confirm]
+    }
+
+    override func accessibilityPerformConfirm() -> Bool { true }
+}
+
+/// `NSSearchField` takes an `NSSearchFieldDelegate`; the controller's
+/// `controlTextDidChange` is what the typed-search field reports to.
+extension HarnessWindowController: NSSearchFieldDelegate {}
 
 /// A search control collapsed to its button, as Activity Monitor's toolbar
 /// publishes it: an `AXButton` with subrole `AXSearchField` that advertises
@@ -774,6 +800,11 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let caretObserver = CaretStateObserver()
     /// The unlabelled row and the three pieces of text it is named by.
     let unlabelledRow = UnlabelledRowView()
+    /// The typed-search scenario: the field, and the app's own record of the
+    /// searches it ran — one per change its field editor reported.
+    let typedSearch = TypedOnlySearchField()
+    let typedSearchStateLabel = NSTextField(labelWithString: "typed_search=none typed_search_runs=0")
+    var typedSearchRuns = 0
     /// The collapsed search scenario: the button, the field its press
     /// reveals, and the app's own record of which one is showing.
     let collapsedSearch = CollapsedSearchButton(title: kCollapsedSearchTitle, target: nil, action: nil)
@@ -1263,6 +1294,21 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             content.addArrangedSubview(unlabelledRow)
             extraHeight += 60
         }
+        if HarnessWindowController.envFlag("CUA_APPKIT_TYPED_SEARCH") {
+            content.addArrangedSubview(sectionLabel("typed_search"))
+            typedSearch.setAccessibilityIdentifier(kTypedSearchAID)
+            typedSearch.placeholderString = kTypedSearchPlaceholder
+            typedSearch.delegate = self
+            typedSearch.translatesAutoresizingMaskIntoConstraints = false
+            typedSearchStateLabel.setAccessibilityIdentifier(kTypedSearchStateAID)
+            typedSearchStateLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            let searchRow = NSStackView(views: [typedSearch, typedSearchStateLabel])
+            searchRow.orientation = .horizontal
+            searchRow.spacing = 12
+            NSLayoutConstraint.activate([typedSearch.widthAnchor.constraint(equalToConstant: 220)])
+            content.addArrangedSubview(searchRow)
+            extraHeight += 60
+        }
         if HarnessWindowController.envFlag("CUA_APPKIT_COLLAPSED_SEARCH") {
             content.addArrangedSubview(sectionLabel("collapsed_search"))
             collapsedSearch.setAccessibilityIdentifier(kCollapsedSearchAID)
@@ -1603,6 +1649,12 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         guard let field = obj.object as? NSTextField else { return }
         if field === textInput {
             textInputMirror.stringValue = field.stringValue
+        }
+        if field === typedSearch {
+            // The search this app runs: only typed input reaches it.
+            typedSearchRuns += 1
+            typedSearchStateLabel.stringValue =
+                "typed_search=\(field.stringValue) typed_search_runs=\(typedSearchRuns)"
         }
         if field === confirmInput {
             // Keystrokes reach a field editor and raise this notification; an
