@@ -446,4 +446,30 @@ mod tests {
         assert_conforms(ACTION_TOOL, &result);
         assert_eq!(result["isError"], true);
     }
+
+    /// `system_windows` rows are closed objects that carry a `title`. The
+    /// schema generator once stripped every key spelled `title` — the schema
+    /// annotation and a property of that name alike — so the first system
+    /// window on screen turned every `list_windows` into an output mismatch.
+    #[test]
+    fn a_system_window_row_with_its_title_passes_the_list_windows_boundary() {
+        let tool = "list_windows";
+        let success = json!({
+            "content": [{"type": "text", "text": "Found 0 window(s)."}],
+            "isError": false,
+            "structuredContent": {
+                "windows": [],
+                "system_windows": [{
+                    "window_id": 41, "pid": 402, "app_name": "UserNotificationCenter", "title": "",
+                    "bounds": {"x": 0.0, "y": 0.0, "width": 400.0, "height": 120.0},
+                    "layer": 1000, "z_index": 0, "kind": "permission"
+                }]
+            },
+        });
+
+        let result = conforming_tool_result(tool, success.clone());
+
+        assert_conforms(tool, &result);
+        assert_eq!(result, success);
+    }
 }

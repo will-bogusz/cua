@@ -690,4 +690,50 @@ mod tests {
             );
         }
     }
+
+    /// A closed object whose `required` names a field its `properties` lack
+    /// rejects every instance: the field is required and forbidden at once.
+    /// The title stripper once removed `title` properties from window rows,
+    /// so every `list_windows` with a system window on screen failed its own
+    /// advertised schema.
+    #[test]
+    fn every_closed_object_schema_declares_the_fields_it_requires() {
+        fn unsatisfiable(schema: &Value, path: &str, found: &mut Vec<String>) {
+            match schema {
+                Value::Object(object) => {
+                    if object.get("additionalProperties") == Some(&Value::Bool(false)) {
+                        let properties = object.get("properties").and_then(Value::as_object);
+                        for field in object
+                            .get("required")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                        {
+                            if !properties.is_some_and(|p| p.contains_key(field)) {
+                                found.push(format!("{path}: {field}"));
+                            }
+                        }
+                    }
+                    for (key, child) in object {
+                        unsatisfiable(child, &format!("{path}/{key}"), found);
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        unsatisfiable(child, &format!("{path}/{index}"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut found = Vec::new();
+        for contract in manifest().tools {
+            if let Some(schema) = advertised_tool_output_schema(&contract.name) {
+                unsatisfiable(&schema, &contract.name, &mut found);
+            }
+        }
+        assert!(found.is_empty(), "required but undeclared: {found:#?}");
+    }
 }

@@ -338,6 +338,9 @@
                     "null"
                   ]
                 },
+                "title": {
+                  "type": "string"
+                },
                 "window_id": {
                   "format": "uint64",
                   "minimum": 0,
@@ -842,6 +845,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "title": {
+                  "type": "string"
                 },
                 "window_id": {
                   "format": "uint64",
@@ -1934,6 +1940,12 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "description": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "element_id": {
                   "type": [
                     "string",
@@ -2628,6 +2640,9 @@
                     "null"
                   ]
                 },
+                "title": {
+                  "type": "string"
+                },
                 "window_id": {
                   "format": "uint64",
                   "minimum": 0,
@@ -2897,6 +2912,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "title": {
+                  "type": "string"
                 },
                 "window_id": {
                   "format": "uint64",
@@ -3329,6 +3347,9 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "title": {
+                  "type": "string"
+                },
                 "window_id": {
                   "format": "uint64",
                   "minimum": 0,
@@ -3449,6 +3470,9 @@
                     "array",
                     "null"
                   ]
+                },
+                "title": {
+                  "type": "string"
                 },
                 "window_id": {
                   "format": "uint64",
@@ -3758,6 +3782,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "title": {
+                  "type": "string"
                 },
                 "window_id": {
                   "format": "uint64",
@@ -4077,6 +4104,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "title": {
+                  "type": "string"
                 },
                 "window_id": {
                   "format": "uint64",
@@ -4416,6 +4446,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "title": {
+                  "type": "string"
                 },
                 "window_id": {
                   "format": "uint64",
@@ -5000,6 +5033,9 @@
                     "null"
                   ]
                 },
+                "title": {
+                  "type": "string"
+                },
                 "window_id": {
                   "format": "uint64",
                   "minimum": 0,
@@ -5454,6 +5490,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "title": {
+                  "type": "string"
                 },
                 "window_id": {
                   "format": "uint64",

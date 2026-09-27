@@ -131,13 +131,22 @@ pub(crate) fn output_schema_with_additional_properties<T: JsonSchema>(
     schema
 }
 
+/// Drop the `title` and `description` annotations schemars writes. A key of a
+/// `properties` map is a field name, not an annotation: `title` is a field of
+/// window rows, and removing it there leaves a closed row that rejects its own
+/// title.
 fn strip_schema_titles(value: &mut Value) {
     match value {
         Value::Object(object) => {
             object.remove("title");
             object.remove("description");
-            for child in object.values_mut() {
-                strip_schema_titles(child);
+            for (key, child) in object.iter_mut() {
+                match (key.as_str(), child) {
+                    ("properties" | "patternProperties" | "$defs", Value::Object(fields)) => {
+                        fields.values_mut().for_each(strip_schema_titles)
+                    }
+                    (_, child) => strip_schema_titles(child),
+                }
             }
         }
         Value::Array(values) => values.iter_mut().for_each(strip_schema_titles),
