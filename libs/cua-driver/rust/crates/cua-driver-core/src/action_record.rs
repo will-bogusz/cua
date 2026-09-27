@@ -262,6 +262,10 @@ pub struct ActionExecutionRecord {
     /// Windows that appeared while the action ran; `None` when the platform
     /// did not watch for them.
     pub gained_windows: Option<Vec<cua_driver_contract::GainedWindow>>,
+    /// `type_text` with a `caret` only: the UTF-16 offset the caret was placed
+    /// at before typing, and the anchor it was resolved against.
+    pub caret_index: Option<u64>,
+    pub caret_anchor: Option<cua_driver_contract::CaretAnchor>,
 }
 
 impl ActionExecutionRecord {
@@ -283,6 +287,8 @@ impl ActionExecutionRecord {
             detail: None,
             committed: None,
             gained_windows: None,
+            caret_index: None,
+            caret_anchor: None,
         }
     }
 
@@ -293,6 +299,18 @@ impl ActionExecutionRecord {
         self.gained_windows = structured
             .get("gained_windows")
             .and_then(|windows| serde_json::from_value(windows.clone()).ok());
+    }
+
+    /// Adopt the caret placement a platform producer published in its
+    /// structured payload (`caret_index`, `caret_anchor`). An absent or
+    /// malformed field leaves the record saying nothing about it.
+    pub fn adopt_caret_placement(&mut self, structured: &serde_json::Value) {
+        self.caret_index = structured
+            .get("caret_index")
+            .and_then(serde_json::Value::as_u64);
+        self.caret_anchor = structured
+            .get("caret_anchor")
+            .and_then(|anchor| serde_json::from_value(anchor.clone()).ok());
     }
 
     pub fn builder(
@@ -463,6 +481,8 @@ impl ActionExecutionRecord {
             }),
             committed: self.committed,
             gained_windows: self.gained_windows.clone(),
+            caret_index: self.caret_index,
+            caret_anchor: self.caret_anchor.clone(),
         })
     }
 

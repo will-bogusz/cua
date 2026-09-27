@@ -166,6 +166,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {
@@ -674,6 +717,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {
@@ -2468,6 +2554,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {
@@ -2741,6 +2870,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {
@@ -3611,6 +3783,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {
@@ -3933,6 +4148,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {
@@ -4275,6 +4533,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {
@@ -4861,6 +5162,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {
@@ -5319,6 +5663,49 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "caret_anchor": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "after": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "after"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "before": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "before"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "caret_index": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "committed": {
             "anyOf": [
               {

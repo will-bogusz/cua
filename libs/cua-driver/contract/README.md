@@ -70,7 +70,8 @@ absence spelled out on the Rust type: `WindowStateOutput` gained
 and `query_hidden_rows`, and `WindowElement` gained `element_id`
 (accessibility-object continuity within one driver process — not record
 identity, never an address); `ListWindowsOutput` gained `system_windows`;
-`ActionResult` gained `gained_windows`. The typed `query` input stays a
+`ActionResult` gained `gained_windows`, `caret_index` and `caret_anchor`
+(`CaretAnchor`). The typed `query` input stays a
 string: the macOS runtime also accepts an array of literals (any-of), which
 the portable schema does not promise on every platform.
 

@@ -1617,14 +1617,15 @@ impl ToolRegistry {
                 );
             }
         }
-        // Appeared windows ride in the producer's structured payload whether
-        // the producer built its record itself or left it to the legacy
-        // normalizer.
+        // Appeared windows and a placed caret ride in the producer's
+        // structured payload whether the producer built its record itself or
+        // left it to the legacy normalizer.
         if let (Some(record), Some(structured)) = (
             result.action_record.as_mut(),
             result.structured_content.as_ref(),
         ) {
             record.adopt_gained_windows(structured);
+            record.adopt_caret_placement(structured);
         }
         if resolved_name == "launch_app" && result.is_error != Some(true) {
             if let (Some(before), Some(pid)) = (
@@ -2990,6 +2991,24 @@ mod runtime_isolation_tests {
     struct ObservationProbe {
         hits: Arc<AtomicUsize>,
         def: super::ToolDef,
+    }
+
+    /// An action tool that answers every call with one fixed producer reply.
+    struct ReplyProbe {
+        text: &'static str,
+        structured: serde_json::Value,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for ReplyProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            crate::protocol::ToolResult::text(self.text).with_structured(self.structured.clone())
+        }
     }
 
     struct ArgumentProbe {
@@ -4639,6 +4658,78 @@ resources:
         cua_driver_contract::validate_success_output("click", structured)
             .expect("the projected action must satisfy the public contract");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// `type_text`'s description promises `caret_index` (a UTF-16 offset)
+    /// and `caret_anchor` on the reply. A successful reply's payload is
+    /// replaced by the closed `ActionResult`, so both have to survive that
+    /// projection and the wire boundary's schema check, exactly as the macOS
+    /// producer spells them.
+    #[tokio::test]
+    async fn a_placed_caret_survives_the_action_result_projection() {
+        let mut registry = super::ToolRegistry::new_with_protected_consent_provider(None);
+        registry.register(Box::new(ReplyProbe {
+            text: "✅ Typed 1 char(s) at caret 9 (after \"anchor\").",
+            structured: serde_json::json!({
+                "path": "ax",
+                "characters": 1,
+                "requested_chars": 1,
+                "verified": true,
+                "effect": "confirmed",
+                "caret_index": 9,
+                "caret_anchor": {"after": "anchor"},
+            }),
+            def: super::ToolDef {
+                name: "type_text".into(),
+                description: "test input".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let registry = Arc::new(registry);
+        let context = standard_context();
+        let runtime_session = context.runtime_session_key("caret");
+        registry
+            .protected_resource_ownership()
+            .mark_driver_owned_pid(&runtime_session, 42);
+
+        let result = registry
+            .invoke_with_context(
+                "type_text",
+                serde_json::json!({
+                    "pid": 42,
+                    "window_id": 7,
+                    "session": "caret",
+                    "text": "X",
+                    "caret": {"after": "anchor"}
+                }),
+                context,
+            )
+            .await;
+
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let structured = result
+            .structured_content
+            .expect("successful actions publish an ActionResult");
+        assert_eq!(structured["caret_index"], 9, "{structured}");
+        assert_eq!(
+            structured["caret_anchor"],
+            serde_json::json!({"after": "anchor"}),
+            "{structured}"
+        );
+        let wire = serde_json::json!({
+            "content": [{"type": "text", "text": "typed"}],
+            "isError": false,
+            "structuredContent": structured,
+        });
+        assert_eq!(
+            crate::mcp_result::conforming_tool_result("type_text", wire.clone()),
+            wire,
+            "the advertised type_text output schema must admit the caret fields"
+        );
     }
 
     #[test]

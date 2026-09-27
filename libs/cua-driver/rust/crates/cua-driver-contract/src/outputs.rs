@@ -709,6 +709,16 @@ pub struct GainedWindow {
     pub attached_to: Option<u64>,
 }
 
+/// The substring a content-placed caret was resolved against, echoed as the
+/// caller sent it: `{"after": s}` puts the caret right after the first
+/// occurrence of `s` in the element's value, `{"before": s}` right before it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum CaretAnchor {
+    After(String),
+    Before(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionResult {
@@ -731,6 +741,16 @@ pub struct ActionResult {
     /// nothing; an empty array is a watch that saw none within its window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gained_windows: Option<Vec<GainedWindow>>,
+    /// `type_text` with a `caret` argument only: the UTF-16 offset into the
+    /// element's value where the caret was placed before anything was typed.
+    /// Absent when no caret was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caret_index: Option<u64>,
+    /// The anchor `caret_index` was resolved against (see [`CaretAnchor`]).
+    /// Absent for the `"start"` and `"end"` carets and when no caret was
+    /// requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caret_anchor: Option<CaretAnchor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -893,7 +913,42 @@ mod tests {
             escalation: None,
             committed: None,
             gained_windows: None,
+            caret_index: None,
+            caret_anchor: None,
         }
+    }
+
+    /// `type_text` publishes the anchor exactly as the caller sent it, so a
+    /// caller can match the reply against its own request.
+    #[test]
+    fn a_caret_anchor_is_published_in_the_request_spelling() {
+        for (anchor, wire) in [
+            (
+                CaretAnchor::After("anchor".into()),
+                json!({"after": "anchor"}),
+            ),
+            (
+                CaretAnchor::Before("anchor".into()),
+                json!({"before": "anchor"}),
+            ),
+        ] {
+            let mut result = confirmed_result();
+            result.caret_index = Some(9);
+            result.caret_anchor = Some(anchor);
+            let payload = serde_json::to_value(&result).unwrap();
+            assert_eq!(payload["caret_index"], json!(9));
+            assert_eq!(payload["caret_anchor"], wire);
+            assert_eq!(
+                serde_json::from_value::<ActionResult>(payload).unwrap(),
+                result
+            );
+        }
+        assert!(serde_json::from_value::<ActionResult>(json!({
+            "effect": "refused",
+            "route": "accessibility",
+            "caret_anchor": {"after": "a", "before": "b"}
+        }))
+        .is_err());
     }
 
     /// A consumer branches on this string, so an unproven write must be
@@ -930,6 +985,8 @@ mod tests {
         assert_eq!(
             properties.keys().map(String::as_str).collect::<Vec<_>>(),
             [
+                "caret_anchor",
+                "caret_index",
                 "committed",
                 "delivery",
                 "effect",
