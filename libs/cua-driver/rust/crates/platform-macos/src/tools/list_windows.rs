@@ -105,7 +105,16 @@ impl Tool for ListWindowsTool {
             windows.retain(|w| w.pid == pid);
         }
 
-        let roster = include_accessibility.then(|| accessibility_roster(pid_filter.unwrap()));
+        let roster = include_accessibility.then(|| {
+            let desktop_window_ids = windows
+                .iter()
+                .filter(|w| {
+                    server_kind(w, &system_overlays) == Some(crate::window_kind::DESKTOP_KIND)
+                })
+                .map(|w| w.window_id)
+                .collect();
+            accessibility_roster(pid_filter.unwrap(), &desktop_window_ids)
+        });
 
         // An application runs its modal alert at the modal-panel level, which
         // the layer filter above does not admit — so the one window the
@@ -135,18 +144,12 @@ impl Tool for ListWindowsTool {
         let windows_json: Vec<Value> = windows
             .iter()
             .map(|w| {
-                let kind = if system_overlays.contains(&w.window_id) {
-                    Some(crate::window_kind::SYSTEM_OVERLAY_KIND)
-                } else if crate::windows::is_desktop_surface(w) {
-                    Some(crate::window_kind::DESKTOP_KIND)
-                } else if roster
-                    .as_ref()
-                    .is_some_and(|roster| roster.is_app_modal(w.window_id))
-                {
-                    Some(crate::window_kind::APP_MODAL_KIND)
-                } else {
-                    None
-                };
+                let kind = server_kind(w, &system_overlays).or_else(|| {
+                    roster
+                        .as_ref()
+                        .is_some_and(|roster| roster.is_app_modal(w.window_id))
+                        .then_some(crate::window_kind::APP_MODAL_KIND)
+                });
                 let ax_backed = row_ax_backed(kind, roster.as_ref(), w.window_id);
                 window_record_json(w, kind, ax_backed)
             })
@@ -160,9 +163,20 @@ impl Tool for ListWindowsTool {
             data["accessibility_windows"] = roster.json;
         }
         data["system_windows"] =
-            serde_json::to_value(crate::window_kind::onscreen_system_windows())
-                .unwrap_or_default();
+            serde_json::to_value(crate::window_kind::onscreen_system_windows()).unwrap_or_default();
         ToolResult::text(format!("Found {} window(s).", windows_json.len())).with_structured(data)
+    }
+}
+
+/// The kind WindowServer facts alone give a row, before any accessibility
+/// roster can name it app-modal.
+fn server_kind(w: &crate::windows::WindowInfo, system_overlays: &[u32]) -> Option<&'static str> {
+    if system_overlays.contains(&w.window_id) {
+        Some(crate::window_kind::SYSTEM_OVERLAY_KIND)
+    } else if crate::windows::is_desktop_surface(w) {
+        Some(crate::window_kind::DESKTOP_KIND)
+    } else {
+        None
     }
 }
 
@@ -211,18 +225,27 @@ impl AccessibilityRoster {
 /// Whether an `AXWindows` entry this roster could not describe leaves the
 /// enumeration unable to claim it saw every window of the process.
 ///
-/// An entry that maps no CGWindowID and is not an `AXWindow` is an
-/// application-level surface, not a window this pass failed to identify: a
-/// display's desktop surface is listed under `AXWindows` and never as an
-/// `AXWindow`, so it has no window id by construction
-/// (`ax::window_scope::decide_desktop_surface_scope`). Counting it as a miss
-/// made every roster of a pid that owns one permanently incomplete, and an
-/// incomplete mapping is the one thing a caller may not narrow an acquisition
-/// with. Every other shape is a real window this roster cannot describe: an
-/// `AXWindow` whose id would not map, or a non-window element that does map
-/// one (an application's inline-rename field).
-fn entry_leaves_roster_incomplete(mapped: Option<u32>, role: Option<&str>) -> bool {
-    !matches!((mapped, role), (None, Some(role)) if role != "AXWindow")
+/// A non-`AXWindow` entry is a desktop surface, not a window this pass failed
+/// to identify, when it maps no CGWindowID (Finder's desktop: no window id by
+/// construction, `ax::window_scope::decide_desktop_surface_scope`) or when the
+/// id it maps is one of this listing's desktop rows (an application's own
+/// `NSWindow` at `kCGDesktopIconWindowLevel` that publishes a non-window role).
+/// Counting either as a miss made every roster of a pid that owns one
+/// permanently incomplete, and an incomplete mapping is the one thing a caller
+/// may not narrow an acquisition with. Every other shape is a real window this
+/// roster cannot describe: an `AXWindow` whose id would not map, an entry whose
+/// role is unreadable, or a non-window element that maps a window that is not
+/// a desktop row (an application's inline-rename field).
+fn entry_leaves_roster_incomplete(
+    mapped: Option<u32>,
+    role: Option<&str>,
+    desktop_window_ids: &std::collections::HashSet<u32>,
+) -> bool {
+    match (mapped, role) {
+        (_, None) | (_, Some("AXWindow")) => true,
+        (None, Some(_)) => false,
+        (Some(window_id), Some(_)) => !desktop_window_ids.contains(&window_id),
+    }
 }
 
 /// `ax_backed` for one WindowServer row.
@@ -244,7 +267,10 @@ fn row_ax_backed(
     roster.ax_backed(window_id)
 }
 
-fn accessibility_roster(pid: i32) -> AccessibilityRoster {
+fn accessibility_roster(
+    pid: i32,
+    desktop_window_ids: &std::collections::HashSet<u32>,
+) -> AccessibilityRoster {
     use crate::ax::bindings::*;
     use core_foundation::base::{CFRelease, CFTypeRef};
 
@@ -296,7 +322,11 @@ fn accessibility_roster(pid: i32) -> AccessibilityRoster {
                         }))
                     }
                     (mapped, role) => {
-                        if entry_leaves_roster_incomplete(mapped, role.as_deref()) {
+                        if entry_leaves_roster_incomplete(
+                            mapped,
+                            role.as_deref(),
+                            desktop_window_ids,
+                        ) {
                             complete = false;
                         }
                     }
@@ -477,20 +507,52 @@ mod tests {
     /// acquisition.
     #[test]
     fn an_unmappable_non_window_surface_does_not_make_the_roster_incomplete() {
-        assert!(!entry_leaves_roster_incomplete(None, Some("AXList")));
-        assert!(!entry_leaves_roster_incomplete(None, Some("AXGroup")));
+        let no_desktop = std::collections::HashSet::new();
+        assert!(!entry_leaves_roster_incomplete(
+            None,
+            Some("AXList"),
+            &no_desktop
+        ));
+        assert!(!entry_leaves_roster_incomplete(
+            None,
+            Some("AXGroup"),
+            &no_desktop
+        ));
 
         assert!(
-            entry_leaves_roster_incomplete(None, Some("AXWindow")),
+            entry_leaves_roster_incomplete(None, Some("AXWindow"), &no_desktop),
             "a window whose id would not map is a window this roster cannot describe"
         );
         assert!(
-            entry_leaves_roster_incomplete(Some(51), Some("AXTextField")),
+            entry_leaves_roster_incomplete(Some(51), Some("AXTextField"), &no_desktop),
             "an element that maps its own window id is a surface a caller can address"
         );
         assert!(
-            entry_leaves_roster_incomplete(None, None),
+            entry_leaves_roster_incomplete(None, None, &no_desktop),
             "an unreadable role says nothing, and nothing is not proof"
+        );
+    }
+
+    /// An application's own `NSWindow` at the desktop-icon level publishes a
+    /// non-window role, yet `_AXUIElementGetWindow` maps it to its CGWindowID.
+    /// That id is a desktop row of the same listing, so the entry is the
+    /// surface, not a window the roster missed. A mapped non-window entry on
+    /// any other row still is one.
+    #[test]
+    fn a_mapped_non_window_entry_on_a_desktop_row_does_not_make_the_roster_incomplete() {
+        let desktop_rows = std::collections::HashSet::from([981]);
+        assert!(!entry_leaves_roster_incomplete(
+            Some(981),
+            Some("AXScrollArea"),
+            &desktop_rows
+        ));
+        assert!(
+            entry_leaves_roster_incomplete(Some(51), Some("AXTextField"), &desktop_rows),
+            "a mapped inline-rename field on an ordinary row is still a miss"
+        );
+        assert!(
+            entry_leaves_roster_incomplete(Some(981), None, &desktop_rows),
+            "an unreadable role says nothing, even on a desktop row"
         );
     }
 

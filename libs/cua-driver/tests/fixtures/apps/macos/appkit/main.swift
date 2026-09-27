@@ -441,8 +441,11 @@ final class DescriptionOnlyText: NSView {
 /// claiming no window identity.
 ///
 /// [`ChildEditorWindow`] already proves an `NSWindow` can publish a
-/// non-`AXWindow` role, which is what makes its CGWindowID unmappable — the
-/// walker asks only `AXWindow`/`AXSheet` for one. This is the same technique
+/// non-`AXWindow` role, which keeps the walker from mapping its CGWindowID —
+/// it asks only `AXWindow`/`AXSheet` for one. (`_AXUIElementGetWindow` does
+/// map it: `list_windows`' roster asks every `AXWindows` entry, and files a
+/// mapped non-window entry on a desktop row as the surface, not a miss.)
+/// This is the same technique
 /// one level down the window stack, so the scope decision has to prove
 /// identity the way it does for Finder: the process owns the window, and an
 /// application-level child's frame lies inside the window's bounds.
