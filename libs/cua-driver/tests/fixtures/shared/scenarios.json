@@ -524,6 +524,17 @@
     }
    },
    {
+    "id": "collapsed_search",
+    "kind": "collapsed_search_control",
+    "description": "CUA_APPKIT_COLLAPSED_SEARCH=1 adds an NSButton titled Search whose accessibility subrole is AXSearchField, the shape Activity Monitor's collapsed toolbar search publishes: an AXButton that advertises AXPress and has no value of its own. Pressing it hides the button, shows the NSSearchField that takes a query, and sets the state label to collapsed_search=expanded. set_value on the button has nothing to write and must be refused before any write; the press is the route.",
+    "controls": {
+     "collapsed_search_aid": "btn-search-collapsed",
+     "expanded_search_aid": "txt-search-expanded",
+     "state_label_aid": "lbl-collapsed-search",
+     "collapsed_search_env": "CUA_APPKIT_COLLAPSED_SEARCH"
+    }
+   },
+   {
     "id": "exit",
     "kind": "exit_button",
     "controls": {

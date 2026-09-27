@@ -325,11 +325,25 @@ use core_foundation::{array::CFArray, base::TCFType, string::CFString as CFStr};
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) -> bool {
+    try_is_attribute_settable(element, attr_name) == Ok(true)
+}
+
+/// [`is_attribute_settable`] with the AX error kept, so a caller can tell an
+/// element that answered "no" from one that did not answer.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn try_is_attribute_settable(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<bool, AXError> {
     let attr = CFStr::new(attr_name);
     let mut settable = 0_u8;
-    AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable)
-        == kAXErrorSuccess
-        && settable != 0
+    match AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable) {
+        err if err == kAXErrorSuccess => Ok(settable != 0),
+        err => Err(err),
+    }
 }
 
 /// Copy a string attribute from an AX element. Returns `None` on any error.

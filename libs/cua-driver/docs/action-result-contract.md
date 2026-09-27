@@ -109,6 +109,7 @@ and the facts the decision actually read. The stable codes are defined once in
 | `element_outside_target_window` | the addressed element could not be proven to belong to the requested window |
 | `element_no_longer_exists` | the addressed element's accessibility reference is invalid; the window itself is unchanged |
 | `element_disabled` | the application reports `enabled = false` on the target, so no delivery mode and no activation can act on it |
+| `value_not_settable` | `set_value` (macOS): the element publishes no `AXValue`, or reports it read-only, so there is no value to write |
 
 `element_no_longer_exists` escalates with `target: "snapshot"`: only a fresh
 observation can produce an addressable element. `element_disabled` carries no
@@ -117,6 +118,17 @@ changes that. Its payload names the control and the state the decision read:
 `action`, `role`, `label`, `window_id`, `pid`, `foreground`,
 `front_in_process`, and `obscured_by` when another window of the same process
 is in front.
+
+`value_not_settable` carries no escalation either: no delivery mode makes a
+value writable. Its payload names the element and what it answered —
+`action`, `role`, `subrole` (when it has one), `label`, `window_id`, `pid`,
+`value_attribute` (`absent` or `read_only`) and `advertised_actions` — and
+its reason names the element's own route when it advertises one: a collapsed
+search control (an `AXButton` with subrole `AXSearchField`) is pressed to
+expand the field that takes the value. A popup's option choice, a date
+control's `CFDate` and stepping a numeric control through its advertised
+increment/decrement actions do not write a string into `AXValue`, so a
+read-only `AXValue` does not refuse them.
 
 `same_pid_keyboard_ambiguity` escalates with `target: "foreground"` for keys
 and chords, which have no element route, and `target: "element"` for text,

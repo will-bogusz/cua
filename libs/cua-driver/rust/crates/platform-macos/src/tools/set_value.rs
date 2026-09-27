@@ -19,7 +19,9 @@
 //!   read-back the driver can perform returns the written string.
 //!
 //! * **Everything else**: Write `AXValue` directly (sliders, steppers, search
-//!   fields whose `AXConfirm` is the commit, web inputs).
+//!   fields whose `AXConfirm` is the commit, web inputs). An element that
+//!   publishes no `AXValue`, or reports it read-only, is refused with
+//!   `value_not_settable` before anything is written.
 
 use async_trait::async_trait;
 use cua_driver_contract::ActionCommit;
@@ -37,9 +39,10 @@ use std::sync::Arc;
 use crate::apps;
 use crate::ax::bindings::{
     copy_action_names, copy_bool_attr, copy_children, copy_date_attr, copy_element_attr,
-    copy_number_attr, copy_string_attr, kAXErrorSuccess, local_iso8601_for_absolute_time,
-    perform_action, release_all, set_date_attr, set_number_attr, set_range_attr, set_string_attr,
-    AXUIElementRef,
+    copy_label_attr, copy_number_attr, copy_string_attr, kAXErrorAttributeUnsupported,
+    kAXErrorSuccess, local_iso8601_for_absolute_time, perform_action, release_all, set_date_attr,
+    set_number_attr, set_range_attr, set_string_attr, try_copy_string_attr,
+    try_is_attribute_settable, AXUIElementRef,
 };
 use crate::ax::popup::{choose_option, copy_open_menu, copy_popup_options, OptionChoice};
 use crate::ax::RetainedElement;
@@ -82,7 +85,11 @@ fn def() -> &'static ToolDef {
              read back; typed only when the control refuses that write.\n\
              \n\
              - **All other elements**: writes AXValue directly (sliders, steppers, \
-             native text fields that expose settable AXValue).\n\
+             native text fields that expose settable AXValue). An element that \
+             publishes no AXValue, or reports it read-only — a button, a collapsed \
+             toolbar search item — is refused with `value_not_settable` before \
+             anything is written; the refusal names the element's own route \
+             (press a collapsed search item to expand its field, then set that).\n\
              \n\
              For free-form text entry into web inputs, prefer `type_text_chars` \
              which synthesises key events — AXValue writes are ignored by WebKit.\n\
@@ -238,14 +245,19 @@ impl Tool for SetValueTool {
             Some(window_id),
         );
 
-        let plan = resolve_write_plan(
+        let plan = match resolve_write_plan(
             &_mutation_lease,
+            pid,
             window_id,
             element_ptr,
             &value,
             ax_echo_surface,
         )
-        .await;
+        .await
+        {
+            Ok(plan) => plan,
+            Err(not_settable) => return not_settable.result(),
+        };
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // AXValue writes on popups / sliders can cause reflex activations
@@ -431,35 +443,52 @@ fn write_plan(role: &str, subrole: &str, advertised: &[String], value: &str) -> 
 
 /// Resolve the write route for the addressed element, re-gating the keystroke
 /// rung before it is promised: a process-scoped key is a stricter route than
-/// the semantic AX write this tool already holds a lease for.
+/// the semantic AX write this tool already holds a lease for. An element with
+/// no value to write is refused here, before anything is dispatched.
 async fn resolve_write_plan(
     lease: &super::BackgroundMutationLease,
+    pid: i32,
     window_id: u32,
     element_ptr: usize,
     value: &str,
     ax_echo_surface: bool,
-) -> WritePlan {
+) -> Result<WritePlan, ValueNotSettable> {
     if ax_echo_surface {
-        return WritePlan::Blocked(
+        return Ok(WritePlan::Blocked(
             "web content never observes an AXValue write, so there is nothing to commit".to_owned(),
-        );
+        ));
     }
-    let Ok((role, subrole, advertised, holds_date)) =
+    let Ok((role, subrole, label, advertised, holds_date, value_attribute)) =
         cua_driver_core::operation::spawn_blocking(move || unsafe {
             let element = element_ptr as AXUIElementRef;
             (
                 copy_string_attr(element, "AXRole").unwrap_or_default(),
                 copy_string_attr(element, "AXSubrole").unwrap_or_default(),
+                copy_label_attr(element).unwrap_or_default(),
                 copy_action_names(element),
                 copy_date_attr(element, "AXValue").is_some(),
+                ValueAttribute::read(element),
             )
         })
         .await
     else {
-        return WritePlan::Blocked(
+        return Ok(WritePlan::Blocked(
             "the element stopped answering AX reads before the write".to_owned(),
-        );
+        ));
     };
+    if let Some(value_attribute) =
+        unwritable_value(&role, holds_date, value_attribute, &advertised, value)
+    {
+        return Err(ValueNotSettable {
+            role,
+            subrole,
+            label,
+            window_id,
+            pid,
+            advertised,
+            value_attribute,
+        });
+    }
     let plan = if holds_date {
         WritePlan::Date(DateFallback::Retype("tab"))
     } else {
@@ -478,12 +507,151 @@ async fn resolve_write_plan(
             .await
         {
             if matches!(plan, WritePlan::Date(_)) {
-                return WritePlan::Date(DateFallback::Refused(keystroke_refusal_reason(&refusal)));
+                return Ok(WritePlan::Date(DateFallback::Refused(keystroke_refusal_reason(
+                    &refusal,
+                ))));
             }
-            return refused_keystroke_plan(&plan, &advertised, &refusal);
+            return Ok(refused_keystroke_plan(&plan, &advertised, &refusal));
         }
     }
-    plan
+    Ok(plan)
+}
+
+/// What the addressed element answered about its `AXValue` before the write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueAttribute {
+    /// The element reports the attribute settable.
+    Settable,
+    /// The element publishes the attribute and reports it read-only.
+    ReadOnly,
+    /// The element does not publish the attribute at all.
+    Absent,
+    /// The element did not answer either question; nothing is known.
+    Unknown,
+}
+
+impl ValueAttribute {
+    /// # Safety
+    ///
+    /// `element` must be a valid, live `AXUIElementRef` for the call.
+    unsafe fn read(element: AXUIElementRef) -> Self {
+        if try_copy_string_attr(element, "AXValue") == Err(kAXErrorAttributeUnsupported) {
+            return Self::Absent;
+        }
+        match try_is_attribute_settable(element, "AXValue") {
+            Ok(true) => Self::Settable,
+            Ok(false) => Self::ReadOnly,
+            Err(err) if err == kAXErrorAttributeUnsupported => Self::Absent,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+/// Why `set_value` has nothing to write on this element, or `None` when a
+/// route exists.
+///
+/// Measured on Activity Monitor's collapsed toolbar search (an `AXButton`
+/// with subrole `AXSearchField`): `AXValue` was written to the button, the
+/// application answered success, nothing read it back, and the list stayed
+/// unfiltered (V3D native-read-activity-processes, 4 of 4 runs). A value the
+/// element does not publish, or publishes read-only, has no write route
+/// whatever the application answers. Three routes do not write a string into
+/// `AXValue` and keep their own refusals: a popup's option choice, a date
+/// control's `CFDate`, and stepping a numeric control through its advertised
+/// increment/decrement actions (SwiftUI's `AXSlider` publishes its value
+/// read-only and steps).
+fn unwritable_value(
+    role: &str,
+    holds_date: bool,
+    value_attribute: ValueAttribute,
+    advertised: &[String],
+    value: &str,
+) -> Option<ValueAttribute> {
+    if !matches!(value_attribute, ValueAttribute::ReadOnly | ValueAttribute::Absent)
+        || role == "AXPopUpButton"
+        || holds_date
+    {
+        return None;
+    }
+    let steps = advertised
+        .iter()
+        .any(|action| action == "AXIncrement" || action == "AXDecrement");
+    if steps && value.trim().parse::<f64>().is_ok() {
+        return None;
+    }
+    Some(value_attribute)
+}
+
+/// The refusal for an element whose value cannot be written: nothing was
+/// dispatched, and the reason names the element's own route when it has one.
+#[derive(Debug)]
+struct ValueNotSettable {
+    role: String,
+    subrole: String,
+    label: String,
+    window_id: u32,
+    pid: i32,
+    advertised: Vec<String>,
+    value_attribute: ValueAttribute,
+}
+
+impl ValueNotSettable {
+    fn reason(&self) -> String {
+        let Self {
+            role,
+            subrole,
+            label,
+            window_id,
+            ..
+        } = self;
+        let control = match (subrole.is_empty(), label.is_empty()) {
+            (true, true) => role.clone(),
+            (true, false) => format!("{role} \"{label}\""),
+            (false, true) => format!("{role}/{subrole}"),
+            (false, false) => format!("{role}/{subrole} \"{label}\""),
+        };
+        let state = match self.value_attribute {
+            ValueAttribute::Absent => "publishes no AXValue, so it has no value to write",
+            _ => "reports its AXValue read-only",
+        };
+        let presses = self.advertised.iter().any(|action| action == "AXPress");
+        let route = if presses && subrole == "AXSearchField" {
+            "It is a collapsed search control that advertises AXPress: press it to expand the \
+             search field, observe the window again, and set the field it reveals."
+        } else if presses {
+            "It advertises AXPress: press it if that is the change you meant; set_value only \
+             writes a control whose value is settable."
+        } else {
+            "It advertises no action that edits a value: address the control that holds the value."
+        };
+        format!("set_value was not dispatched: {control} of window {window_id} {state}. {route}")
+    }
+
+    fn payload(&self) -> Value {
+        let mut payload = serde_json::json!({
+            "code": "value_not_settable",
+            "effect": "not_dispatched",
+            "route": "ax",
+            "action": "set_value",
+            "role": self.role,
+            "label": self.label,
+            "window_id": self.window_id,
+            "pid": self.pid,
+            "value_attribute": match self.value_attribute {
+                ValueAttribute::Absent => "absent",
+                _ => "read_only",
+            },
+            "advertised_actions": self.advertised,
+        });
+        if !self.subrole.is_empty() {
+            payload["subrole"] = serde_json::json!(self.subrole);
+        }
+        payload
+    }
+
+    fn result(&self) -> ToolResult {
+        ToolResult::error(self.reason()).with_structured(self.payload())
+    }
 }
 
 /// What is left when the keystroke rung is refused before dispatch.
@@ -1778,8 +1946,9 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_readback, classify_write,
-        commit_written_value, judge_commit, refused_keystroke_plan, selection_length, write_plan,
-        CommitReadback, CommitTarget, CommitWitness, SetValueOutcome, ToolResult, WritePlan,
+        commit_written_value, judge_commit, refused_keystroke_plan, selection_length,
+        unwritable_value, write_plan, CommitReadback, CommitTarget, CommitWitness, SetValueOutcome,
+        ToolResult, ValueAttribute, ValueNotSettable, WritePlan,
     };
     use cua_driver_contract::ActionCommit;
 
@@ -2259,5 +2428,110 @@ mod tests {
             typed.detail,
             "📨 Sent (unverified) 4 character(s) into [4] AXTextField."
         );
+    }
+
+    /// Activity Monitor's collapsed toolbar search is an `AXButton` with
+    /// subrole `AXSearchField` that publishes no `AXValue`. `set_value` wrote
+    /// the button anyway, the app answered success, and the list stayed
+    /// unfiltered (V3D native-read-activity-processes, 4 of 4 runs).
+    #[test]
+    fn a_control_without_a_writable_value_is_refused_before_the_write() {
+        let press = ["AXPress".to_owned()];
+        assert_eq!(
+            unwritable_value("AXButton", false, ValueAttribute::Absent, &press, "Dock"),
+            Some(ValueAttribute::Absent)
+        );
+        assert_eq!(
+            unwritable_value("AXTextField", false, ValueAttribute::ReadOnly, &[], "Dock"),
+            Some(ValueAttribute::ReadOnly)
+        );
+        // A settable value, or one the element did not answer about, keeps
+        // the write: an unanswered question is not a "no".
+        for answered in [ValueAttribute::Settable, ValueAttribute::Unknown] {
+            assert_eq!(
+                unwritable_value("AXButton", false, answered, &press, "Dock"),
+                None
+            );
+        }
+    }
+
+    /// Three routes write something other than a string into `AXValue`, so a
+    /// read-only `AXValue` does not close them.
+    #[test]
+    fn routes_that_do_not_write_axvalue_keep_their_own_refusals() {
+        // A popup's option is pressed, not written.
+        assert_eq!(
+            unwritable_value("AXPopUpButton", false, ValueAttribute::ReadOnly, &[], "Red"),
+            None
+        );
+        // A date control takes a CFDate, and types when it refuses one.
+        assert_eq!(
+            unwritable_value("AXDateTimeArea", true, ValueAttribute::ReadOnly, &[], "2026-09-27"),
+            None
+        );
+        // SwiftUI's slider publishes its value read-only and steps.
+        let steps = ["AXIncrement".to_owned(), "AXDecrement".to_owned()];
+        assert_eq!(
+            unwritable_value("AXSlider", false, ValueAttribute::ReadOnly, &steps, " 40 "),
+            None
+        );
+        // Stepping only reaches a number.
+        assert_eq!(
+            unwritable_value("AXSlider", false, ValueAttribute::ReadOnly, &steps, "loud"),
+            Some(ValueAttribute::ReadOnly)
+        );
+    }
+
+    fn not_settable(subrole: &str, advertised: &[&str], attribute: ValueAttribute) -> ValueNotSettable {
+        ValueNotSettable {
+            role: "AXButton".to_owned(),
+            subrole: subrole.to_owned(),
+            label: "Search".to_owned(),
+            window_id: 4242,
+            pid: 77,
+            advertised: advertised.iter().map(|action| (*action).to_owned()).collect(),
+            value_attribute: attribute,
+        }
+    }
+
+    /// The refusal names the route the element itself offers, and only that:
+    /// pressing a collapsed search item expands the field that takes a value.
+    #[test]
+    fn the_refusal_names_the_elements_own_route() {
+        let collapsed = not_settable("AXSearchField", &["AXPress"], ValueAttribute::Absent);
+        let reason = collapsed.reason();
+        assert!(reason.starts_with("set_value was not dispatched: "), "{reason}");
+        assert!(reason.contains("AXButton/AXSearchField \"Search\" of window 4242"), "{reason}");
+        assert!(reason.contains("publishes no AXValue"), "{reason}");
+        assert!(reason.contains("press it to expand the search field"), "{reason}");
+
+        let button = not_settable("", &["AXPress"], ValueAttribute::ReadOnly).reason();
+        assert!(button.contains("AXButton \"Search\""), "{button}");
+        assert!(button.contains("read-only"), "{button}");
+        assert!(!button.contains("search field"), "{button}");
+
+        let inert = not_settable("", &[], ValueAttribute::ReadOnly).reason();
+        assert!(!inert.contains("AXPress"), "{inert}");
+        assert!(inert.contains("advertises no action"), "{inert}");
+    }
+
+    #[test]
+    fn the_refusal_payload_carries_the_state_it_was_decided_on() {
+        let result = not_settable("AXSearchField", &["AXPress"], ValueAttribute::Absent).result();
+        assert_eq!(result.is_error, Some(true));
+        let payload = result.structured_content.expect("refusal payload");
+        assert_eq!(payload["code"], "value_not_settable");
+        assert_eq!(payload["effect"], "not_dispatched");
+        assert_eq!(payload["action"], "set_value");
+        assert_eq!(payload["role"], "AXButton");
+        assert_eq!(payload["subrole"], "AXSearchField");
+        assert_eq!(payload["value_attribute"], "absent");
+        assert_eq!(payload["advertised_actions"], serde_json::json!(["AXPress"]));
+        assert_eq!(payload["window_id"], 4242);
+        assert!(payload.get("escalation").is_none());
+
+        let plain = not_settable("", &[], ValueAttribute::ReadOnly).payload();
+        assert_eq!(plain["value_attribute"], "read_only");
+        assert!(plain.get("subrole").is_none());
     }
 }

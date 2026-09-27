@@ -4029,3 +4029,92 @@ fn harness_appkit_a_desktop_level_window_is_a_desktop_row_read_through_its_conte
         },
     );
 }
+/// A search control collapsed to its button has no value to write, and
+/// `set_value` says so before writing anything.
+///
+/// Activity Monitor's collapsed toolbar search is an `AXButton` with subrole
+/// `AXSearchField`. `set_value("Dock")` used to write `AXValue` to that
+/// button: the application answered success, nothing read it back, the list
+/// stayed unfiltered and the reply said `Sent (unverified)` (V3D
+/// native-read-activity-processes, 4 of 4 runs). The fixture's button is the
+/// same shape with AppKit's own answer for its `AXValue`. The refusal has to
+/// name the press, and the press has to be the route: it reveals the field
+/// that takes a value.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_on_a_collapsed_search_is_refused_with_its_press() {
+    run_background_case_with_env(
+        "set_value_collapsed_search",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_APPKIT_COLLAPSED_SEARCH", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("collapsed_search=collapsed")
+                    && !has_id(before.tree_text(), "txt-search-expanded"),
+                "the fixture did not start collapsed:\n{}",
+                before.tree_text()
+            );
+            let button = element_by_id(&before, "btn-search-collapsed");
+            assert_eq!(button["role"], "AXButton", "the fixture control changed shape: {button}");
+
+            let refused = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&before, "btn-search-collapsed"),
+                    "value": "Dock"
+                }),
+            );
+            assert!(
+                refused.is_error(),
+                "set_value on a control with no value to write was accepted: {}",
+                refused.raw
+            );
+            assert_eq!(
+                refused.structured()["code"].as_str(),
+                Some("value_not_settable"),
+                "wrong refusal for a collapsed search control: {}",
+                refused.raw
+            );
+            assert_eq!(
+                refused.structured()["effect"].as_str(),
+                Some("not_dispatched"),
+                "the refusal must say nothing was written: {}",
+                refused.raw
+            );
+            assert!(
+                refused.text().contains("press it to expand the search field"),
+                "the refusal must name the control's own route: {}",
+                refused.text()
+            );
+            let unchanged = snapshot_elements(driver, pid, wid);
+            assert!(
+                unchanged.tree_text().contains("collapsed_search=collapsed"),
+                "the refused call changed the app:\n{}",
+                unchanged.tree_text()
+            );
+
+            // The route the refusal names lands: the press reveals the field.
+            let pressed = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&unchanged, "btn-search-collapsed"),
+                }),
+            );
+            assert!(!pressed.is_error(), "the press was refused: {}", pressed.raw);
+            std::thread::sleep(Duration::from_millis(250));
+            let expanded = snapshot_elements(driver, pid, wid);
+            assert!(
+                expanded.tree_text().contains("collapsed_search=expanded")
+                    && has_id(expanded.tree_text(), "txt-search-expanded"),
+                "the press did not reveal the search field:\n{}",
+                expanded.tree_text()
+            );
+        },
+    );
+}

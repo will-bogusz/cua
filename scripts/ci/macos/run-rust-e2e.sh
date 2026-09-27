@@ -394,6 +394,7 @@ if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
     harness_appkit_caret_places_the_insertion_point_before_typing \
     harness_appkit_an_unlabelled_row_is_named_by_its_text_descendants \
     harness_appkit_a_desktop_level_window_is_a_desktop_row_read_through_its_content \
+    harness_appkit_set_value_on_a_collapsed_search_is_refused_with_its_press \
       harness_appkit_slider_drag_px_background; do
       run_test "appkit-${appkit_test}" cargo test -p cua-driver --test harness_appkit_test -- \
         --ignored --exact "${appkit_test}" --nocapture --test-threads=1

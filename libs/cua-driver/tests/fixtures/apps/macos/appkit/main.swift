@@ -24,6 +24,9 @@
 //                    display-only descendants (CUA_APPKIT_DESCENDANT_ROW=1)
 //   desktop_surface — a window at the desktop-icon level holding one
 //                    labelled image (CUA_APPKIT_DESKTOP_SURFACE=1)
+//   collapsed_search — a collapsed search control that publishes no value
+//                    and expands into a search field when pressed
+//                    (CUA_APPKIT_COLLAPSED_SEARCH=1)
 //   exit           — NSButton terminates the app
 //
 // AX identifiers (via `setAccessibilityIdentifier(_:)`) match the IDs in
@@ -195,6 +198,13 @@ let kDesktopSurfaceSize = NSSize(width: 360, height: 220)
 /// bottom-left-origin coordinates. Away from the menu bar and the Dock so it
 /// is fully on screen, which is what puts it in an on-screen-only listing.
 let kDesktopSurfaceOrigin = NSPoint(x: 80, y: 120)
+/// collapsed_search — the collapsed toolbar search shape
+/// (`CUA_APPKIT_COLLAPSED_SEARCH=1`): a button that publishes itself as a
+/// search field and has no value, and the field its press reveals.
+let kCollapsedSearchAID = "btn-search-collapsed"
+let kCollapsedSearchTitle = "Search"
+let kExpandedSearchAID = "txt-search-expanded"
+let kCollapsedSearchStateAID = "lbl-collapsed-search"
 
 // MARK: - Controls
 
@@ -360,6 +370,16 @@ final class HarnessWindow: NSWindow {
 /// is key, which is what a click on a text control does.
 final class KeyWindowGatedSearchField: NSSearchField {
     override func isAccessibilityEnabled() -> Bool { window?.isKeyWindow == true }
+}
+
+/// A search control collapsed to its button, as Activity Monitor's toolbar
+/// publishes it: an `AXButton` with subrole `AXSearchField` that advertises
+/// `AXPress` and has no value of its own. The press is the only way in — it
+/// swaps the button for the search field that takes a query. Nothing here
+/// overrides how AppKit answers for the button's `AXValue`: that answer is
+/// the state the driver has to read.
+final class CollapsedSearchButton: NSButton {
+    override func accessibilitySubrole() -> NSAccessibility.Subrole? { .searchField }
 }
 
 /// The application's own witness of where its insertion point went.
@@ -754,6 +774,11 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let caretObserver = CaretStateObserver()
     /// The unlabelled row and the three pieces of text it is named by.
     let unlabelledRow = UnlabelledRowView()
+    /// The collapsed search scenario: the button, the field its press
+    /// reveals, and the app's own record of which one is showing.
+    let collapsedSearch = CollapsedSearchButton(title: kCollapsedSearchTitle, target: nil, action: nil)
+    let expandedSearch = NSSearchField()
+    let collapsedSearchStateLabel = NSTextField(labelWithString: "collapsed_search=collapsed")
 
     // Pinned content size — every launch MUST produce a byte-identical window
     // so screenshot dimensions (and the hardcoded pixel coords the harness tests
@@ -1238,6 +1263,25 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             content.addArrangedSubview(unlabelledRow)
             extraHeight += 60
         }
+        if HarnessWindowController.envFlag("CUA_APPKIT_COLLAPSED_SEARCH") {
+            content.addArrangedSubview(sectionLabel("collapsed_search"))
+            collapsedSearch.setAccessibilityIdentifier(kCollapsedSearchAID)
+            collapsedSearch.bezelStyle = .rounded
+            collapsedSearch.target = self
+            collapsedSearch.action = #selector(onExpandSearch)
+            expandedSearch.setAccessibilityIdentifier(kExpandedSearchAID)
+            expandedSearch.placeholderString = kCollapsedSearchTitle
+            expandedSearch.isHidden = true
+            expandedSearch.translatesAutoresizingMaskIntoConstraints = false
+            collapsedSearchStateLabel.setAccessibilityIdentifier(kCollapsedSearchStateAID)
+            collapsedSearchStateLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            let searchRow = NSStackView(views: [collapsedSearch, expandedSearch, collapsedSearchStateLabel])
+            searchRow.orientation = .horizontal
+            searchRow.spacing = 12
+            NSLayoutConstraint.activate([expandedSearch.widthAnchor.constraint(equalToConstant: 200)])
+            content.addArrangedSubview(searchRow)
+            extraHeight += 60
+        }
         if extraHeight > 0 {
             window.setContentSize(NSSize(
                 width: HarnessWindowController.kContentSize.width,
@@ -1401,6 +1445,14 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     /// an unflipped view), and below the window there is no screen left, so
     /// AppKit would fold it back in. `.semitransient` keeps it up while the
     /// application is in the background, which is when the driver observes it.
+    /// The collapsed search control's own press: swap the button for the
+    /// field, the way a toolbar search item expands.
+    @objc private func onExpandSearch() {
+        collapsedSearch.isHidden = true
+        expandedSearch.isHidden = false
+        collapsedSearchStateLabel.stringValue = "collapsed_search=expanded"
+    }
+
     @objc private func onShowPopover() {
         guard !popover.isShown else { return }
         popoverBodyLabel.setAccessibilityIdentifier(kPopoverBodyAID)
