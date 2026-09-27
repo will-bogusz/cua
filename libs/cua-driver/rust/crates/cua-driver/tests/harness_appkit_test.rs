@@ -4183,3 +4183,129 @@ fn harness_appkit_set_value_on_a_search_the_app_never_ran_is_unproven() {
         },
     );
 }
+
+/// Typing over a selection is measured against what the selection leaves.
+///
+/// AppKit selects a text field's whole value when it takes focus, and the
+/// first keystroke replaces the selection. Font Book's search field held
+/// "PapyrusPapyrus" selected and took "Papyrus" typed in the foreground — the
+/// search ran — while the reply said `type_text_incomplete: delivered 0 of 7`
+/// because the field had shrunk; with "Zapfino" selected and "Zapfino" typed
+/// the value did not move at all (V3D fontbook, 3 of 4 omp-next runs, each
+/// followed by a report_issue). Here the fixture's own search count is the
+/// witness that the keystrokes landed, and the reply has to agree with it in
+/// both shapes.
+#[test]
+#[ignore]
+fn harness_appkit_typing_over_a_selected_value_counts_what_replaced_it() {
+    run_case_with_env(
+        native_foreground_case(
+            "appkit",
+            "type_text_over_selection",
+            Targeting::Ax,
+            DriverRoute::MacosCgEventPid,
+        ),
+        &[("CUA_APPKIT_TYPED_SEARCH", "1")],
+        |pid, wid, driver| {
+            let first = snapshot_elements(driver, pid, wid);
+            let seeded = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&first, "txt-search-typed"),
+                    "value": "PapyrusPapyrus"
+                }),
+            );
+            assert!(!seeded.is_error(), "seeding the field failed: {}", seeded.raw);
+
+            // Focus selects the whole value; the query replaces it and shrinks it.
+            let second = snapshot_elements(driver, pid, wid);
+            let shrunk = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&second, "txt-search-typed"),
+                    "text": "Papyrus",
+                    "delivery_mode": "foreground"
+                }),
+            );
+            assert!(
+                !shrunk.is_error(),
+                "a replacement that shrank the field was reported undelivered: {}",
+                shrunk.raw
+            );
+            assert_eq!(
+                shrunk.action_effect(),
+                Some("confirmed"),
+                "the replacement was not read back as delivered: {}",
+                shrunk.raw
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            let third = snapshot_elements(driver, pid, wid);
+            let runs_after_first = typed_search_runs(third.tree_text());
+            assert!(
+                third.tree_text().contains("typed_search=Papyrus typed_search_runs=")
+                    && runs_after_first > 0,
+                "the app did not see the query typed over its selected value:\n{}",
+                third.tree_text()
+            );
+
+            // Move focus away, so focusing the field selects "Papyrus" again,
+            // and type the same query over it: the value cannot move.
+            let away = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&third, "txt-input")
+                }),
+            );
+            assert!(!away.is_error(), "moving focus away failed: {}", away.raw);
+            let fourth = snapshot_elements(driver, pid, wid);
+            let same = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "element_token": element_token_by_id(&fourth, "txt-search-typed"),
+                    "text": "Papyrus",
+                    "delivery_mode": "foreground"
+                }),
+            );
+            assert!(
+                !same.is_error(),
+                "the query typed over itself was reported undelivered: {}",
+                same.raw
+            );
+            assert_eq!(
+                same.action_effect(),
+                Some("confirmed"),
+                "the caret past the insertion was not taken as the delivery: {}",
+                same.raw
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            let last = snapshot_elements(driver, pid, wid);
+            assert!(
+                last.tree_text().contains("typed_search=Papyrus typed_search_runs=")
+                    && typed_search_runs(last.tree_text()) > runs_after_first,
+                "the app did not see the query typed over itself:\n{}",
+                last.tree_text()
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
+/// The typed-search fixture's own count of the searches it ran.
+fn typed_search_runs(tree: &str) -> u32 {
+    tree.split("typed_search_runs=")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|digits| digits.parse().ok())
+        })
+        .unwrap_or_else(|| panic!("no typed_search_runs= in the tree:\n{tree}"))
+}

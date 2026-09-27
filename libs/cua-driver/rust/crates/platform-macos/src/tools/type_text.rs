@@ -1483,46 +1483,161 @@ fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> Type
     }
 }
 
-/// Read the focused/target field's `AXValue`, for before/after read-back.
-/// Re-fetches the focused element each call when no explicit element is given
-/// (cheap, and focus is stable across our own keystrokes).
-fn read_axvalue(pid: i32, element_ptr_and_idx: Option<(usize, Option<usize>)>) -> Option<String> {
-    if let Some((ptr, _)) = element_ptr_and_idx {
-        unsafe { copy_string_attr(ptr as AXUIElementRef, "AXValue") }
-    } else if let Some(el) = unsafe { focused_element_of_pid(pid) } {
-        let v = unsafe { copy_string_attr(el, "AXValue") };
-        unsafe {
-            CFRelease(el as _);
+/// What the destination held at the moment text was dispatched into it, as
+/// delivery is measured against it.
+///
+/// The first keystroke — and an `AXSelectedText` write — replaces the
+/// selection, and AppKit selects a text field's whole value when it takes
+/// focus. Measured against the whole prior value, typing a query over a
+/// selected value that already held it is a shrink or no change at all: Font
+/// Book's search field held "PapyrusPapyrus" selected, took "Papyrus" typed in
+/// the foreground and ran the search, and the reply said `delivered 0 of 7`
+/// (V3D fontbook, 3 of 4 omp-next runs, each followed by a report_issue).
+/// So an insertion is measured against the value with the selection taken
+/// out. A value that still reads exactly as before is nothing landed — unless
+/// the selection held exactly the request, when the value reads the same
+/// either way and only the caret, collapsed past the insertion, tells them
+/// apart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct InsertionBase {
+    value: Option<String>,
+    replaced: Option<ReplacedSelection>,
+}
+
+/// A readable, non-empty selection inside the destination's value, split at
+/// its UTF-16 bounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplacedSelection {
+    prefix: String,
+    selected: String,
+    suffix: String,
+}
+
+impl InsertionBase {
+    /// A destination whose insertion replaces nothing, or whose selection
+    /// was not read.
+    pub(super) fn at(value: Option<&str>) -> Self {
+        Self {
+            value: value.map(str::to_owned),
+            replaced: None,
         }
-        v
-    } else {
-        None
+    }
+
+    /// A destination holding `value` with `selection` (UTF-16 location and
+    /// length, as `AXSelectedTextRange` reports it) selected. A selection that
+    /// is empty, out of range or splits a character replaces nothing
+    /// measurable.
+    fn replacing(value: Option<String>, selection: Option<(isize, isize)>) -> Self {
+        let replaced = value
+            .as_deref()
+            .zip(selection)
+            .and_then(|(value, (location, length))| {
+                let location = usize::try_from(location).ok()?;
+                let length = usize::try_from(length).ok().filter(|length| *length > 0)?;
+                let units: Vec<u16> = value.encode_utf16().collect();
+                let end = location.checked_add(length).filter(|end| *end <= units.len())?;
+                Some(ReplacedSelection {
+                    prefix: String::from_utf16(&units[..location]).ok()?,
+                    selected: String::from_utf16(&units[location..end]).ok()?,
+                    suffix: String::from_utf16(&units[end..]).ok()?,
+                })
+            });
+        Self { value, replaced }
+    }
+
+    /// How far `text` got, given the destination's value after the dispatch.
+    /// `caret` reads its selection, and is asked only when the value cannot
+    /// tell.
+    fn progress(
+        &self,
+        after: Option<&str>,
+        text: &str,
+        caret: impl FnOnce() -> Option<(isize, isize)>,
+    ) -> TypedProgress {
+        let Some(replaced) = &self.replaced else {
+            return typed_progress(self.value.as_deref(), after, text);
+        };
+        if text.is_empty() {
+            return TypedProgress::Complete;
+        }
+        if after.is_some() && after == self.value.as_deref() {
+            if replaced.selected != text {
+                return TypedProgress::Unchanged;
+            }
+            let start = utf16_len(&replaced.prefix);
+            let inserted_end = (start + utf16_len(text)) as isize;
+            let still_selected = (start as isize, utf16_len(&replaced.selected) as isize);
+            return match caret() {
+                Some(caret) if caret == (inserted_end, 0) => TypedProgress::Complete,
+                Some(caret) if caret == still_selected => TypedProgress::Unchanged,
+                _ => TypedProgress::Unverifiable,
+            };
+        }
+        let baseline = format!("{}{}", replaced.prefix, replaced.suffix);
+        typed_progress(Some(&baseline), after, text)
     }
 }
 
-/// Window-bound variant of [`read_axvalue`]: when no explicit element is
-/// addressed and a `window_id` is known, the focused element is used ONLY when
-/// its ancestry provably resolves to that exact window. A sibling window's
-/// focused field must never supply before/after evidence for the requested
-/// target — an unprovable focus reads as `None` (unverifiable), never as
-/// sibling data. Without a window the legacy pid-global read applies.
-fn read_axvalue_bound(
+/// Run `read` on a keystroke destination: the addressed element, else the
+/// focused element. When no element is addressed and a `window_id` is known,
+/// the focused element is used ONLY when its ancestry provably resolves to
+/// that exact window. A sibling window's focused field must never supply
+/// evidence for the requested target — an unprovable focus reads as `None`
+/// (unverifiable), never as sibling data. Without a window the pid-global
+/// focus applies.
+fn read_destination<T>(
     pid: i32,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
-) -> Option<String> {
-    if element_ptr_and_idx.is_some() {
-        return read_axvalue(pid, element_ptr_and_idx);
+    read: impl FnOnce(AXUIElementRef) -> T,
+) -> Option<T> {
+    if let Some((ptr, _)) = element_ptr_and_idx {
+        return Some(read(ptr as AXUIElementRef));
     }
-    match window_id {
-        Some(wid) => unsafe {
-            let el = crate::ax::exact_target::focused_element_in_window(pid, wid)?;
-            let v = copy_string_attr(el, "AXValue");
-            CFRelease(el as _);
-            v
-        },
-        None => read_axvalue(pid, None),
-    }
+    // SAFETY: both resolvers return a `+1` reference, released below.
+    let focused = unsafe {
+        match window_id {
+            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+            None => focused_element_of_pid(pid),
+        }
+    }?;
+    let value = read(focused);
+    unsafe { CFRelease(focused as _) };
+    Some(value)
+}
+
+/// The destination's value and selection at the moment text is dispatched
+/// into it. Read after focus is taken, because taking focus is what selects
+/// a text field's whole value.
+fn read_insertion_base(
+    pid: i32,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    window_id: Option<u32>,
+) -> InsertionBase {
+    read_destination(pid, element_ptr_and_idx, window_id, |element| unsafe {
+        InsertionBase::replacing(
+            copy_string_attr(element, "AXValue"),
+            copy_range_attr(element, "AXSelectedTextRange"),
+        )
+    })
+    .unwrap_or_default()
+}
+
+/// One read-back of a destination, measured against `base`.
+fn read_progress(
+    pid: i32,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    window_id: Option<u32>,
+    base: &InsertionBase,
+    text: &str,
+) -> TypedProgress {
+    read_destination(pid, element_ptr_and_idx, window_id, |element| {
+        let after = unsafe { copy_string_attr(element, "AXValue") };
+        base.progress(after.as_deref(), text, || unsafe {
+            copy_range_attr(element, "AXSelectedTextRange")
+        })
+    })
+    .unwrap_or_else(|| base.progress(None, text, || None))
 }
 
 /// Post-keystroke read-back over both readable views of the target.
@@ -1543,39 +1658,28 @@ fn read_axvalue_bound(
 /// as confirmed at a row that took none, which is how a Finder row-name cell
 /// answered a 0-of-8 insert with the text that had landed in a neighbouring
 /// editor.
-fn read_typed_value(
+fn read_typed_progress(
     pid: i32,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
-    before: Option<&str>,
+    base: &InsertionBase,
     text: &str,
     focus_may_substitute: bool,
-) -> Option<String> {
-    let addressed = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
-    if element_ptr_and_idx.is_none() || !focus_may_substitute {
+) -> TypedProgress {
+    let addressed = read_progress(pid, element_ptr_and_idx, window_id, base, text);
+    if element_ptr_and_idx.is_none()
+        || !focus_may_substitute
+        || addressed == TypedProgress::Complete
+    {
         return addressed;
     }
-    if matches!(
-        typed_progress(before, addressed.as_deref(), text),
-        TypedProgress::Complete
-    ) {
-        return addressed;
-    }
-    let focused = read_axvalue_bound(pid, None, window_id);
-    stronger_reading(before, text, addressed, focused)
+    stronger_progress(addressed, read_progress(pid, None, window_id, base, text))
 }
 
 /// Keep whichever read-back proves more delivery. An unreadable or unrelated
 /// focused element can never downgrade the addressed element's evidence.
-fn stronger_reading(
-    before: Option<&str>,
-    text: &str,
-    addressed: Option<String>,
-    focused: Option<String>,
-) -> Option<String> {
-    if progress_rank(&typed_progress(before, focused.as_deref(), text))
-        > progress_rank(&typed_progress(before, addressed.as_deref(), text))
-    {
+fn stronger_progress(addressed: TypedProgress, focused: TypedProgress) -> TypedProgress {
+    if progress_rank(&focused) > progress_rank(&addressed) {
         focused
     } else {
         addressed
@@ -1677,7 +1781,6 @@ fn cgevent_type_verified(
     pid: i32,
     text: &str,
     delay_ms: u64,
-    before: Option<&str>,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
     window_id: Option<u32>,
@@ -1707,12 +1810,15 @@ fn cgevent_type_verified(
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
+    // Read once focus is settled: taking focus is what selects a text field's
+    // whole value, and that selection is what the first keystroke replaces.
+    let base = read_insertion_base(pid, element_ptr_and_idx, window_id);
     Ok(KeystrokeRung {
         delivery: type_and_drain_from(
             pid,
             text,
             delay_ms,
-            before,
+            &base,
             element_ptr_and_idx,
             window_id,
             /*focus_may_substitute=*/ target_focused != Some(false),
@@ -1729,7 +1835,7 @@ pub(super) fn type_and_drain(
     pid: i32,
     text: &str,
     delay_ms: u64,
-    before: Option<&str>,
+    base: &InsertionBase,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
 ) -> anyhow::Result<TypedDelivery> {
@@ -1737,7 +1843,7 @@ pub(super) fn type_and_drain(
         pid,
         text,
         delay_ms,
-        before,
+        base,
         element_ptr_and_idx,
         window_id,
         /*focus_may_substitute=*/ true,
@@ -1749,7 +1855,7 @@ fn type_and_drain_from(
     pid: i32,
     text: &str,
     delay_ms: u64,
-    before: Option<&str>,
+    base: &InsertionBase,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
     focus_may_substitute: bool,
@@ -1762,12 +1868,12 @@ fn type_and_drain_from(
     // visible instead of treating any growth as success. If the deadline
     // expires after observable growth, surface the exact partial count.
     let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
-    Ok(await_typed_delivery(before, text, deadline, || {
-        read_typed_value(
+    Ok(await_typed_delivery(text, deadline, || {
+        read_typed_progress(
             pid,
             element_ptr_and_idx,
             window_id,
-            before,
+            base,
             text,
             focus_may_substitute,
         )
@@ -1787,12 +1893,11 @@ pub(super) struct TypedDelivery {
 }
 
 fn await_typed_delivery(
-    before: Option<&str>,
     text: &str,
     deadline: std::time::Instant,
-    read_value: impl FnMut() -> Option<String>,
+    read_progress: impl FnMut() -> TypedProgress,
 ) -> TypedDelivery {
-    match await_typed_progress(before, text, deadline, read_value) {
+    match await_typed_progress(deadline, read_progress) {
         TypedProgress::Complete => TypedDelivery {
             verified: true,
             delivered: Some(text.chars().count()),
@@ -1818,16 +1923,13 @@ fn await_typed_delivery(
 }
 
 fn await_typed_progress(
-    before: Option<&str>,
-    text: &str,
     deadline: std::time::Instant,
-    mut read_value: impl FnMut() -> Option<String>,
+    mut read_progress: impl FnMut() -> TypedProgress,
 ) -> TypedProgress {
     let mut best_partial = None;
     let mut last_readable;
     loop {
-        let after = read_value();
-        match typed_progress(before, after.as_deref(), text) {
+        match read_progress() {
             // A value already the requested length has nothing left to
             // arrive; both states are terminal.
             terminal @ (TypedProgress::Complete | TypedProgress::Normalized(_)) => return terminal,
@@ -1908,10 +2010,6 @@ fn type_text_blocking(
     });
     let destination_resolved = target.is_some();
 
-    // Original field value before any rung drives read-back verification only.
-    // An unreadable value is not evidence that the field is empty.
-    let before = read_axvalue_bound(pid, target, window_id);
-
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
         let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
@@ -1958,7 +2056,6 @@ fn type_text_blocking(
                 pid,
                 text,
                 delay_ms,
-                before.as_deref(),
                 destination,
                 foreground_settle_ms,
                 window_id,
@@ -2051,7 +2148,6 @@ fn type_text_blocking(
             pid,
             text,
             delay_ms,
-            before.as_deref(),
             target,
             /*settle_ms=*/ 0,
             window_id,
@@ -2084,6 +2180,9 @@ fn type_text_blocking(
     if let (Some((element, idx_opt)), Some(true)) = (ax_target, target_focused) {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+        // Read after focus, which selects a text field's whole value: that
+        // selection is what the write replaces.
+        let base = read_insertion_base(pid, Some((element as usize, idx_opt)), window_id);
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
         // Classify the write before considering synthesis. Complete AX
         // delivery returns immediately. Partial delivery is surfaced as such
@@ -2098,15 +2197,13 @@ fn type_text_blocking(
         let ax_progress = if err == kAXErrorSuccess {
             let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
             Some(await_typed_progress(
-                before.as_deref(),
-                text,
                 deadline,
                 || {
-                    read_typed_value(
+                    read_typed_progress(
                         pid,
                         Some((element as usize, idx_opt)),
                         window_id,
-                        before.as_deref(),
+                        &base,
                         text,
                         // This rung only runs on a target that took focus, so
                         // the field editor standing in for it is this field.
@@ -2211,7 +2308,6 @@ fn type_text_blocking(
         pid,
         text,
         delay_ms,
-        before.as_deref(),
         target,
         /*settle_ms=*/ 0,
         window_id,
@@ -2231,6 +2327,18 @@ fn type_text_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drain sampler measuring each value `read` hands out against `before`,
+    /// with no selection replaced.
+    fn reading(
+        before: Option<&str>,
+        text: &str,
+        mut read: impl FnMut() -> Option<String>,
+    ) -> impl FnMut() -> TypedProgress {
+        let base = InsertionBase::at(before);
+        let text = text.to_owned();
+        move || base.progress(read().as_deref(), &text, || None)
+    }
 
     // ── Caret placement ──────────────────────────────────────────────────
 
@@ -2624,13 +2732,12 @@ mod tests {
         ]);
         let mut reads = 0;
         let delivery = await_typed_delivery(
-            Some(""),
             text,
             std::time::Instant::now() + std::time::Duration::from_secs(1),
-            || {
+            reading(Some(""), text, || {
                 reads += 1;
                 values.pop_front().flatten()
-            },
+            }),
         );
         assert_eq!(
             delivery,
@@ -2646,10 +2753,9 @@ mod tests {
     #[test]
     fn drained_prefix_reports_the_delivered_character_count() {
         let delivery = await_typed_delivery(
-            Some(""),
             "BEGIN-payload-END",
             std::time::Instant::now(),
-            || Some("BEGIN".to_owned()),
+            reading(Some(""), "BEGIN-payload-END", || Some("BEGIN".to_owned())),
         );
         assert_eq!(
             delivery,
@@ -2717,9 +2823,11 @@ mod tests {
             typed_progress(Some(""), Some("Warehouse pallet audit"), text),
             TypedProgress::Normalized(text.chars().count())
         );
-        let delivery = await_typed_delivery(Some(""), text, std::time::Instant::now(), || {
-            Some("Warehouse pallet audit".to_owned())
-        });
+        let delivery = await_typed_delivery(
+            text,
+            std::time::Instant::now(),
+            reading(Some(""), text, || Some("Warehouse pallet audit".to_owned())),
+        );
         assert_eq!(
             delivery,
             TypedDelivery {
@@ -2941,10 +3049,8 @@ mod tests {
     fn a_write_the_field_never_took_stays_unchanged() {
         assert_eq!(
             await_typed_progress(
-                Some("old"),
-                "new value",
                 std::time::Instant::now(),
-                || Some("old".to_owned())
+                reading(Some("old"), "new value", || Some("old".to_owned()))
             ),
             TypedProgress::Unchanged
         );
@@ -2954,17 +3060,15 @@ mod tests {
     fn a_partial_the_field_discards_is_not_a_partial_delivery() {
         let mut reads = 0;
         let progress = await_typed_progress(
-            Some(""),
-            "10600 North Tantau Avenue",
             std::time::Instant::now() + std::time::Duration::from_millis(250),
-            || {
+            reading(Some(""), "10600 North Tantau Avenue", || {
                 reads += 1;
                 Some(if reads == 1 {
                     "10600 North Ta".to_owned()
                 } else {
                     String::new()
                 })
-            },
+            }),
         );
         assert_eq!(progress, TypedProgress::Unchanged);
         assert!(reads > 1, "the drain read the field {reads} time(s)");
@@ -2974,10 +3078,10 @@ mod tests {
     fn a_partial_the_settled_read_still_shows_is_reported() {
         assert_eq!(
             await_typed_progress(
-                Some(""),
-                "10600 North Tantau Avenue",
                 std::time::Instant::now() + std::time::Duration::from_millis(250),
-                || Some("10600 North Ta".to_owned())
+                reading(Some(""), "10600 North Tantau Avenue", || {
+                    Some("10600 North Ta".to_owned())
+                })
             ),
             TypedProgress::Partial(14)
         );
@@ -2987,13 +3091,11 @@ mod tests {
     fn an_unreadable_settled_read_falls_back_to_the_partial_observed() {
         let mut reads = 0;
         let progress = await_typed_progress(
-            Some(""),
-            "10600 North Tantau Avenue",
             std::time::Instant::now() + std::time::Duration::from_millis(250),
-            || {
+            reading(Some(""), "10600 North Tantau Avenue", || {
                 reads += 1;
                 (reads == 1).then(|| "10600 North Ta".to_owned())
-            },
+            }),
         );
         assert_eq!(progress, TypedProgress::Partial(14));
     }
@@ -3002,13 +3104,11 @@ mod tests {
     fn a_field_that_never_reads_is_unverifiable_without_draining() {
         let mut reads = 0;
         let progress = await_typed_progress(
-            Some(""),
-            "payload",
             std::time::Instant::now() + std::time::Duration::from_secs(5),
-            || {
+            reading(Some(""), "payload", || {
                 reads += 1;
                 None
-            },
+            }),
         );
         assert_eq!(progress, TypedProgress::Unverifiable);
         assert_eq!(reads, 1);
@@ -3019,33 +3119,26 @@ mod tests {
     /// a partial one. The focused element is where the keystrokes landed.
     #[test]
     fn a_replaced_field_is_read_through_the_focused_element() {
+        let text = "555-1234";
         assert_eq!(
-            stronger_reading(
-                Some(""),
-                "555-1234",
-                Some("555".to_owned()),
-                Some("555-1234".to_owned())
-            )
-            .as_deref(),
-            Some("555-1234")
+            stronger_progress(
+                typed_progress(Some(""), Some("555"), text),
+                typed_progress(Some(""), Some("555-1234"), text),
+            ),
+            TypedProgress::Complete
         );
     }
 
     #[test]
     fn an_unrelated_focused_element_never_downgrades_the_addressed_read() {
+        let addressed = typed_progress(Some(""), Some("hi"), "hi");
         assert_eq!(
-            stronger_reading(Some(""), "hi", Some("hi".to_owned()), None).as_deref(),
-            Some("hi")
+            stronger_progress(addressed, typed_progress(Some(""), None, "hi")),
+            TypedProgress::Complete
         );
         assert_eq!(
-            stronger_reading(
-                Some(""),
-                "hi",
-                Some("hi".to_owned()),
-                Some("somewhere else".to_owned())
-            )
-            .as_deref(),
-            Some("hi")
+            stronger_progress(addressed, typed_progress(Some(""), Some("somewhere else"), "hi")),
+            TypedProgress::Complete
         );
     }
 
@@ -3140,5 +3233,88 @@ mod tests {
         }
         assert!(screen_sharing_delivery_error(true, true, Some(7)).is_none());
         assert!(screen_sharing_delivery_error(false, false, None).is_none());
+    }
+
+    /// Font Book's search field held "PapyrusPapyrus" with its whole value
+    /// selected; "Papyrus" typed in the foreground replaced it and ran the
+    /// search, and the reply said "delivered 0 of 7" — the field had shrunk
+    /// (V3D fontbook omp-next-2 s12, omp-next-4 s13).
+    #[test]
+    fn typing_over_a_selection_is_measured_without_what_it_replaced() {
+        let base = InsertionBase::replacing(Some("PapyrusPapyrus".to_owned()), Some((0, 14)));
+        assert_eq!(
+            base.progress(Some("Papyrus"), "Papyrus", || None),
+            TypedProgress::Complete
+        );
+        // The field still reading exactly as before is nothing landed.
+        assert_eq!(
+            base.progress(Some("PapyrusPapyrus"), "Papyrus", || None),
+            TypedProgress::Unchanged
+        );
+        // Part of it arriving over the selection is counted from the selection.
+        assert_eq!(
+            base.progress(Some("Pap"), "Papyrus", || None),
+            TypedProgress::Partial(3)
+        );
+        // A selection inside the value keeps the text around it.
+        let middle = InsertionBase::replacing(Some("abc OLD def".to_owned()), Some((4, 3)));
+        assert_eq!(
+            middle.progress(Some("abc new def"), "new", || None),
+            TypedProgress::Complete
+        );
+    }
+
+    /// Font Book's field held "Zapfino" selected and took "Zapfino" typed over
+    /// it (V3D fontbook omp-next-3 s16): the value reads the same whether or
+    /// not anything landed, so only the caret collapsed past the insertion
+    /// proves delivery, and the untouched selection proves none.
+    #[test]
+    fn a_selection_that_held_the_request_is_judged_by_the_caret() {
+        let base = InsertionBase::replacing(Some("Zapfino".to_owned()), Some((0, 7)));
+        assert_eq!(
+            base.progress(Some("Zapfino"), "Zapfino", || Some((7, 0))),
+            TypedProgress::Complete
+        );
+        assert_eq!(
+            base.progress(Some("Zapfino"), "Zapfino", || Some((0, 7))),
+            TypedProgress::Unchanged
+        );
+        assert_eq!(
+            base.progress(Some("Zapfino"), "Zapfino", || None),
+            TypedProgress::Unverifiable
+        );
+        // The caret is only asked when the value cannot tell.
+        let mut asked = false;
+        let other = InsertionBase::replacing(Some("PapyrusPapyrus".to_owned()), Some((0, 14)));
+        other.progress(Some("Papyrus"), "Papyrus", || {
+            asked = true;
+            None
+        });
+        assert!(!asked, "a value that moved answered by itself");
+    }
+
+    /// `AXSelectedTextRange` counts UTF-16 units; a selection that is empty,
+    /// out of range or splits a surrogate pair replaces nothing measurable,
+    /// and the whole prior value stays the measure.
+    #[test]
+    fn only_a_selection_inside_the_value_replaces_anything() {
+        let value = || Some("\u{1F600}AB".to_owned());
+        // After the emoji: two units in.
+        let base = InsertionBase::replacing(value(), Some((2, 2)));
+        assert_eq!(
+            base.progress(Some("\u{1F600}x"), "x", || None),
+            TypedProgress::Complete
+        );
+        for selection in [Some((0, 0)), Some((3, 2)), Some((1, 1)), Some((-1, 2)), None] {
+            assert_eq!(
+                InsertionBase::replacing(value(), selection),
+                InsertionBase::at(value().as_deref()),
+                "{selection:?}"
+            );
+        }
+        assert_eq!(
+            InsertionBase::replacing(None, Some((0, 3))),
+            InsertionBase::at(None)
+        );
     }
 }

@@ -1356,7 +1356,7 @@ fn retype_blocking(
             pid,
             value,
             0,
-            Some(""),
+            &super::type_text::InsertionBase::at(Some("")),
             Some((element_ptr, Some(element_index))),
             Some(window_id),
         )?
