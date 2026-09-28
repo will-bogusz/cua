@@ -42,13 +42,13 @@ Rules for this stack:
 | P16 | `fix(macos): thread-scoped AX walk budget with deadline-aware bindings` | Upstream bounds each native AX request with a per-element messaging timeout, so a wedged app can extend an observation element by element. One thread-scoped deadline across the walk, deadline-aware binding wrappers, partial-state reporting (`ax_walk_timed_out`, `stop_reason`), and a refusal instead of substituting another window's controls. | #1537, draft PR #1755 (wall-clock guard this supersedes) | yes — unfiled |
 | P10 | `feat(macos): read AXDocument/AXEdited for the requested window` | macOS half of P4: `AXDocument` and `AXEdited` (window, then close button). | none found | #3795 (with P4) |
 | P11 | `fix(macos): prove sheet and menu-bar ancestry in exact_target` | macOS half of P5: proves `ProvenAppMenu` / `ProvenAttachedSheet` ancestry and names the owning window in refusals. | #3351 / #3353 | #3793 (with P5) |
-| P12 | `fix(macos): resolve menu activation from WindowServer, not cached NSWorkspace state` | `invoke_menu` polls `NSWorkspace.frontmostApplication`, an AppKit cached value that never refreshes on the blocking menu path; upstream still reads it. Kept alongside upstream's main-queue affinity for the embedded self-pid case (`2dbc1c2c`). | none found | #3781 |
-| P13 | `fix(macos): poll for the Chromium AX tree instead of a fixed 0.5 s sleep` | After `AXManualAccessibility` upstream sleeps 500 ms, too short on a loaded machine and wasted otherwise. Side effect to disclose: VS Code shows its screen-reader toast on first assertion. | #1756 | #3783 (APPROVED) |
-| P14 | `fix(macos): verify bring_to_front against the process it activated` | Upstream verifies by global z-order and false-negatives when another process owns the topmost window; refines the merged overlay exclusion (`44c9d1f6`, #3704 / #2829). | #2829, #3704 | #3785 (APPROVED) |
+| P12 | `fix(macos): resolve menu activation from WindowServer, not cached NSWorkspace state` | `invoke_menu` polls `NSWorkspace.frontmostApplication`, an AppKit cached value that never refreshes on the blocking menu path; upstream still reads it. Kept alongside upstream's main-queue affinity for the embedded self-pid case (`2dbc1c2c`). | none found | #3781 (merged 09-28) |
+| P13 | `fix(macos): poll for the Chromium AX tree instead of a fixed 0.5 s sleep` | After `AXManualAccessibility` upstream sleeps 500 ms, too short on a loaded machine and wasted otherwise. Side effect to disclose: VS Code shows its screen-reader toast on first assertion. | #1756 | #3783 (merged 09-28) |
+| P14 | `fix(macos): verify bring_to_front against the process it activated` | Upstream verifies by global z-order and false-negatives when another process owns the topmost window; refines the merged overlay exclusion (`44c9d1f6`, #3704 / #2829). | #2829, #3704 | #3785 (merged 09-28) |
 | P15 | `feat(macos): probe delivery of background clicks` | A background click on a window that ignores synthetic input reported success because the events were posted; pre/post AX probe classifies delivery and escalates a no-op. | #3389 is the `type_text` sibling of the same class; PR #3373 overlaps the evidence rule (see P6) | conditional on #3373 — unfiled |
 | L1 | `feat(linux): report background_input routes on get_window_state` | Linux refuses background routes with the right predicates but never publishes the core `background_input` routes object the agent needs to choose a route up front. | none found | #3791 |
 | L2 | `fix(linux): return a structured foreground_unavailable code on X11 foreground failure` | The X11 foreground path builds `anyhow!("foreground_unavailable: ...")`, which surfaces as untyped error text; the Hyprland path already emits the typed `{code, detail}` envelope. | none found | yes — unfiled |
-| L3 | `fix(linux): set screenshot_frame_valid on successful get_window_state` | Linux only ever reported `screenshot_frame_valid: false` on the refusal path and never `true` for a delivered per-window frame, which is by construction identity-validated on that path; macOS reports `true`. | none found | #3789 |
+| L3 | `fix(linux): set screenshot_frame_valid on successful get_window_state` | Linux only ever reported `screenshot_frame_valid: false` on the refusal path and never `true` for a delivered per-window frame, which is by construction identity-validated on that path; macOS reports `true`. | none found | #3789 -> #3814 (merged 09-28) |
 
 Dropped from the pre-0.28 fork or from the original plan:
 
@@ -121,7 +121,7 @@ budget also raises, where nothing having happened is the common case.
 | B10 | `fix(macos): settle the AX write's read-back before calling it partial` (7a520407d) | A field that publishes `AXValue` after the write read back short once and was reported `type_text_incomplete`. | #3842 (hold: #3897) |
 | B11 | `fix(macos): watch a dispatched action long enough to see it land` (8a01c1079) | The post-dispatch probe's settle window closed before AppKit had rendered the effect. | unfiled; with the delivery-probe PR (#3373-conditional) |
 | B12 | `fix(testkit): report why the driver child stopped answering` (95ee4cf1e) | A daemon/driver version mismatch surfaced as "missing window" (#3843). | #3844 |
-| B13 | `fix(macos): keep a foreground key chord's modifiers on its base key` (cb2533ac7) | Foreground chords arrived with no modifier flags on the base key (#3849). | #3855 |
+| B13 | `fix(macos): keep a foreground key chord's modifiers on its base key` (cb2533ac7) | Foreground chords arrived with no modifier flags on the base key (#3849). | #3855 (merged 09-28) |
 | B14 | `fix(macos): a click on a text role focuses it instead of pressing it` (a100d2c80) + `keep the no-op wording off a click that focused a text control` (3a2a160e6) | Plain click on a text field dispatched an unadvertised `AXPress` (#3850); the focusing click then read "no-op". | #3856 (fold 3a2a160e6) |
 | B15 | `fix(contract): report a value write's commit as a verdict, not a boolean` (c114d3cec) | A bound control echoes the read-back, so `committed: true/false` cannot be honest (#3851). | #3857 → fold into #3858; needs the contract RFC |
 | B16 | `fix(macos): write a bound text field by typing, and judge the commit honestly` (58f557bd3) + `only a typed edit session ending is a commit, and keep a save panel reachable` (aaa61d980) | `set_value` on a native single-line field never reached the binding (#3852); a save panel became unreachable after the typed route. | #3858 (fold aaa61d980) |
@@ -135,7 +135,7 @@ budget also raises, where nothing having happened is the common case.
 | B24 | `feat(macos): give a drag the same delivery evidence a click carries` (f3a4e3959) | Drags reported posted, never probed. | unfiled; delivery-probe PR |
 | B25 | `fix(macos): read an application's own actions out of the envelope macOS ships them in` (4af44c0ac) + `dispatch a custom action by the name the element advertises` (e84bdf625) | macOS's three-line action envelope broke `tree_markdown` (#3919); named custom actions were not invocable. | #3947 |
 | B26 | `fix(macos): refuse a click action the element does not advertise` (da38cc568) + `…on every dispatch path` (bd4251f94) | An unrecognised action name dispatched as `AXPress` (#3920). | #3922 |
-| B27 | `feat(macos): let a caller that enumerates windows itself decline the post-action window poll` (63dbd1af7) (+ fixture 932f52297) | ~1 s unconditional post-action poll, 64–93% of in-driver time, opt-out unreachable (#3924). | #3946 |
+| B27 | `feat(macos): let a caller that enumerates windows itself decline the post-action window poll` (63dbd1af7) (+ fixture 932f52297) | ~1 s unconditional post-action poll, 64–93% of in-driver time, opt-out unreachable (#3924). | #3946 (merged 09-28) |
 | B28 | `perf(macos): do not re-activate a drag target that is already frontmost` (259895a41) | Redundant activation per drag. | #3925 |
 | B29 | `feat(macos): list a menu submenu's items instead of pressing the path's final segment` (17fabf889) + `let a menu submenu listing answer without an ActionResult` (a8d6357d5) | `invoke_menu` pressed a submenu-bearing segment and discarded the labels it enumerated (#3944). | #3945 |
 | B30 | `perf(macos): cap the probe settle when there is no element state to compare` (096cbdd0b) + `stop claiming signals the probe never watched` (b4bf36937) | Probe waited its full budget with nothing to compare; replies claimed unwatched signals. | unfiled; delivery-probe PR |
@@ -233,13 +233,13 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 | P16 | - |
 | P10 | as P4 |
 | P11 | as P5 |
-| P12 | #3781: re-review at b26880250; seam, z-order removal and native proof answered 09-13 |
-| P13 | #3783 approved at a0dc87e15 (09-13T15:27); merge pending; nothing owed |
-| P14 | #3785 approved at 42052d0e9 (09-13T15:00); head 215d7bd1a (09-25, approval kept). Body re-labelled 09-25 for #4094: harness table supporting, canonical Lume run a known gap, mutation checks named. Merge pending. W5-16 follows after merge. The fork carries #3785's approved cell rewrite since cfbadaf1a (`…ignores_competing_application_window`); a8636718a's per-display scoping is PR-branch only |
+| P12 | - (#3781 merged 2026-09-28 by f-trycua at `8ec1de476` after his rebase to `e42c5e698`; shipped in cua-driver-rs 0.30.3. Drop the fork commit at the next sync) |
+| P13 | - (#3783 merged 2026-09-28 by f-trycua at `1e93424e5`, head `ecf8abc77`; shipped in 0.30.3. Drop at the next sync) |
+| P14 | - (#3785 merged 2026-09-28 by f-trycua at `0a91a1186` after re-approval at his rebase `8ed3f74f0`; in the pending 0.30.4 release (#4302). W5-16 is now unblocked. Drop the fork commit and cfbadaf1a's cell rewrite at the next sync) |
 | P15 | as P6 |
 | L1 | #3791 closed 2026-09-25 with Will's approved comment: #3882 rewrote the Linux background ladder (MPX/uinput keyboard, PointerRoute, isolated Hyprland), so the shared-ladder report no longer matches the tools. Re-express later as a report derived from the current routes if wanted |
 | L2 | - |
-| L3 | #3814 cut 09-25 to the frame-valid write (e10b5827b, retitled `fix(cua-driver): mark a delivered Linux window screenshot's frame valid`); the element cap and elements_complete half is carried by #3882. Parked draft; canonical Linux run pending; RFC 3931 calls the field non-portable |
+| L3 | - (#3814 merged 2026-09-28 by f-trycua at `9fe9520ef` after his rebase to `ca2ab5ef0`; shipped in 0.30.3. The element cap and elements_complete half stays with #3882) |
 
 ### Bench fixes B1-B9
 
@@ -247,10 +247,10 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 |---|---|
 | B1 | - (#3816 and #3857 closed 09-20 into #3858. #3858 rebased 09-25 at 86f20bf7d: harness cell selected by run-rust-e2e.sh, contract regenerated. Parked as draft until RFC #4009 records a decision) |
 | B2 | - |
-| B3 | - (folded into #3946; re-cut on #3929 and pushed 09-25 at 747ff16ec; #3806 closed) |
+| B3 | - (folded into #3946, merged 2026-09-28; see B27) |
 | B4 | #3811 (injaneity 09-16): hold acknowledged 09-20; rebased 09-25 at 70d4706f1 and retitled; #3842/#3921 closed "for now"; parked as draft until #3897 lands or closes |
 | B5 | withdrawn in wave B (ef1930d95, see "Wave B review"): B5's `AXShowMenu` pixel fallback dropped from #3922 at 5b7e84f7e (pushed 09-25; #3810/#3856 closed) |
-| B6 | - (folded into #3787, pushed 09-20 at 87d032b9f; #3813 closed; `description` still blocked by the manifest generator, #3802) |
+| B6 | - (folded into #3787, pushed 09-20 at 87d032b9f; #3813 closed. The `description` blocker #3802 was fixed upstream by #3827 (LikelyLucid, `1052ad8fe`, 0.30.3), so #3787 can carry `description` at its next rebase) |
 | B7 | - (folded into #3787, pushed 09-20 at 87d032b9f; #3817 closed) |
 | B8 | - (#3864 conflict: test nodes need identity: None) |
 | B9 | #3836 (injaneity 09-15): re-review at c2e6298df, rebased dea964ccb; P2 fallback fix answered 07:03 |
@@ -262,7 +262,7 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 | B10 | hold: #3897 returns TypedProgress; re-express with #3811 |
 | B11 | as P6 |
 | B12 | - (retitled; kvnloo's four #3843 assertions pushed 09-25 at e69cbe8ba and answered; draft) |
-| B13 | - (#3855 at de1a640c4 with supporting exact-head evidence: chord cell 4/4, fails on main's driver; body re-labelled 09-25 for #4094; draft until the contribution-process answer) |
+| B13 | - (#3855 merged 2026-09-28 by f-trycua at `f71044a94` after his rebase to `6ea50bb22`; in the pending 0.30.4 release (#4302). Drop at the next sync) |
 | B14 | - (folds into #3922, at 5b7e84f7e with supporting exact-head evidence; body re-labelled 09-25 for #4094; draft) |
 | B15 | CONTRIBUTING: public ActionResult change needs the RFC first; closing #3857 into #3858 |
 | B16 | RFC before the committed verdict lands; the macOS typed write path can go first |
@@ -276,9 +276,9 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 | B24 | as P6 |
 | B25 | - (folds into #3950, rebased 09-25 at f022d673f) |
 | B26 | - |
-| B27 | #3946 re-cut on upstream #3929 (1435052d6) and pushed 09-25 at 747ff16ec, retitled `fix(cua-driver): let SDK hosts bound the post-action window poll`: SDK allowlist for #3929's variables + `Changes::not_polled()` (both sides pinned) + scroll clamp; no public input (the #3971 agreement), kvnloo answered. The fork's public `detect_window_change` is superseded by #3929's env bound at the next sync; body re-labelled 09-25 for #4094 (harness table supporting, canonical Lume gap, mutation checks named) |
+| B27 | - (#3946 merged 2026-09-28 by f-trycua at `990a2d1f1` after his rebase to `dc9f5a512`; shipped in 0.30.3. The fork's public `detect_window_change` is superseded by #3929's env bound at the next sync) |
 | B28 | - (superseded upstream by 681bc4480; dropped from #3946) |
-| B29 | - (stacked on #3781) |
+| B29 | - (was stacked on #3781, merged 2026-09-28: free to file when a slot opens) |
 | B30 | as P6 |
 | B31 | - |
 
@@ -301,7 +301,7 @@ What each row still owes a maintainer, or `-` when nothing is pending, so a new 
 | W5-13 | RFC for element_disabled and escalation; mirror #3888's Windows shape |
 | W5-14 | with #3858 (RFC-gated) |
 | W5-15 | - (chord PR; no longer waits on T11, whose route was removed in wave B) |
-| W5-16 | after #3785 merges (approved 09-13) |
+| W5-16 | - (#3785 merged 2026-09-28; free to file on top of it when a slot opens) |
 | W5-17 | - (chord PR; stays the mechanism: the T11 menu-command route meant to replace it was removed in wave B, 6f8eafbd9) |
 | W5-18 | - (chord PR) |
 | W5-19 | RFC: element_no_longer_exists and escalation.target are vocabulary |
