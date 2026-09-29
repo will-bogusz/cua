@@ -62,6 +62,12 @@ const ALIAS_MIN_PT: u32 = 3;
 /// A competing shift whose residual is within this factor of the best one's
 /// (plus 5% of the difference) makes a registration ambiguous.
 const ALIAS_NOISE: f32 = 1.3;
+/// Below this share of the band left in common, a first-vs-last comparison
+/// is not trusted and clean tracked travel stands instead.
+const NET_RELIABLE_OVERLAP: f64 = 0.35;
+/// Each frame-to-frame step of a clean tracked series explains at least this
+/// share of its pair's difference.
+const CLEAN_STEP_CONFIDENCE: f64 = 0.6;
 
 /// One captured window frame: 8-bit gray, row-major, one pixel per point.
 #[derive(Clone, PartialEq, Eq)]
@@ -642,9 +648,15 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     if bounced && !motion.baseline_moving {
         return verdict(OutcomeKind::AtEnd, travel, step_confidence, true);
     }
-    if travel != 0 && travel.abs() + NET_WINDOW_PT > overlap && !motion.baseline_moving {
-        // Tracked but not registered first-vs-last because the move outran
-        // the overlap a single comparison needs.
+    // Tracked but not registered first-vs-last: accept the travel when the
+    // frame-to-frame steps are clean (one direction, each a confident rigid
+    // shift, nothing moving beforehand) and the first and last frames share
+    // too little of the band for one comparison to be reliable.
+    let band = overlap + MIN_OVERLAP_ROWS;
+    let clean_steps = !steps.is_empty()
+        && steps.iter().all(|s| s.shift.signum() == travel.signum() && s.confidence >= CLEAN_STEP_CONFIDENCE);
+    let little_overlap = f64::from(band - travel.abs()) < NET_RELIABLE_OVERLAP * f64::from(band);
+    if travel != 0 && clean_steps && little_overlap && !motion.baseline_moving {
         return verdict(OutcomeKind::Moved, travel, step_confidence, true);
     }
     if diff >= NO_MOTION_DIFF || travel != 0 {
@@ -1052,6 +1064,19 @@ mod tests {
         // A move that ran on and bounced back part of the way.
         let verdict = down(&[0, 60, 120, 140, 125, 120]);
         assert_eq!((verdict.kind, verdict.along), (OutcomeKind::AtEnd, 120));
+    }
+
+    /// Live on TextEdit: a page (0.8 of the visible area) left too little in
+    /// common between first and last frame to register, and the clean
+    /// tracked travel was refused, so every page read "changed in place".
+    #[test]
+    fn a_page_sized_move_stands_on_its_clean_tracked_travel() {
+        for total in [320i64, 340] {
+            let offsets: Vec<i64> = (0..=10).map(|i| i * total / 10).collect();
+            let verdict = down(&offsets);
+            assert_eq!((verdict.kind, verdict.along), (OutcomeKind::Moved, total as i32));
+            assert!(verdict.ambiguous, "tracked-only distances never calibrate");
+        }
     }
 
     #[test]
