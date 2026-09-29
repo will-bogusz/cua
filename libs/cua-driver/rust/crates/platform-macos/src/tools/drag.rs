@@ -49,6 +49,17 @@ fn drag_noop_report(polled: bool) -> delivery_probe::NoopReport<'static> {
     }
 }
 
+/// How the gesture reached the app, as the reply states it. A window drag is
+/// always foreground (background delivery is refused) and runs on the global
+/// HID stream; only a window-less drag is posted to the pid.
+fn transport_phrase(foreground_window: bool) -> &'static str {
+    if foreground_window {
+        "foreground HID gesture"
+    } else {
+        "pid-posted CGEvent"
+    }
+}
+
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 fn def() -> &'static ToolDef {
@@ -472,7 +483,7 @@ impl Tool for DragTool {
                      from window-pixel ({}, {}) → ({}, {}), \
                      screen ({}, {}) → ({}, {}) \
                      in {duration_ms}ms / {steps} steps{mode_label} \
-                     (background CGEvent; not driver-verified — confirm via screenshot).{}",
+                     ({}; not driver-verified — confirm via screenshot).{}",
                     from_x as i64,
                     from_y as i64,
                     to_x as i64,
@@ -481,6 +492,7 @@ impl Tool for DragTool {
                     from_sy as i64,
                     to_sx as i64,
                     to_sy as i64,
+                    transport_phrase(fg),
                     changes.result_suffix(),
                 );
                 let mut structured = serde_json::json!({
@@ -512,6 +524,12 @@ mod tests {
         assert!(!activation_needed(Some(758), 758));
         assert!(activation_needed(Some(12), 758));
         assert!(activation_needed(None, 758));
+    }
+
+    #[test]
+    fn a_foreground_drag_is_never_described_as_background_delivery() {
+        assert_eq!(transport_phrase(true), "foreground HID gesture");
+        assert!(!transport_phrase(false).contains("background"));
     }
 
     /// A drag addresses pixels, never an element, so the probe watches

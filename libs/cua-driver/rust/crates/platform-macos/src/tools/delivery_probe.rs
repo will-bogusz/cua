@@ -293,6 +293,9 @@ pub struct DeliveryProbe {
     /// The window's subtree digest was identical across two pre-dispatch
     /// samples, so a post-dispatch difference is attributable to the action.
     quiescent: bool,
+    /// The window has no accessibility content, so its subtree is never
+    /// sampled (see [`window_has_no_ax_content`]).
+    tree_skipped: bool,
     elapsed: Duration,
 }
 
@@ -311,8 +314,15 @@ impl DeliveryProbe {
             .map_or(ElementRead::Unreadable, element_state);
         let focus = focus_state(pid);
         let menus = menu_state(pid);
-        let first = tree_digest(pid, window_id);
-        let second = tree_digest(pid, window_id);
+        // A window whose accessibility tree has no content (a pixel-only
+        // surface such as a mirrored phone screen) digests to noise: its
+        // subtree is not evidence either way, so it is not sampled.
+        let tree_skipped = window_has_no_ax_content(pid, window_id);
+        let (first, second) = if tree_skipped {
+            (None, None)
+        } else {
+            (tree_digest(pid, window_id), tree_digest(pid, window_id))
+        };
         let quiescent = matches!((first, second), (Some(a), Some(b)) if a == b);
         Self {
             pid,
@@ -325,6 +335,7 @@ impl DeliveryProbe {
                 menus,
             },
             quiescent,
+            tree_skipped,
             elapsed: start.elapsed(),
         }
     }
@@ -341,7 +352,9 @@ impl DeliveryProbe {
         let start = Instant::now();
         let mut probe = Self::capture(pid, window_id, None);
         for _ in 0..ACTIVATION_SETTLE_ATTEMPTS {
-            if probe.quiescent || cua_driver_core::operation::sleep(ACTIVATION_SETTLE_GAP).is_err()
+            if probe.quiescent
+                || probe.tree_skipped
+                || cua_driver_core::operation::sleep(ACTIVATION_SETTLE_GAP).is_err()
             {
                 break;
             }
@@ -652,6 +665,56 @@ fn tree_digest(pid: i32, window_id: u32) -> Option<u64> {
     Some(std::hash::Hasher::finish(&hash))
 }
 
+/// Whether `window_id`'s accessibility tree carries no content: the window
+/// has no children, or its only child is a group with no children. `false`
+/// when the window or its children cannot be read.
+fn window_has_no_ax_content(pid: i32, window_id: u32) -> bool {
+    use crate::ax::bindings::{
+        ax_get_window_id, copy_ax_windows, copy_children_checked, AXUIElementCreateApplication,
+        AXUIElementSetMessagingTimeout,
+    };
+    use core_foundation::base::{CFRelease, CFTypeRef};
+
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.25);
+        let mut window = None;
+        for candidate in copy_ax_windows(app) {
+            if window.is_none() && ax_get_window_id(candidate) == Some(window_id) {
+                window = Some(candidate);
+            } else {
+                CFRelease(candidate as CFTypeRef);
+            }
+        }
+        CFRelease(app as CFTypeRef);
+        let Some(window) = window else {
+            return false;
+        };
+        let (children, hidden) = copy_children_checked(window);
+        let shapes: Vec<(Option<String>, Option<usize>)> = children
+            .iter()
+            .map(|&child| (copy_string_attr(child, "AXRole"), children_count(child)))
+            .collect();
+        for child in children {
+            CFRelease(child as CFTypeRef);
+        }
+        CFRelease(window as CFTypeRef);
+        !hidden && tree_is_contentless(&shapes)
+    }
+}
+
+/// The content-less shapes, over each child's `(role, child count)`.
+fn tree_is_contentless(children: &[(Option<String>, Option<usize>)]) -> bool {
+    match children {
+        [] => true,
+        [(Some(role), Some(0))] => role == "AXGroup",
+        _ => false,
+    }
+}
+
 /// The accessory windows `pid` currently shows. An open `NSMenu` is one of
 /// them; so is a popover's own backing window once it is on screen above the
 /// application's normal layer. Read from WindowServer rather than AX because
@@ -803,8 +866,23 @@ mod tests {
             element: None,
             before: Signals::default(),
             quiescent: false,
+            tree_skipped: false,
             elapsed: Duration::ZERO,
         }
+    }
+
+    /// A mirrored phone screen publishes one empty group and nothing else;
+    /// its digest changes with nothing the caller did, so "Delivered:
+    /// window_tree changed" there was noise. Any real control keeps it.
+    #[test]
+    fn only_an_empty_window_or_one_empty_group_is_contentless() {
+        let group = |children| (Some("AXGroup".to_owned()), children);
+        assert!(tree_is_contentless(&[]));
+        assert!(tree_is_contentless(&[group(Some(0))]));
+        assert!(!tree_is_contentless(&[group(Some(3))]));
+        assert!(!tree_is_contentless(&[group(None)]), "unreadable children prove nothing");
+        assert!(!tree_is_contentless(&[group(Some(0)), group(Some(0))]));
+        assert!(!tree_is_contentless(&[(Some("AXButton".to_owned()), Some(0))]));
     }
 
     #[test]
