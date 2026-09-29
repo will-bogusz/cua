@@ -178,6 +178,11 @@ pub fn with_raised_pointer<T>(
     if prior_app != Some(pid) {
         set_app_frontmost(pid);
     }
+    // Activation raises the app, not necessarily this window over its own
+    // siblings. Ask for the exact window too; any error is ignored (iPhone
+    // Mirroring answers -25205 and still comes forward) — the hit test below
+    // decides.
+    let _ = crate::ax::bindings::raise_exact_ax_window(pid, window_id);
     let bounds = loop {
         let enumeration = crate::windows::visible_windows_with_space_snapshot();
         let top = topmost_window_at(&enumeration.windows, &enumeration.alphas, x, y, own_pid);

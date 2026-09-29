@@ -68,6 +68,9 @@ const NET_RELIABLE_OVERLAP: f64 = 0.35;
 /// Each frame-to-frame step of a clean tracked series explains at least this
 /// share of its pair's difference.
 const CLEAN_STEP_CONFIDENCE: f64 = 0.6;
+/// A net registration further than this from a clean tracked travel yields
+/// to the travel.
+const TRACKED_AGREEMENT_PT: i32 = 5;
 
 /// One captured window frame: 8-bit gray, row-major, one pixel per point.
 #[derive(Clone, PartialEq, Eq)]
@@ -663,6 +666,12 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     if diff < NO_MOTION_DIFF && motion.series.is_empty() {
         return verdict(OutcomeKind::NoMotion, 0, None, false, true);
     }
+    // A clean tracked series: every changed pair a confident rigid shift the
+    // same way, and nothing moving before the first event.
+    let clean_steps = !steps.is_empty()
+        && !motion.baseline_moving
+        && motion.non_rigid_pairs == 0
+        && steps.iter().all(|s| s.shift.signum() == travel.signum() && s.confidence >= CLEAN_STEP_CONFIDENCE);
     // Content that was already moving must agree with the tracked travel
     // before its shift is credited to the scroll.
     let attributable = !motion.baseline_moving || (net.shift - travel).abs() <= 8;
@@ -672,6 +681,12 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
         } else {
             OutcomeKind::Moved
         };
+        // Over repeated rows the first-vs-last search can settle on an alias
+        // a few line pitches from the travel every frame pair registered;
+        // a clean tracked series is the better witness then.
+        if clean_steps && !bounced && (net.shift - travel).abs() > TRACKED_AGREEMENT_PT {
+            return verdict(kind, travel, step_confidence, false, true);
+        }
         return verdict(
             kind,
             net.shift,
@@ -683,16 +698,12 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     if bounced && !motion.baseline_moving {
         return verdict(OutcomeKind::AtEnd, travel, step_confidence, false, true);
     }
-    // Tracked but not registered first-vs-last: accept the travel when the
-    // frame-to-frame series is clean (every changed pair a confident rigid
-    // shift the same way, nothing moving beforehand) and the first and last
-    // frames share too little of the band for one comparison to be reliable.
+    // Tracked but not registered first-vs-last: accept a clean tracked
+    // travel when the first and last frames share too little of the band for
+    // one comparison to be reliable.
     let band = overlap + MIN_OVERLAP_ROWS;
-    let clean_steps = !steps.is_empty()
-        && motion.non_rigid_pairs == 0
-        && steps.iter().all(|s| s.shift.signum() == travel.signum() && s.confidence >= CLEAN_STEP_CONFIDENCE);
     let little_overlap = f64::from(band - travel.abs()) < NET_RELIABLE_OVERLAP * f64::from(band);
-    if travel != 0 && clean_steps && little_overlap && !motion.baseline_moving {
+    if travel != 0 && clean_steps && little_overlap {
         return verdict(OutcomeKind::Moved, travel, step_confidence, false, true);
     }
     if diff >= NO_MOTION_DIFF || travel != 0 {
@@ -1434,6 +1445,46 @@ mod tests {
         let verdict = classify(&tracker.call_motion(), ScrollDirection::Down);
         assert_eq!((verdict.kind, verdict.along), (OutcomeKind::Moved, 90));
         assert!(verdict.uncalibrated);
+    }
+
+    /// Live on TextEdit (13 pt numbered lines): every chunk registered 534 pt,
+    /// but the whole-call search within ±40 pt of that travel settled on an
+    /// alias three line pitches short and the reply said 495.
+    #[test]
+    fn a_net_alias_three_pitches_off_yields_to_the_clean_tracked_travel() {
+        let step = |shift| Step {
+            axis: Axis::Vertical,
+            shift,
+            confidence: 0.97,
+        };
+        let motion = Motion {
+            travel_v: 534,
+            travel_h: 0,
+            series: vec![step(200), step(200), step(134)],
+            net_v: Registration {
+                shift: 495,
+                residual: 0.5,
+                diff: 20.0,
+                ambiguous: false,
+            },
+            net_h: Registration::still(20.0),
+            reshaped: false,
+            non_rigid_pairs: 0,
+            baseline_moving: false,
+            overlap_v: 632,
+            overlap_h: 600,
+        };
+        let verdict = classify(&motion, ScrollDirection::Down);
+        assert_eq!((verdict.kind, verdict.along), (OutcomeKind::Moved, 534));
+        assert!(verdict.uncalibrated);
+
+        // One pair that did not register rigidly withdraws the tracked
+        // travel's standing; the net registration stands.
+        let dirty = Motion {
+            non_rigid_pairs: 1,
+            ..motion
+        };
+        assert_eq!(classify(&dirty, ScrollDirection::Down).along, 495);
     }
 
     /// Audit: a clean move followed by one navigation frame (unrelated
