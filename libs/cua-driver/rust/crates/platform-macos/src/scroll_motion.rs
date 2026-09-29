@@ -10,9 +10,12 @@
 //! Registration is generic — no hand-set content band. Rows that never change
 //! across a frame pair (fixed chrome: title bars, tab bars, a status line) drop
 //! out on their own; rows that change without matching any shift (a progress
-//! bar, a clock) stay in the comparison as unexplained residual. The search
-//! runs on per-row block descriptors so a ±300 pt search stays cheap, then the
-//! chosen shift is refined on full pixels. Tracking frame to frame keeps a list
+//! bar, a clock) stay in the comparison as unexplained residual. Across the
+//! shift, the comparison is confined to the strip of columns that changed
+//! under the pointer, so a carousel row or side list that moves alone is not
+//! outvoted by the static content beside it. The search runs on per-row
+//! block descriptors so a ±300 pt search stays cheap, then the chosen shift
+//! is refined on full pixels. Tracking frame to frame keeps a list
 //! with a constant row pitch from aliasing: the final first-vs-last shift is
 //! searched only within [`NET_WINDOW_PT`] of the tracked travel.
 //!
@@ -74,6 +77,11 @@ const TRACKED_AGREEMENT_PT: i32 = 5;
 /// The residual at the tracked travel counts as competitive with the net's
 /// best within this factor.
 const TRAVEL_RESIDUAL_FACTOR: f32 = 1.3;
+/// A column counts toward the strip under the pointer when its change
+/// stands this many times above the frame pair's noise floor.
+const STRIP_NOISE: f32 = 3.0;
+/// Unchanged columns the strip under the pointer bridges.
+const STRIP_GAP: usize = 24;
 
 /// One captured window frame: 8-bit gray, row-major, one pixel per point.
 #[derive(Clone, PartialEq, Eq)]
@@ -115,35 +123,51 @@ impl GrayFrame {
 }
 
 /// The part of the frame registration reads: the scroll area when
-/// accessibility exposes one, else the window inside small margins.
+/// accessibility exposes one, else the window inside small margins, and the
+/// scroll's pointer in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
     pub x0: usize,
     pub x1: usize,
     pub y0: usize,
     pub y1: usize,
+    /// Where the wheel events land, `(x, y)` in frame points: registration
+    /// reads the strip of change under it (see [`strip_under_pointer`]).
+    pub pointer: (usize, usize),
 }
 
 impl Region {
     /// `rect` (frame points, `[x, y, w, h]`) clamped into a `width`×`height`
     /// frame. Falls back to the whole frame minus 8 pt side margins when
-    /// `rect` is absent or leaves too little to register.
-    pub fn within(width: usize, height: usize, rect: Option<[f64; 4]>) -> Region {
+    /// `rect` is absent or leaves too little to register. `pointer` (frame
+    /// points) is clamped into the frame.
+    pub fn within(
+        width: usize,
+        height: usize,
+        rect: Option<[f64; 4]>,
+        pointer: (f64, f64),
+    ) -> Region {
+        let clamp = |v: f64, max: usize| v.round().clamp(0.0, max as f64) as usize;
+        let pointer = (
+            clamp(pointer.0, width.saturating_sub(1)),
+            clamp(pointer.1, height.saturating_sub(1)),
+        );
         let fallback = Region {
             x0: 8.min(width),
             x1: width.saturating_sub(8).max(8.min(width)),
             y0: 0,
             y1: height,
+            pointer,
         };
         let Some([x, y, w, h]) = rect else {
             return fallback;
         };
-        let clamp = |v: f64, max: usize| v.round().clamp(0.0, max as f64) as usize;
         let region = Region {
             x0: clamp(x, width),
             x1: clamp(x + w, width),
             y0: clamp(y, height),
             y1: clamp(y + h, height),
+            pointer,
         };
         if region.x1 < region.x0 + BLOCKS || region.y1 < region.y0 + MIN_OVERLAP_ROWS as usize {
             fallback
@@ -162,6 +186,7 @@ impl Region {
             x1: self.y1,
             y0: self.x0,
             y1: self.x1,
+            pointer: (self.pointer.1, self.pointer.0),
         }
     }
 }
@@ -169,8 +194,10 @@ impl Region {
 /// The best rigid shift between two frames, with how well it explains them.
 ///
 /// Both numbers are mean absolute gray levels normalized over every row of
-/// the region, so `diff` is comparable across windows of any height and
-/// `residual / diff` is the share of the change the shift leaves unexplained.
+/// the region, so `diff` is comparable across windows of any height.
+/// `residual / diff` is the share of the change the shift leaves
+/// unexplained, measured on the strip under the pointer when the change
+/// is confined to one ([`strip_under_pointer`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Registration {
     pub shift: i32,
@@ -232,6 +259,82 @@ fn descriptor_distance(a: &[f32; BLOCKS], b: &[f32; BLOCKS]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>() / BLOCKS as f32
 }
 
+/// Each row's difference in place, and the region's change: the changed
+/// rows' differences normalized over every row.
+fn row_changes(earlier: &GrayFrame, later: &GrayFrame, region: &Region) -> (Vec<f32>, f32) {
+    let still_diffs: Vec<f32> = (region.y0..region.y1)
+        .map(|y| row_diff(earlier, y, later, y, region))
+        .collect();
+    let diff =
+        still_diffs.iter().filter(|d| **d > ROW_CHANGE).sum::<f32>() / region.rows().max(1) as f32;
+    (still_diffs, diff)
+}
+
+/// The columns of `region` a frame pair changed in around the pointer.
+///
+/// A scroll can move one strip of the region only (a carousel row above a
+/// static list, a side list beside static content). Compared together with
+/// the static content across from it, no shift explains the strip: the
+/// shifted static part leaves as large a residual as staying put. So the
+/// pair registers on the run of changed columns that holds the pointer's,
+/// bridging unchanged gaps up to [`STRIP_GAP`] (the blank between a
+/// carousel's pictures and their captions). A column counts as changed when
+/// its mean difference stands [`STRIP_NOISE`] times above the pair's noise
+/// floor (its quietest tenth of columns, what a video stream changes
+/// everywhere) or half the largest column's, whichever is lower. When the
+/// pointer's column is in no run, or the run is too narrow to register, the
+/// whole region is read.
+fn strip_under_pointer(earlier: &GrayFrame, later: &GrayFrame, region: &Region) -> Region {
+    let width = region.x1 - region.x0;
+    let Some(pointer) = region
+        .pointer
+        .0
+        .checked_sub(region.x0)
+        .filter(|p| *p < width)
+    else {
+        return *region;
+    };
+    let mut sums = vec![0u32; width];
+    for y in region.y0..region.y1 {
+        let start = y * earlier.width + region.x0;
+        let (a, b) = (
+            &earlier.pixels[start..start + width],
+            &later.pixels[start..start + width],
+        );
+        for (sum, (p, q)) in sums.iter_mut().zip(a.iter().zip(b)) {
+            *sum += u32::from(p.abs_diff(*q));
+        }
+    }
+    let change: Vec<f32> = sums
+        .iter()
+        .map(|s| *s as f32 / region.rows().max(1) as f32)
+        .collect();
+    let mut sorted = change.clone();
+    sorted.sort_by(f32::total_cmp);
+    let threshold = (STRIP_NOISE * sorted[width / 10])
+        .min(0.5 * sorted[width - 1])
+        .max(ROW_CHANGE);
+    let mut run: Option<(usize, usize)> = None;
+    for (x, c) in change.iter().enumerate() {
+        if *c <= threshold {
+            continue;
+        }
+        run = match run {
+            Some((start, end)) if x - end <= STRIP_GAP => Some((start, x + 1)),
+            Some((start, end)) if (start..end).contains(&pointer) => break,
+            _ => Some((x, x + 1)),
+        };
+    }
+    match run {
+        Some((start, end)) if (start..end).contains(&pointer) && end - start >= BLOCKS => Region {
+            x0: region.x0 + start,
+            x1: region.x0 + end,
+            ..*region
+        },
+        _ => *region,
+    }
+}
+
 /// Register `later` against `earlier` over `region`, searching shifts in
 /// `lo..=hi`. A frame pair with too few changed rows, or no candidate with
 /// enough overlap, registers as still (shift 0).
@@ -256,22 +359,26 @@ pub fn register(
     {
         return Registration::still(0.0);
     }
-    let rows = region.rows();
-    if rows == 0 {
+    if region.rows() == 0 {
         return Registration::still(0.0);
     }
-    let still_diffs: Vec<f32> = (region.y0..region.y1)
-        .map(|y| row_diff(earlier, y, later, y, region))
-        .collect();
+    // `diff` stays the whole region's change, so the no-motion and pair
+    // floors read the same whichever columns the shift is scored on; the
+    // residual below is the strip's unexplained share of it.
+    let (whole_diffs, diff) = row_changes(earlier, later, region);
+    if whole_diffs.iter().filter(|d| **d > ROW_CHANGE).count() < MIN_BAND_ROWS {
+        return Registration::still(diff);
+    }
+    let strip = strip_under_pointer(earlier, later, region);
+    let still_diffs = if strip == *region {
+        whole_diffs
+    } else {
+        row_changes(earlier, later, &strip).0
+    };
+    let region = &strip;
+    let rows = region.rows();
     let changed: Vec<bool> = still_diffs.iter().map(|d| *d > ROW_CHANGE).collect();
     let changed_rows = changed.iter().filter(|c| **c).count();
-    let diff = still_diffs
-        .iter()
-        .zip(&changed)
-        .filter(|(_, c)| **c)
-        .map(|(d, _)| *d)
-        .sum::<f32>()
-        / rows as f32;
     if changed_rows < MIN_BAND_ROWS {
         return Registration::still(diff);
     }
@@ -1140,8 +1247,9 @@ mod tests {
         frame_with(offset, texture)
     }
 
+    /// The window with the pointer at its centre.
     fn region() -> Region {
-        Region::within(W, H, None)
+        Region::within(W, H, None, (W as f64 / 2.0, H as f64 / 2.0))
     }
 
     fn track(frames: impl IntoIterator<Item = GrayFrame>) -> MotionTracker {
@@ -1288,6 +1396,138 @@ mod tests {
         assert_eq!((right.kind, right.along), (OutcomeKind::Moved, 25));
         let down = classify(&tracker.call_motion(), ScrollDirection::Down);
         assert_eq!(down.across, 25);
+    }
+
+    /// Adds `±amp` gray-level noise, as a compressed video stream does to
+    /// every pixel from frame to frame.
+    fn noise(f: &mut GrayFrame, seed: u64, amp: i16) {
+        for (i, p) in f.pixels.iter_mut().enumerate() {
+            let mut v = (i as u64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            v ^= v >> 31;
+            let n = (v % (2 * amp as u64 + 1)) as i16 - amp;
+            *p = (i16::from(*p) + n).clamp(0, 255) as u8;
+        }
+    }
+
+    /// The static window of [`frame`] with rows `strip` drawn by
+    /// `strip_content(x, y)`, under `±2` noise seeded by `seed`.
+    fn with_strip(
+        strip: std::ops::Range<usize>,
+        seed: u64,
+        strip_content: impl Fn(usize, usize) -> u8,
+    ) -> GrayFrame {
+        let mut f = frame(0);
+        for y in strip {
+            for x in 0..W {
+                f.pixels[y * W + x] = strip_content(x, y);
+            }
+        }
+        noise(&mut f, seed, 2);
+        f
+    }
+
+    /// Live on iPhone Mirroring: a carousel row about a fifth of the window
+    /// tall scrolled 93 pt sideways above a static list, and both calls read
+    /// "changed in place". Every column compared the moving strip together
+    /// with the static rows around it, so no sideways shift explained it.
+    #[test]
+    fn a_thin_strip_scrolled_sideways_is_moved() {
+        let at = |dx: usize, seed: u64| {
+            with_strip(150..210, seed, |x, y| texture(y, (x + dx + 700) as i64))
+        };
+        let offsets = [0usize, 6, 14, 20, 25];
+        let right = track(
+            offsets
+                .iter()
+                .enumerate()
+                .map(|(i, dx)| at(*dx, i as u64 + 1)),
+        );
+        let verdict = classify(&right.call_motion(), ScrollDirection::Right);
+        assert_eq!(
+            (verdict.kind, verdict.along),
+            (OutcomeKind::Moved, 25),
+            "{verdict:?}"
+        );
+        let left = track(
+            offsets
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(i, dx)| at(*dx, i as u64 + 1)),
+        );
+        let verdict = classify(&left.call_motion(), ScrollDirection::Left);
+        assert_eq!(
+            (verdict.kind, verdict.along),
+            (OutcomeKind::Moved, 25),
+            "{verdict:?}"
+        );
+    }
+
+    /// The vertical counterpart: a narrow list beside static content.
+    #[test]
+    fn a_narrow_column_scrolled_down_is_moved() {
+        let at = |offset: i64, seed: u64| {
+            let mut f = frame(0);
+            for y in CHROME_TOP..H - CHROME_BOTTOM {
+                for x in 44..68 {
+                    f.pixels[y * W + x] = texture(x + 300, y as i64 + offset);
+                }
+            }
+            noise(&mut f, seed, 2);
+            f
+        };
+        let offsets = [0i64, 9, 21, 33, 40];
+        let tracker = track(
+            offsets
+                .iter()
+                .enumerate()
+                .map(|(i, o)| at(*o, i as u64 + 1)),
+        );
+        let verdict = classify(&tracker.call_motion(), ScrollDirection::Down);
+        assert_eq!(
+            (verdict.kind, verdict.along),
+            (OutcomeKind::Moved, 40),
+            "{verdict:?}"
+        );
+    }
+
+    /// A strip whose content is replaced in place (a carousel page tap)
+    /// stays changed in place on either axis.
+    #[test]
+    fn a_thin_strip_replaced_in_place_is_not_a_move() {
+        let before = with_strip(150..210, 1, |x, y| texture(y, (x + 700) as i64));
+        let after = with_strip(150..210, 2, |x, y| texture(y + 40, (x + 5000) as i64));
+        let motion = track([before, after]).call_motion();
+        for direction in [
+            ScrollDirection::Right,
+            ScrollDirection::Left,
+            ScrollDirection::Down,
+            ScrollDirection::Up,
+        ] {
+            let verdict = classify(&motion, direction);
+            assert_eq!(
+                verdict.kind,
+                OutcomeKind::ChangedInPlace,
+                "{direction:?} {verdict:?}"
+            );
+        }
+    }
+
+    /// A strip that slides by itself away from the pointer (a marquee, a
+    /// banner rotating over static content) is not what the scroll moved.
+    #[test]
+    fn a_strip_sliding_away_from_the_pointer_is_not_the_scroll() {
+        let at = |dx: usize, seed: u64| {
+            with_strip(150..210, seed, |x, y| texture(y, (x + dx + 700) as i64))
+        };
+        let mut tracker = MotionTracker::new(at(0, 1), Region::within(W, H, None, (60.0, 300.0)));
+        tracker.begin_gesture(false);
+        for (i, dx) in [6, 14, 20, 25].into_iter().enumerate() {
+            tracker.push(at(dx, i as u64 + 2));
+        }
+        let verdict = classify(&tracker.call_motion(), ScrollDirection::Right);
+        assert_eq!(verdict.kind, OutcomeKind::ChangedInPlace, "{verdict:?}");
     }
 
     #[test]
@@ -1679,15 +1919,6 @@ mod tests {
     /// against the whole frame's change.
     #[test]
     fn an_in_place_change_under_noise_or_a_dim_is_not_a_move() {
-        let noise = |f: &mut GrayFrame, seed: u64, amp: i16| {
-            for (i, p) in f.pixels.iter_mut().enumerate() {
-                let mut v = (i as u64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                    .wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                v ^= v >> 31;
-                let n = (v % (2 * amp as u64 + 1)) as i16 - amp;
-                *p = (i16::from(*p) + n).clamp(0, 255) as u8;
-            }
-        };
         let swapped = |f: &mut GrayFrame, rows: std::ops::Range<usize>| {
             for y in rows {
                 for x in 0..W {

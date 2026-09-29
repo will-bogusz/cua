@@ -640,7 +640,7 @@ fn pointer_scroll(
         }
     };
     primed?;
-    let sampler = FrameSampler::start(request.wid, area);
+    let sampler = FrameSampler::start(request.wid, area, request.point.local);
     let mut unmeasured = sampler.as_ref().err().cloned();
     let position = || scroll_position(request.pid, x, y);
     let start_position = position();
@@ -842,7 +842,7 @@ async fn background(request: Request, args: &Value) -> ToolResult {
         || async move {
             cua_driver_core::operation::spawn_blocking(move || -> anyhow::Result<Verdict> {
                 let (area, _) = request.area();
-                let sampler = FrameSampler::start(wid, area);
+                let sampler = FrameSampler::start(wid, area, point.local);
                 crate::input::mouse::scroll_wheel_at_xy(
                     pid,
                     point.screen.0,

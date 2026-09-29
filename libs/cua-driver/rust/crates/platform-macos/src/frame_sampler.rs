@@ -168,10 +168,15 @@ impl FrameSampler {
     /// Capture the first frame now, sample [`BASELINE_FRAMES`] more before
     /// returning (so content already moving is known before any input), and
     /// keep sampling until [`Self::finish`]. `area` is the region to register
-    /// on in window points (`[x, y, w, h]`).
-    pub fn start(window_id: u32, area: Option<[f64; 4]>) -> Result<Self, String> {
+    /// on in window points (`[x, y, w, h]`), `pointer` where the wheel events
+    /// land in window points.
+    pub fn start(
+        window_id: u32,
+        area: Option<[f64; 4]>,
+        pointer: (f64, f64),
+    ) -> Result<Self, String> {
         let first = capture_gray(window_id)?;
-        let region = Region::within(first.width, first.height, area);
+        let region = Region::within(first.width, first.height, area, pointer);
         let now = Instant::now();
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
