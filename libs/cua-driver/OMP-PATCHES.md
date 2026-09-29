@@ -131,7 +131,7 @@ budget also raises, where nothing having happened is the common case.
 | B20 | `feat(macos): name the windows that appeared in a click's delivery evidence` (94a7fba9a) | Evidence said "a window changed" without naming which. | unfiled; delivery-probe PR |
 | B21 | `feat(macos): classify the window-sharing indicator in list_windows` (4937e10a4) + `publish whether a window row is accessibility-backed` (07d2deb5a) | The 66×20 capture indicator listed as an ordinary window (#3909); consumers could not tell an AX-backed panel from a bare CGWindow. | #3910 (fold 07d2deb5a) |
 | B22 | `fix(macos): classify typed delivery from the settled read, not the window's strongest one` (258e289b6) | The strongest-focused-value heuristic mis-classified the settled read. | #3921 (hold: #3897) |
-| B23 | `feat(macos): name the window that holds focus when foreground HID delivery is refused` (91dcc591c) | The refusal withheld the focus holder the driver had just read (#3918). | #3923 |
+| B23 | `feat(macos): name the window that holds focus when foreground HID delivery is refused` (91dcc591c) | The refusal withheld the focus holder the driver had just read (#3918). | #3923 (head 7b5441718, 2026-09-29) |
 | B24 | `feat(macos): give a drag the same delivery evidence a click carries` (f3a4e3959) | Drags reported posted, never probed. | unfiled; delivery-probe PR |
 | B25 | `fix(macos): read an application's own actions out of the envelope macOS ships them in` (4af44c0ac) + `dispatch a custom action by the name the element advertises` (e84bdf625) | macOS's three-line action envelope broke `tree_markdown` (#3919); named custom actions were not invocable. | #3947 |
 | B26 | `fix(macos): refuse a click action the element does not advertise` (da38cc568) + `…on every dispatch path` (bd4251f94) | An unrecognised action name dispatched as `AXPress` (#3920). | #3922 |
@@ -139,7 +139,7 @@ budget also raises, where nothing having happened is the common case.
 | B28 | `perf(macos): do not re-activate a drag target that is already frontmost` (259895a41) | Redundant activation per drag. | #3925 |
 | B29 | `feat(macos): list a menu submenu's items instead of pressing the path's final segment` (17fabf889) + `let a menu submenu listing answer without an ActionResult` (a8d6357d5) | `invoke_menu` pressed a submenu-bearing segment and discarded the labels it enumerated (#3944). | #3945 |
 | B30 | `perf(macos): cap the probe settle when there is no element state to compare` (096cbdd0b) + `stop claiming signals the probe never watched` (b4bf36937) | Probe waited its full budget with nothing to compare; replies claimed unwatched signals. | unfiled; delivery-probe PR |
-| B31 | `feat(macos): keep a disabled control addressable and publish its subrole` (2237aa939) + `drop the subrole field doc the TS generator embeds` (6840dd292) | Disabled controls got no `element_index`; `AXSubrole` never read (#3949). | #3950 |
+| B31 | `feat(macos): keep a disabled control addressable and publish its subrole` (2237aa939) + `drop the subrole field doc the TS generator embeds` (6840dd292) | Disabled controls got no `element_index`; `AXSubrole` never read (#3949). | #3950 (head 625c4c495, 2026-09-29) |
 
 ## Wave 5 (72c4c94e0..6ba974075)
 
@@ -155,11 +155,11 @@ budget also raises, where nothing having happened is the common case.
 | W5-6 | `fix(macos): say when no text destination resolved instead of pointing at a screenshot` (f21e6af9f) | Notes window-scoped type with no resolvable field: "verify via screenshot" on both rungs; foreground named as the fix when the path was the problem. | with the #3897 re-expression (its wording is "observe the target before retrying") |
 | W5-7 | `fix(macos): name the element a reply acted on` (86389bfc3) | `Performed AXPress on [40] AXCell ""` / `Selected nearest AXRow for [18] AXCell ""` — AppKit cells carry the label in `AXDescription`; the reply read `AXTitle` only. | yes — small PR |
 | W5-8 | `fix(core): carry the platform's observed escalation reason and name the pid-routed key route` (14f81c34b) | Background chord never probed → `{"reason":"delivery_failed","target":"foreground"}` fabricated from a static table; `key_events_fg` published `route: global_input` for a pid-routed post. | projection half: producer-observed `escalation.reason` deferred by RFC #4009 (2026-09-29); route token: chord PR; drop the `from_legacy` half (RFC 3473) |
-| W5-9 | `fix(macos): keep a content-bearing AXGroup addressable` (ca32c1c2d) | Reminders row `AXGroup` with actions [AXPress, Move Up, …] and help "To mark as completed, press Control-Option-Space." collapsed before its attributes were read. | yes — with #3950's family |
+| W5-9 | `fix(macos): keep a content-bearing AXGroup addressable` (ca32c1c2d) | Reminders row `AXGroup` with actions [AXPress, Move Up, …] and help "To mark as completed, press Control-Option-Space." collapsed before its attributes were read. | #3950 (head 625c4c495) |
 | W5-10 | `fix(macos): verify typed text against the field's prior value` (324dbaf76) | Notes search field still held "warehouse pallet audit" from a refused clear → "[OK] Inserted 22 char(s) … verified" for a write that delivered nothing; TextEdit autocapitalised → `Partial(22)`. | issue #3917 filed; the echo rule is what #3897's `typed_progress` does (`before == after → Unchanged`); `Normalized` conflicts with #3897 (non-byte-identical growth stays Unverifiable) — do not file that half |
 | W5-11 | `chore(contract): bump CONTRACT_VERSION to 0.9.0 and regenerate` (6ee6d7632) | Manifest/UniFFI/TS/Python regenerated; `manifest_is_sorted_and_versioned` now asserts `CONTRACT_VERSION`. | fork-only (upstream bumps in its own release) |
 | W5-12 | `fix(macos): spell the undelivered remainder on a partial type` (f8c44d6d2) | "retry only the remaining suffix" left the caller slicing by codepoint; reply now carries `retry_text`. | do not file — #3897 makes trusted partials `retryable: false` and drops `retry_from_character` |
-| W5-13 | `fix(macos): refuse a disabled control with the state that disabled it` (8ba9550f0) | Chrome and Notes, four states: byte-identical "Retry with delivery_mode:\"foreground\" or call bring_to_front first" while both routes were already taken; no `code`. Now `code: element_disabled`, `effect: not_dispatched`, `obscured_by`. | yes — one PR with W5-16/W5-24/W5-25/W5-26 (mirrors #3888's structured escalation on Windows) |
+| W5-13 | `fix(macos): refuse a disabled control with the state that disabled it` (8ba9550f0) | Chrome and Notes, four states: byte-identical "Retry with delivery_mode:\"foreground\" or call bring_to_front first" while both routes were already taken; no `code`. Now `code: element_disabled`, `effect: not_dispatched`, `obscured_by`. | #3923 — re-expressed with W5-26 on main as 9296b42c7 (head 7b5441718): `effect: refused` (not `not_dispatched`), `obscured_by: {window_id, title}` only, front window resolved per display as #3785 does; W5-16/W5-24 not included |
 | W5-14 | `fix(macos): a confirmed set_value on a search field reports committed when the value changed` (5082b2c90) | 0917 write census: 23 writes landed, 22 reported `committed: unproven` because `ValueThenConfirm` could never show a typed edit ending. | no — not folded into #3858 (2026-09-29): a6f32e598 (Q10, Font Book) and #3858's own Automator `R1_confirm` probe show a confirm over a changed value is not a commit; #3858 keeps every `AXConfirm` route at `unproven` |
 | W5-15 | `fix(macos): probe a chord's effect instead of reporting it pressed` (174797eaa) | Notes `cmd+option+f`: 0/12 dispatches landed, every reply "Pressed cmd+option+f on pid 91895". | chord PR (DriverT11 owns hotkey.rs) |
 | W5-16 | `fix(macos): bring_to_front verifies behind the app's own panel and names it` (3bf900306) | Notes/Chrome `reveal()` → `bring_to_front_exact_window_unverified` with `front_in_process=false`; the blocker (17013) was the same pid's panel; both candidates refused. | follow-up to #3785 after it merges; `obscured_by` resolver shared with W5-13 |
@@ -171,9 +171,9 @@ budget also raises, where nothing having happened is the common case.
 | W5-22 | `test(macos): a menu key equivalent through hotkey on both rungs` (8b1da0438) + `assert the menu chord on the surface the contract publishes` (a7415f702) | No cell asserted a chord reaches NSMenu; wave-4's silent chord drop was invisible. Fixture Window ▸ Arrange ▸ Left owns `cmd+option+l`; cell asserts route/effect/escalation only. | with the chord PR |
 | W5-23 | `fix(macos): state the key-window refusal without naming one transport` (dacdce172) | `ForegroundActivationRefused` said "for foreground HID delivery" on the pid-routed menu branch. | with the chord PR |
 | W5-24 | `fix(macos): keep the probed element alive across the dispatch it may destroy` (d004e4c59) | `press_key escape` SIGTRAP 5/5: `CF_IS_OBJC ← CFGetTypeID ← _AXUIElementValidate ← try_copy_string_attr ← DeliveryProbe::compare`; the probe held a bare `usize` the dispatch freed. Probe now retains; `ElementRead::{State,Gone,Unreadable}`; `Evidence::ElementGone`. | not on its own: the crash site is the fork-only `DeliveryProbe` (P15 `4f305e1f7`; absent from upstream `main`), so the fix travels with the delivery-probe PR; already re-expressed on `RetainedElement` (cd0861727) |
-| W5-25 | `fix(macos): a system overlay is never the panel in front` (7c7f4a853) | `element_disabled` named the 66×20 capture-lease indicator (19083) as the panel in front and told the agent to dismiss its own capture. | with W5-13 |
-| W5-26 | `fix(macos): a disabled control on a window that is not key names the foreground rung` (5a2dbf1d5) | Notes toolbar search field `AXEnabled=false` in background; `ChordProbe` saw it enable once the window was key; reply said no route exists. Fourth arm + `key_window` facts + `escalation: {target: foreground, reason: route_unavailable}`. | with W5-13 |
-| W5-27 | `fix(macos): classify the capture-lease indicator from the full window list` (6ba974075) | W5-25 did not fire live: the provider view is enumerated off-screen, so `visible_windows()` never enclosed the host row; resolver now takes `all_windows()` with on-screen gating for nameable rows. | with W5-13 |
+| W5-25 | `fix(macos): a system overlay is never the panel in front` (7c7f4a853) | `element_disabled` named the 66×20 capture-lease indicator (19083) as the panel in front and told the agent to dismiss its own capture. | hold until #3910 (its classifier); not in #3923 |
+| W5-26 | `fix(macos): a disabled control on a window that is not key names the foreground rung` (5a2dbf1d5) | Notes toolbar search field `AXEnabled=false` in background; `ChordProbe` saw it enable once the window was key; reply said no route exists. Fourth arm + `key_window` facts + `escalation: {target: foreground, reason: route_unavailable}`. | #3923 (in 9296b42c7, with a key-window-only AppKit fixture button and harness cell) |
+| W5-27 | `fix(macos): classify the capture-lease indicator from the full window list` (6ba974075) | W5-25 did not fire live: the provider view is enumerated off-screen, so `visible_windows()` never enclosed the host row; resolver now takes `all_windows()` with on-screen gating for nameable rows. | hold until #3910, with W5-25 |
 | W5-28 | fixture fixes `carry/restore the new ClickInput field` (64d906624, a90ad3d07) | 0.9.0 struct-literal break took the whole `cua-driver` test crate down; same one-line fix on each topic branch. | fork-only; squash into W5-11 |
 
 ## Sync with trycua/cua main (c5550997b)
@@ -275,15 +275,15 @@ The accepted RFC #4009 document `rfcs/4009-actionresult-outcome-vocabulary.md` (
 | B20 | as P6 |
 | B21 | - |
 | B22 | hold: #3897 replaces the classifier; re-express with #3811 |
-| B23 | RFC #4009 accepted `element_disabled` and a refusal `escalation` with existing enum values; #3923 rebases onto the accepted file and documents its refusal detail fields as macOS-only; stacked on #3910 |
+| B23 | #3923 rebased onto main `0f29c142d` at 7b5441718 (2026-09-29) with W5-13 + W5-26 (`element_disabled`, escalation `{foreground, route_unavailable}`), refusal detail documented macOS-only in `Skills/cua-driver/MACOS.md`; no longer stacked on #3910. Bench-VM AppKit table 23/26 (3 direct-mode limits shared with main), new cell 4/4, before-proof on main's driver fails. Still a draft: waits on Will's approval to mark ready + post the ready-for-another-look line; canonical Lume run owed |
 | B24 | as P6 |
-| B25 | - (folds into #3950, rebased 09-25 at f022d673f) |
+| B25 | - (folds into #3950, rebased 09-29 at 625c4c495) |
 | B26 | - |
 | B27 | - (#3946 merged 2026-09-28 by f-trycua at `990a2d1f1` after his rebase to `dc9f5a512`; shipped in 0.30.3. The fork's public `detect_window_change` is superseded by #3929's env bound at the next sync) |
 | B28 | - (superseded upstream by 681bc4480; dropped from #3946) |
 | B29 | - (was stacked on #3781, merged 2026-09-28: free to file when a slot opens) |
 | B30 | as P6 |
-| B31 | - |
+| B31 | #3950 rebased onto main `0f29c142d` at 625c4c495 (2026-09-29); `subrole`/`custom_actions` documented macOS-only and `enabled` per platform on `WindowElement` (#4009 feedback). Bench-VM AppKit table 23/26 (3 direct-mode limits shared with main). Still a draft: waits on Will's approval to mark ready + post; canonical Lume run owed |
 
 ### Wave 5
 
@@ -297,11 +297,11 @@ The accepted RFC #4009 document `rfcs/4009-actionresult-outcome-vocabulary.md` (
 | W5-6 | #3897 wording "observe the target before retrying"; file with the re-expression |
 | W5-7 | - |
 | W5-8 | producer-observed `escalation.reason` deferred by RFC #4009 (2026-09-29) to an amendment; no new from_legacy branches (RFC 3473) |
-| W5-9 | - (with #3950, rebased 09-25 at f022d673f; the harness cell is selected by run-rust-e2e.sh) |
+| W5-9 | - (with #3950, rebased 09-29 at 625c4c495; the harness cell is selected by run-rust-e2e.sh and passed in the bench VM) |
 | W5-10 | #3897: before == after is Unchanged; do not file Normalized |
 | W5-11 | - (fork-only) |
 | W5-12 | do not file: #3897 makes trusted partials retryable:false |
-| W5-13 | RFC #4009 accepted `element_disabled` and a refusal `escalation` using existing enum values only (2026-09-29); refusal detail fields documented as macOS-only; mirror #3888's Windows shape |
+| W5-13 | as B23 (#3923 at 7b5441718) |
 | W5-14 | not folded (confirm alone stays `unproven`; see the W5-14 row above and B1) |
 | W5-15 | - (chord PR; no longer waits on T11, whose route was removed in wave B) |
 | W5-16 | - (#3785 merged 2026-09-28; free to file on top of it when a slot opens) |
@@ -313,9 +313,9 @@ The accepted RFC #4009 document `rfcs/4009-actionresult-outcome-vocabulary.md` (
 | W5-22 | new native cases wired into the canonical allowlist in the same commit |
 | W5-23 | - (chord PR) |
 | W5-24 | re-expressed on #3616's RetainedElement (cd0861727); file as the crash fix, first free slot |
-| W5-25 | - (with W5-13) |
-| W5-26 | - (with W5-13) |
-| W5-27 | - (with W5-13) |
+| W5-25 | hold until #3910 lands; then re-express on #3923's `ElementDisabled` |
+| W5-26 | - (in #3923 at 7b5441718) |
+| W5-27 | hold until #3910 lands, with W5-25 |
 | W5-28 | - (fork-only) |
 
 ### Sync and wave 6

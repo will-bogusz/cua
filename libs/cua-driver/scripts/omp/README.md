@@ -68,6 +68,12 @@ SIGKILLs every later reader of that path. `install` and `restore` unlink first f
   pending. Through the shim each proxy is its own `mcp --direct` process with its own snapshot
   numbering and token table, so the shared-daemon invariant under test does not exist. Only a
   `serve` daemon whose app identity holds Screen Recording can prove this cell.
+- `harness_appkit_counter_px_background` fails under `mcp --direct` on current upstream heads
+  (origin/main `0f29c142d` included, bench VM 2026-09-29) at `double_click must refuse another
+  client's screenshot transform` (`code` null, expected `screenshot_context_missing`): the cell
+  starts a peer client "on the same daemon" (`spawn_peer_unrecorded`) and checks that the peer
+  cannot use the first client's screenshot transform. Through the shim the peer is its own
+  process, so the cross-client refusal cannot occur; the same shared-daemon limit as above.
 - `build` codesigns with `OMP Computer Use`, and that signature is not byte-deterministic: the
   same head signed twice yields two sha256 values. The `binary sha256` column of an evidence table
   therefore identifies the binary that ran, not the head; `head (driver binary)` (from
