@@ -1140,6 +1140,10 @@ impl Report {
             (Verdict::Measured(c), ScrollDelivery::Foreground) if c.kind == OutcomeKind::NoMotion => {
                 Some(NO_MOTION.to_owned())
             }
+            _ if self.from_accessibility => Some(
+                "measured from the accessibility scroll position: the window's pixels did not show the move"
+                    .to_owned(),
+            ),
             _ => None,
         };
         match (base, &self.stopped) {
@@ -1589,6 +1593,9 @@ mod tests {
         assert!(report.text().contains("accessibility scroll position"));
         assert_eq!(report.structured()["effect"], "unverifiable");
         assert_eq!(report.structured()["scroll"]["outcome"], "moved");
+        assert!(report.structured()["scroll"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("accessibility scroll position")));
     }
 
     #[test]
