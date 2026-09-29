@@ -691,6 +691,15 @@ impl ScrollUnit {
         }
     }
 
+    /// The amount a call that names none asks for: three line notches, or
+    /// one page. `points` has no default; the tool refuses it without one.
+    pub fn default_amount(self) -> u64 {
+        match self {
+            Self::Line => 3,
+            Self::Page | Self::Points => 1,
+        }
+    }
+
     /// Clamp a requested amount into the unit's accepted range.
     pub fn clamp_amount(self, requested: u64) -> u32 {
         let max = match self {
@@ -1117,6 +1126,14 @@ mod tests {
         assert_eq!(ScrollUnit::Points.clamp_amount(1100), 1100);
         assert_eq!(ScrollUnit::Points.clamp_amount(9000), 5000);
         assert_eq!(ScrollUnit::Page.clamp_amount(0), 1);
+    }
+
+    #[test]
+    fn a_page_scroll_that_names_no_amount_asks_for_one_page() {
+        let page = ScrollUnit::Page.clamp_amount(ScrollUnit::Page.default_amount());
+        assert_eq!(requested_distance(ScrollUnit::Page, page, 500.0), 400.0);
+        let lines = ScrollUnit::Line.clamp_amount(ScrollUnit::Line.default_amount());
+        assert_eq!(requested_distance(ScrollUnit::Line, lines, 500.0), 120.0);
     }
 
     #[test]

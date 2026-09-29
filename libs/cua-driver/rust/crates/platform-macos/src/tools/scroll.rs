@@ -120,7 +120,7 @@ fn def() -> &'static ToolDef {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": POINTS_AMOUNT_MAX,
-                    "description": "How many units. line and page clamp to 50; points accepts up to 5000. Default: 3."
+                    "description": "How many units. line and page clamp to 50; points accepts up to 5000 and has no default. Default for a window scroll: 3 lines, or 1 page. Desktop scope defaults to 3 of either."
                 },
                 "window_id": { "type": "integer" },
                 "element_index": cua_driver_core::tool_schema::element_index_schema(),
@@ -198,7 +198,7 @@ impl Tool for ScrollTool {
                 "by:\"points\" needs an explicit amount (1-5000 points)".to_owned(),
             );
         }
-        let amount = unit.clamp_amount(args.u64_or("amount", 3));
+        let amount = unit.clamp_amount(args.u64_or("amount", unit.default_amount()));
         // Surface 6: element_token / element_index precedence.
         let element_token_arg = args.opt_str("element_token");
         let window_id_arg = args.opt_u64("window_id");
