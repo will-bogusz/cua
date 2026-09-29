@@ -331,17 +331,22 @@ pub fn register(
     // those fixed rows still differ by noise from frame to frame, so they
     // count as changed — and compared against a shifted row they leave a
     // large residual that is not the scroll's failure. Each row is explained
-    // by whichever fits better: the shift, or staying put.
+    // by whichever fits better: the shift, or staying put. The residual is
+    // then scaled by the change in the rows it scored, not the whole frame's:
+    // otherwise a shift that pushes an in-place change out of the overlap
+    // scores only noise rows and looks rigid.
     let pixel_residual = |shift: i32| -> Option<f32> {
         let mut sum = 0f32;
+        let mut still_sum = 0f32;
         let mut count = 0usize;
         for r in pairs(shift) {
             let source = (r as i32 + shift) as usize;
             let shifted = row_diff(earlier, region.y0 + source, later, region.y0 + r, region);
             sum += shifted.min(still_diffs[r]);
+            still_sum += still_diffs[r];
             count += 1;
         }
-        (count >= min_pairs).then(|| sum / count as f32 * changed_rows as f32 / rows as f32)
+        (count >= min_pairs && still_sum > 0.0).then(|| sum / still_sum * diff)
     };
     let mut refined: Option<(i32, f32)> = None;
     let mut tried: Vec<(i32, f32)> = Vec::new();
@@ -754,25 +759,39 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
             motion.baseline_moving,
         );
     }
-    if bounced && !motion.baseline_moving {
+    let unambiguous_steps = steps.iter().all(|s| !s.ambiguous);
+    if bounced && unambiguous_steps && !motion.baseline_moving {
         return verdict(OutcomeKind::AtEnd, travel, step_confidence, false, true);
     }
     // Two independent registrations agreeing: the tracked frame-to-frame
     // travel (one direction, on the requested axis only) and a first-vs-last
     // shift at that travel that explains most of the change. A noisy stream
     // (video, compression, bursty frame delivery) keeps the residual above
-    // the strict rigid ratio and can drop a pair, but a pager or navigation
-    // never produces this agreement.
+    // the strict rigid ratio. A frame pair that did not register (bursty
+    // delivery, or a partial navigation) demands the strict ratio instead,
+    // and such a verdict never calibrates.
     let monotonic = !steps.is_empty()
         && motion.series.iter().all(|s| s.axis == axis)
-        && steps.iter().all(|s| s.shift.signum() == travel.signum() && !s.ambiguous);
+        && steps.iter().all(|s| s.shift.signum() == travel.signum())
+        && unambiguous_steps;
+    let agreement_ratio = if motion.non_rigid_pairs > 0 {
+        NET_RIGID_RATIO
+    } else {
+        PAIR_RIGID_RATIO
+    };
     if travel != 0
         && monotonic
         && !motion.baseline_moving
         && (net.shift - travel).abs() <= TRACKED_AGREEMENT_PT
-        && net.is_rigid(PAIR_RIGID_RATIO)
+        && net.is_rigid(agreement_ratio)
     {
-        return verdict(OutcomeKind::Moved, net.shift, Some(net.confidence()), false, false);
+        return verdict(
+            OutcomeKind::Moved,
+            net.shift,
+            Some(net.confidence()),
+            false,
+            motion.non_rigid_pairs > 0,
+        );
     }
     // Tracked but not registered first-vs-last: accept a clean tracked
     // travel when the first and last frames share too little of the band for
@@ -1653,6 +1672,50 @@ mod tests {
         }
     }
 
+    /// Audit M1 of cda887bd2: with a little change on every row (codec
+    /// noise, or a slight dim), a region changing in place while nothing
+    /// scrolled registered as a confirmed ~200 pt move — the chosen shift
+    /// pushed the changed band out of the overlap and scored only noise rows
+    /// against the whole frame's change.
+    #[test]
+    fn an_in_place_change_under_noise_or_a_dim_is_not_a_move() {
+        let noise = |f: &mut GrayFrame, seed: u64, amp: i16| {
+            for (i, p) in f.pixels.iter_mut().enumerate() {
+                let mut v = (i as u64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                v ^= v >> 31;
+                let n = (v % (2 * amp as u64 + 1)) as i16 - amp;
+                *p = (i16::from(*p) + n).clamp(0, 255) as u8;
+            }
+        };
+        let swapped = |f: &mut GrayFrame, rows: std::ops::Range<usize>| {
+            for y in rows {
+                for x in 0..W {
+                    f.pixels[y * W + x] = texture(x, y as i64 + 3000);
+                }
+            }
+        };
+        // Rows 200..360 swapped in place under ±2 noise, no scroll.
+        let mut before = frame(0);
+        noise(&mut before, 1, 2);
+        let mut after = frame(0);
+        swapped(&mut after, 200..360);
+        noise(&mut after, 2, 2);
+        let verdict = classify(&track([before, after]).call_motion(), ScrollDirection::Down);
+        assert_ne!(verdict.kind, OutcomeKind::Moved, "{verdict:?}");
+        assert_ne!(verdict.kind, OutcomeKind::AtEnd, "{verdict:?}");
+
+        // The window dims 6% while rows 200..360 swap, no noise at all.
+        let mut dimmed = frame(0);
+        swapped(&mut dimmed, 200..360);
+        for p in dimmed.pixels.iter_mut() {
+            *p = (f32::from(*p) * 0.94) as u8;
+        }
+        let verdict = classify(&track([frame(0), dimmed]).call_motion(), ScrollDirection::Down);
+        assert_ne!(verdict.kind, OutcomeKind::Moved, "{verdict:?}");
+        assert_ne!(verdict.kind, OutcomeKind::AtEnd, "{verdict:?}");
+    }
+
     /// Audit: a clean move followed by one navigation frame (unrelated
     /// content) read as a confirmed move of the tracked distance.
     #[test]
@@ -1704,4 +1767,5 @@ mod tests {
         assert!(summary.stalled);
         assert_eq!(summary.calibration, None, "the end-cut chunk disagrees, so nothing commits");
     }
+
 }
