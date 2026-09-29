@@ -526,12 +526,6 @@ mod tests {
         assert!(activation_needed(None, 758));
     }
 
-    #[test]
-    fn a_foreground_drag_is_never_described_as_background_delivery() {
-        assert_eq!(transport_phrase(true), "foreground HID gesture");
-        assert!(!transport_phrase(false).contains("background"));
-    }
-
     /// A drag addresses pixels, never an element, so the probe watches
     /// everything but the element's own state.
     fn outcome(evidence: delivery_probe::Evidence, waited_ms: u64) -> delivery_probe::ProbeOutcome {

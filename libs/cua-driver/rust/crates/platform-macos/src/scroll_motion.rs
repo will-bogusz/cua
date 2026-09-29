@@ -57,6 +57,11 @@ const NO_MOTION_DIFF: f32 = 1.0;
 const REVERSAL_MIN_PT: i32 = 3;
 /// Descriptor minima re-scored on full pixels per registration.
 const REFINE_CANDIDATES: usize = 8;
+/// A competing shift this far from the best one is an alias, not a refinement.
+const ALIAS_MIN_PT: u32 = 3;
+/// A competing shift whose residual is within this factor of the best one's
+/// (plus 5% of the difference) makes a registration ambiguous.
+const ALIAS_NOISE: f32 = 1.3;
 
 /// One captured window frame: 8-bit gray, row-major, one pixel per point.
 #[derive(Clone, PartialEq, Eq)]
@@ -159,6 +164,10 @@ pub struct Registration {
     pub shift: i32,
     pub residual: f32,
     pub diff: f32,
+    /// Another shift at least [`ALIAS_MIN_PT`] away explains the frames
+    /// within noise of this one (repeated rows: a list, numbered text), so
+    /// the distance may be off by that pitch.
+    pub ambiguous: bool,
 }
 
 impl Registration {
@@ -167,6 +176,7 @@ impl Registration {
             shift: 0,
             residual: diff,
             diff,
+            ambiguous: false,
         }
     }
 
@@ -315,16 +325,16 @@ pub fn register(
         (count >= min_pairs).then(|| sum / count as f32 * changed_rows as f32 / rows as f32)
     };
     let mut refined: Option<(i32, f32)> = None;
-    let mut seen = Vec::new();
+    let mut tried: Vec<(i32, f32)> = Vec::new();
     for (coarse, _) in candidates {
         for shift in [coarse - 1, coarse, coarse + 1] {
-            if shift == 0 || shift < lo || shift > hi || seen.contains(&shift) {
+            if shift == 0 || shift < lo || shift > hi || tried.iter().any(|(s, _)| *s == shift) {
                 continue;
             }
-            seen.push(shift);
             let Some(residual) = pixel_residual(shift) else {
                 continue;
             };
+            tried.push((shift, residual));
             let better = match refined {
                 None => true,
                 Some((best_shift, best)) => {
@@ -344,6 +354,9 @@ pub fn register(
             shift,
             residual,
             diff,
+            ambiguous: tried.iter().any(|(other, r)| {
+                other.abs_diff(shift) >= ALIAS_MIN_PT && *r <= residual * ALIAS_NOISE + 0.05 * diff
+            }),
         },
         None => Registration::still(diff),
     }
@@ -372,6 +385,12 @@ pub struct MotionTracker {
     travel_h: i32,
     series: Vec<Step>,
     chunk: ChunkStart,
+    /// [`Self::begin_gesture`] ran: frames after it belong to the scroll.
+    gesture_started: bool,
+    /// Frames already changed before the first input event (an animation,
+    /// a video, a scroll still settling): pixels alone then cannot attribute
+    /// a shift to the scroll.
+    baseline_moving: bool,
 }
 
 struct ChunkStart {
@@ -393,6 +412,12 @@ pub struct Motion {
     /// The window's frame changed size between the two frames, so no shift
     /// between them can be registered.
     pub reshaped: bool,
+    /// The content was already changing before the first input event.
+    pub baseline_moving: bool,
+    /// Largest vertical / horizontal shift a single comparison can register
+    /// (the region minus the overlap it needs).
+    pub overlap_v: i32,
+    pub overlap_h: i32,
 }
 
 impl MotionTracker {
@@ -410,7 +435,20 @@ impl MotionTracker {
             travel_v: 0,
             travel_h: 0,
             series: Vec::new(),
+            gesture_started: false,
+            baseline_moving: false,
         }
+    }
+
+    /// The gesture starts now: the latest frame becomes the call's first
+    /// frame, and whether anything changed before this is remembered.
+    pub fn begin_gesture(&mut self) {
+        self.gesture_started = true;
+        self.first = self.prev.clone();
+        self.travel_v = 0;
+        self.travel_h = 0;
+        self.series.clear();
+        self.begin_chunk();
     }
 
     /// Feed the next captured frame. Returns whether it differed from the
@@ -418,6 +456,11 @@ impl MotionTracker {
     pub fn push(&mut self, frame: GrayFrame) -> bool {
         if frame == self.prev {
             return false;
+        }
+        if !self.gesture_started {
+            self.baseline_moving = true;
+            self.prev = frame;
+            return true;
         }
         let vertical = register(
             &self.prev,
@@ -505,6 +548,9 @@ impl MotionTracker {
             net_v,
             net_h,
             reshaped: start.width != self.prev.width || start.height != self.prev.height,
+            baseline_moving: self.baseline_moving,
+            overlap_v: self.region.rows() as i32 - MIN_OVERLAP_ROWS,
+            overlap_h: (self.region.x1 - self.region.x0) as i32 - MIN_OVERLAP_ROWS,
         }
     }
 }
@@ -532,6 +578,9 @@ pub struct Classified {
     pub confidence: Option<f64>,
     /// The content moved one way and then the other (overshoot and bounce).
     pub bounced: bool,
+    /// The distance rests on a registration a repeated-row alias competes
+    /// with, so it may be off by one pitch.
+    pub ambiguous: bool,
 }
 
 fn axis_of(direction: ScrollDirection) -> (Axis, i32) {
@@ -546,9 +595,9 @@ fn axis_of(direction: ScrollDirection) -> (Axis, i32) {
 /// Classify `motion` for a scroll in `direction`.
 pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     let (axis, sign) = axis_of(direction);
-    let (net, travel, net_across, travel_across) = match axis {
-        Axis::Vertical => (motion.net_v, motion.travel_v, motion.net_h, motion.travel_h),
-        Axis::Horizontal => (motion.net_h, motion.travel_h, motion.net_v, motion.travel_v),
+    let (net, travel, net_across, travel_across, overlap) = match axis {
+        Axis::Vertical => (motion.net_v, motion.travel_v, motion.net_h, motion.travel_h, motion.overlap_v),
+        Axis::Horizontal => (motion.net_h, motion.travel_h, motion.net_v, motion.travel_v, motion.overlap_h),
     };
     let steps: Vec<&Step> = motion.series.iter().filter(|s| s.axis == axis).collect();
     let bounced = steps.iter().any(|s| s.shift >= REVERSAL_MIN_PT)
@@ -563,40 +612,45 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     // The first-vs-last difference is read in the vertical orientation; it is
     // the same pixels whichever axis the request named.
     let diff = motion.net_v.diff;
-    let verdict = |kind, along: i32, confidence| Classified {
+    let verdict = |kind, along: i32, confidence, ambiguous| Classified {
         kind,
         along: sign * along,
         across,
         confidence,
         bounced,
+        ambiguous,
     };
 
     if motion.reshaped {
-        return verdict(OutcomeKind::ChangedInPlace, 0, None);
+        return verdict(OutcomeKind::ChangedInPlace, 0, None, false);
     }
     if diff < NO_MOTION_DIFF && motion.series.is_empty() {
-        return verdict(OutcomeKind::NoMotion, 0, None);
+        return verdict(OutcomeKind::NoMotion, 0, None, false);
     }
-    if net.is_rigid(NET_RIGID_RATIO) {
+    // Content that was already moving must agree with the tracked travel
+    // before its shift is credited to the scroll.
+    let attributable = !motion.baseline_moving || (net.shift - travel).abs() <= 8;
+    if net.is_rigid(NET_RIGID_RATIO) && attributable {
         let kind = if bounced {
             OutcomeKind::AtEnd
         } else {
             OutcomeKind::Moved
         };
-        return verdict(kind, net.shift, Some(net.confidence()));
+        let ambiguous = net.ambiguous || motion.baseline_moving;
+        return verdict(kind, net.shift, Some(net.confidence()), ambiguous);
     }
-    if bounced {
-        return verdict(OutcomeKind::AtEnd, travel, step_confidence);
+    if bounced && !motion.baseline_moving {
+        return verdict(OutcomeKind::AtEnd, travel, step_confidence, true);
     }
-    if travel != 0 {
-        // Tracked but not registered first-vs-last: the move outran the
-        // overlap a single comparison needs.
-        return verdict(OutcomeKind::Moved, travel, step_confidence);
+    if travel != 0 && travel.abs() + NET_WINDOW_PT > overlap && !motion.baseline_moving {
+        // Tracked but not registered first-vs-last because the move outran
+        // the overlap a single comparison needs.
+        return verdict(OutcomeKind::Moved, travel, step_confidence, true);
     }
-    if diff >= NO_MOTION_DIFF {
-        return verdict(OutcomeKind::ChangedInPlace, 0, None);
+    if diff >= NO_MOTION_DIFF || travel != 0 {
+        return verdict(OutcomeKind::ChangedInPlace, 0, None, false);
     }
-    verdict(OutcomeKind::NoMotion, 0, None)
+    verdict(OutcomeKind::NoMotion, 0, None, false)
 }
 
 /// Scroll units a caller can ask for.
@@ -699,22 +753,34 @@ pub struct ChunkMeasure {
     pub settled: bool,
 }
 
+/// What one turn of the closed loop produced.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChunkStep {
+    /// The chunk was posted and measured.
+    Measured(ChunkMeasure),
+    /// The chunk was posted but the frames could not be measured.
+    Unmeasured,
+    /// Nothing was posted: the gesture must stop (takeover, destination).
+    Halted,
+}
+
 /// What the closed loop did.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoopSummary {
     pub chunks: u32,
     pub total_px: u32,
     pub events: u32,
-    /// Points per pixel from the last chunk known to have run its whole
-    /// course — followed by more motion, or finishing the distance. A chunk
-    /// that ran into the end of the content moved less than its pixels asked
-    /// for, and calibrating from it would oversize the next call's chunks.
+    /// Points per pixel, only from chunks that ran their whole course with
+    /// an unambiguous registration — followed by another full move, or
+    /// finishing the distance — and agreed with each other within 15%.
     pub calibration: Option<f64>,
     /// The last chunk moved less than 20% of what it was expected to, with
     /// frames settled.
     pub stalled: bool,
-    /// No chunk could be measured.
+    /// A chunk was posted and could not be measured; the loop stopped there.
     pub unmeasured: bool,
+    /// The loop stopped before posting a chunk (see [`ChunkStep::Halted`]).
+    pub halted: bool,
 }
 
 fn chunk_px(remaining_pt: f64, k: f64) -> u32 {
@@ -725,17 +791,22 @@ fn keep_going(remaining_pt: f64, requested_pt: f64) -> bool {
     remaining_pt > (0.05 * requested_pt).max(8.0)
 }
 
+/// Lowest registration confidence a chunk may calibrate from.
+const CALIBRATION_CONFIDENCE: f64 = 0.85;
+/// Largest spread between calibrating chunks of one call.
+const CALIBRATION_AGREEMENT: f64 = 1.15;
+
 /// Scroll `requested_pt` in chunks of at most [`CHUNK_MAX_PT`], each sized
-/// from the points-per-pixel `k` (starting at `k0`) and re-calibrated from
-/// what the chunk measured. `run(px)` posts one chunk and returns its
-/// measurement, or `None` when the frames could not be captured — the loop
-/// then sends the rest of the distance open-loop. Stops early on a chunk
-/// that reached the end, did not move, changed in place, or moved the wrong
-/// way.
+/// from the points-per-pixel `k` (starting at `k0`) and re-sized from a chunk
+/// that measured cleanly. `run(px)` posts one chunk and says what it
+/// measured. The loop stops on a chunk that could not be measured, did not
+/// move the way asked, reached the end, changed in place, or rests on an
+/// ambiguous registration (a correction for a possibly aliased distance
+/// could overshoot by that alias), and before posting when `run` halts.
 pub fn drive_chunks(
     requested_pt: f64,
     k0: f64,
-    mut run: impl FnMut(u32) -> anyhow::Result<Option<ChunkMeasure>>,
+    mut run: impl FnMut(u32) -> anyhow::Result<ChunkStep>,
 ) -> anyhow::Result<LoopSummary> {
     let mut k = k0.clamp(K_RANGE.0, K_RANGE.1);
     let mut remaining = requested_pt;
@@ -745,56 +816,64 @@ pub fn drive_chunks(
         events: 0,
         calibration: None,
         stalled: false,
-        unmeasured: true,
+        unmeasured: false,
+        halted: false,
     };
-    // Calibration from the latest chunk, committed once the chunk is known
-    // not to have been cut short by the end of the content.
+    // The latest clean chunk's k, committed once the chunk proves it ran its
+    // whole course.
     let mut pending: Option<f64> = None;
-    let mut completed = true;
+    let mut committed: Vec<f64> = Vec::new();
     while summary.chunks < MAX_CHUNKS {
         let px = chunk_px(remaining, k);
         let expected = f64::from(px) * k;
-        let measure = run(px)?;
-        summary.chunks += 1;
-        summary.total_px += px;
-        summary.events += px.div_ceil(WHEEL_EVENT_MAX_PX);
-        let Some(measure) = measure else {
-            remaining -= expected;
-            if !keep_going(remaining, requested_pt) {
+        let measure = match run(px)? {
+            ChunkStep::Halted => {
+                summary.halted = true;
                 break;
             }
-            continue;
+            step => {
+                summary.chunks += 1;
+                summary.total_px += px;
+                summary.events += px.div_ceil(WHEEL_EVENT_MAX_PX);
+                match step {
+                    ChunkStep::Measured(measure) => measure,
+                    _ => {
+                        summary.unmeasured = true;
+                        break;
+                    }
+                }
+            }
         };
-        summary.unmeasured = false;
-        let moved = f64::from(measure.classified.along);
+        let c = measure.classified;
+        let moved = f64::from(c.along);
         summary.stalled = measure.settled && moved < 0.2 * expected;
-        if !matches!(measure.classified.kind, OutcomeKind::Moved) || moved <= 0.0 {
-            completed = false;
+        let full_move = c.kind == OutcomeKind::Moved && moved > 0.0 && !summary.stalled;
+        if !full_move {
             break;
         }
-        if pending.is_some() {
-            summary.calibration = pending;
+        committed.extend(pending.take());
+        remaining -= moved;
+        if c.ambiguous {
+            break;
         }
-        // Only a chunk that moved roughly what it was sized for re-sizes the
-        // next one; a chunk that hit the end moved far less.
         let ratio = moved / expected;
-        pending = (measure.classified.confidence.is_some() && (0.5..=2.0).contains(&ratio))
-            .then(|| (moved / f64::from(px)).clamp(K_RANGE.0, K_RANGE.1));
+        pending = (!c.bounced
+            && c.confidence.is_some_and(|confidence| confidence >= CALIBRATION_CONFIDENCE)
+            && (0.5..=2.0).contains(&ratio))
+        .then(|| (moved / f64::from(px)).clamp(K_RANGE.0, K_RANGE.1));
         if let Some(measured) = pending {
             k = measured;
         }
-        remaining -= moved;
-        if summary.stalled {
-            completed = false;
-            break;
-        }
         if !keep_going(remaining, requested_pt) {
+            committed.extend(pending.take());
             break;
         }
     }
-    if completed && pending.is_some() {
-        summary.calibration = pending;
-    }
+    let spread = committed.iter().copied().reduce(f64::max).zip(committed.iter().copied().reduce(f64::min));
+    summary.calibration = match spread {
+        Some((max, min)) if max <= min * CALIBRATION_AGREEMENT => committed.last().copied(),
+        _ => None,
+    };
     Ok(summary)
 }
 
@@ -872,6 +951,7 @@ mod tests {
     fn track(frames: impl IntoIterator<Item = GrayFrame>) -> MotionTracker {
         let mut frames = frames.into_iter();
         let mut tracker = MotionTracker::new(frames.next().unwrap(), region());
+        tracker.begin_gesture();
         for frame in frames {
             tracker.push(frame);
         }
@@ -1025,28 +1105,32 @@ mod tests {
         assert_eq!(wheel_events(31, ScrollDirection::Left), vec![(0, 30), (0, 1)]);
     }
 
+    fn moved(along: i32, confidence: f64, ambiguous: bool) -> ChunkStep {
+        let kind = if along == 0 {
+            OutcomeKind::NoMotion
+        } else {
+            OutcomeKind::Moved
+        };
+        ChunkStep::Measured(ChunkMeasure {
+            classified: Classified {
+                kind,
+                along,
+                across: 0,
+                confidence: (along != 0).then_some(confidence),
+                bounced: false,
+                ambiguous,
+            },
+            settled: true,
+        })
+    }
+
     /// A view that moves `k` pt per wheel pixel and ends after `room` pt.
-    fn view(k: f64, room: f64) -> impl FnMut(u32) -> anyhow::Result<Option<ChunkMeasure>> {
+    fn view(k: f64, room: f64) -> impl FnMut(u32) -> anyhow::Result<ChunkStep> {
         let mut position = 0.0f64;
         move |px| {
             let before = position;
             position = (position + f64::from(px) * k).min(room);
-            let moved = (position - before).round() as i32;
-            let kind = if moved == 0 {
-                OutcomeKind::NoMotion
-            } else {
-                OutcomeKind::Moved
-            };
-            Ok(Some(ChunkMeasure {
-                classified: Classified {
-                    kind,
-                    along: moved,
-                    across: 0,
-                    confidence: (moved != 0).then_some(0.95),
-                    bounced: false,
-                },
-                settled: true,
-            }))
+            Ok(moved((position - before).round() as i32, 0.95, false))
         }
     }
 
@@ -1091,17 +1175,68 @@ mod tests {
         assert!(summary.stalled);
     }
 
+    /// Before: an unmeasured chunk counted as its expected distance and the
+    /// loop kept sending blind (400, 400, 100 px for 900 pt).
     #[test]
-    fn an_unmeasured_loop_sends_the_distance_open_loop() {
+    fn an_unmeasured_chunk_stops_the_loop_and_counts_what_was_sent() {
         let mut sizes = Vec::new();
         let summary = drive_chunks(900.0, 1.0, |px| {
             sizes.push(px);
-            Ok(None)
+            Ok(ChunkStep::Unmeasured)
         })
         .unwrap();
-        assert_eq!(sizes, vec![400, 400, 100]);
+        assert_eq!(sizes, vec![400]);
         assert!(summary.unmeasured);
-        assert_eq!(summary.events, 14 + 14 + 4);
+        assert_eq!((summary.chunks, summary.total_px, summary.events), (1, 400, 14));
+    }
+
+    #[test]
+    fn a_halt_before_a_chunk_posts_nothing_more() {
+        let mut inner = view(1.0, 10_000.0);
+        let mut calls = 0;
+        let summary = drive_chunks(1000.0, 1.0, |px| {
+            calls += 1;
+            if calls == 2 {
+                return Ok(ChunkStep::Halted);
+            }
+            inner(px)
+        })
+        .unwrap();
+        assert!(summary.halted);
+        assert_eq!((summary.chunks, summary.total_px), (1, 400));
+    }
+
+    /// Reviewer M3: a first chunk cut short by the end (240 of 400 pt, inside
+    /// the 0.5..2 ratio filter) must not become the window's calibration.
+    #[test]
+    fn a_chunk_that_may_have_hit_the_end_never_calibrates() {
+        let summary = drive_chunks(1200.0, 1.0, view(1.0, 240.0)).unwrap();
+        assert_eq!(summary.calibration, None);
+    }
+
+    /// Skeptic R5: an aliased distance must neither calibrate nor trigger a
+    /// correction chunk that would overshoot by the alias.
+    #[test]
+    fn an_ambiguous_chunk_ends_the_loop_without_calibrating() {
+        let mut calls = 0;
+        let summary = drive_chunks(300.0, 1.0, |_| {
+            calls += 1;
+            Ok(moved(287, 0.98, true))
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(summary.calibration, None);
+    }
+
+    #[test]
+    fn chunks_that_disagree_leave_the_calibration_unset() {
+        let mut ratios = [0.5, 1.0, 1.0].into_iter();
+        let summary = drive_chunks(1000.0, 1.0, |px| {
+            let k = ratios.next().unwrap_or(1.0);
+            Ok(moved((f64::from(px) * k).round() as i32, 0.95, false))
+        })
+        .unwrap();
+        assert_eq!(summary.calibration, None);
     }
 
     /// Measured on TextEdit: a numbered document whose lines differ only in
@@ -1145,11 +1280,4 @@ mod tests {
         assert_eq!(summary.calibration, Some(1.0), "the full chunk's k stands");
     }
 
-    #[test]
-    fn calibration_is_kept_per_window() {
-        let cache = ScrollCalibrations::default();
-        cache.record(7, 70, 0.771);
-        assert_eq!(cache.get(7, 70), Some(0.771));
-        assert_eq!(cache.get(7, 71), None);
-    }
 }

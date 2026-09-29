@@ -274,22 +274,24 @@ pub fn cursor_location() -> anyhow::Result<CGPoint> {
 }
 
 /// Park the real pointer on `(x, y)` and make the window under it track it
-/// there: warp, then three HID `mouseMoved` events 20 ms apart (the last
-/// exactly on the point), then 50 ms. A warp alone generates no
+/// there: three HID `mouseMoved` events 20 ms apart arriving at the point
+/// from `interior` (a unit step pointing into the target window, so a point
+/// at the window's edge is never approached from outside it), the last
+/// exactly on the point, then 30 ms more. A warp alone generates no
 /// `mouseMoved`, and a view that scrolls whatever sits under the pointer
 /// learns where the pointer is only from those events — after an activation
 /// change it drops the first wheel of a gesture that was not primed.
-pub fn prime_pointer_at(x: f64, y: f64) -> anyhow::Result<()> {
+pub fn prime_pointer_at(x: f64, y: f64, interior: (f64, f64)) -> anyhow::Result<()> {
     use core_graphics::event::CGEventTapLocation;
 
     move_cursor_desktop(x, y)?;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    for offset in [-2.0, -1.0, 0.0] {
+    for step in [2.0, 1.0, 0.0] {
         let event = CGEvent::new_mouse_event(
             source.clone(),
             CGEventType::MouseMoved,
-            CGPoint::new(x + offset, y),
+            CGPoint::new(x + interior.0 * step, y + interior.1 * step),
             CGMouseButton::Left,
         )
         .map_err(|_| anyhow::anyhow!("mouseMoved event preparation failed"))?;

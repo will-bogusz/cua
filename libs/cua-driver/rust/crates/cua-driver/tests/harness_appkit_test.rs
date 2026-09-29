@@ -2270,7 +2270,7 @@ fn harness_appkit_scroll_foreground() {
             "appkit",
             "scroll",
             Targeting::Ax,
-            DriverRoute::MacosAxAction,
+            DriverRoute::MacosCgEventHid,
         ),
         |pid, wid, driver| {
             let pre = snapshot_elements(driver, pid, wid);
@@ -2296,6 +2296,12 @@ fn harness_appkit_scroll_foreground() {
                 !response.is_error(),
                 "AppKit foreground scroll failed: {}; raw={}",
                 response.text(),
+                response.raw
+            );
+            assert_eq!(
+                response.structured()["scroll"]["outcome"],
+                "moved",
+                "foreground scroll is pointer-routed and measured; raw={}",
                 response.raw
             );
             std::thread::sleep(Duration::from_millis(300));

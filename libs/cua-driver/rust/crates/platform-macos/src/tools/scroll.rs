@@ -20,7 +20,8 @@ use crate::focus_guard;
 use crate::frame_sampler::{FrameSampler, Settle};
 use crate::input::raised_pointer::{self, RaisedPointerError};
 use crate::scroll_motion::{
-    self, ChunkMeasure, Classified, LoopSummary, OutcomeKind, ScrollUnit, POINTS_AMOUNT_MAX,
+    self, ChunkMeasure, ChunkStep, Classified, LoopSummary, OutcomeKind, ScrollUnit,
+    POINTS_AMOUNT_MAX,
 };
 use crate::window_change_detector::WindowChangeDetector;
 use crate::windows::WindowBounds;
@@ -92,9 +93,10 @@ fn def() -> &'static ToolDef {
             Distance: by='points' → `amount` points; by='line' → `amount` × 40 pt (background: \
             `amount` line ticks); by='page' → `amount` × 0.8 × the visible height of the scroll \
             area under the point (background: 5 lines per page).\n\n\
-            Every window reply is measured from window frames — moved N pt, at end, no motion, \
+            Every wheel reply is measured from window frames — moved N pt, at end, no motion, \
             changed in place, or unmeasured — and the structured `scroll` object carries the \
-            numbers."
+            numbers. The AppKit text-area scroll-bar route (background, element target) is \
+            not measured and carries no `scroll` object."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -191,6 +193,11 @@ impl Tool for ScrollTool {
         let Some(unit) = ScrollUnit::parse(&by) else {
             return ToolResult::error(format!("by must be line, page or points (got {by:?})"));
         };
+        if unit == ScrollUnit::Points && args.get("amount").is_none() {
+            return ToolResult::error(
+                "by:\"points\" needs an explicit amount (1-5000 points)".to_owned(),
+            );
+        }
         let amount = unit.clamp_amount(args.u64_or("amount", 3));
         // Surface 6: element_token / element_index precedence.
         let element_token_arg = args.opt_str("element_token");
@@ -480,29 +487,47 @@ struct Request {
 }
 
 impl Request {
-    /// The scroll area under the point in window-local points, and its
-    /// visible height (the window's when accessibility exposes none).
+    /// The visible scroll area under the point in window-local points, and
+    /// its visible height (the window's when accessibility exposes none).
     fn area(&self) -> (Option<[f64; 4]>, f64) {
-        let bounds = crate::windows::window_bounds_by_id(self.wid);
-        let area = scroll_area_at(self.pid, self.point.screen.0, self.point.screen.1)
-            .zip(bounds.as_ref())
-            .map(|([x, y, w, h], bounds)| [x - bounds.x, y - bounds.y, w, h]);
-        let visible = area
-            .map(|[_, _, _, h]| h)
-            .or(bounds.map(|b| b.height))
-            .unwrap_or(0.0);
-        (area, visible)
+        let Some(bounds) = crate::windows::window_bounds_by_id(self.wid) else {
+            return (None, 0.0);
+        };
+        let area = scroll_area_at(self.pid, self.point.screen.0, self.point.screen.1);
+        visible_area(area, &bounds)
     }
+}
+
+/// Clip a scroll area's screen frame to the window it sits in, as window-local
+/// points. A scroll area's frame can extend past the window (a document
+/// view, a resized window), and a page is what the user can see.
+fn visible_area(area: Option<[f64; 4]>, window: &WindowBounds) -> (Option<[f64; 4]>, f64) {
+    let clipped = area.and_then(|[x, y, w, h]| {
+        let x0 = x.max(window.x);
+        let y0 = y.max(window.y);
+        let x1 = (x + w).min(window.x + window.width);
+        let y1 = (y + h).min(window.y + window.height);
+        (x1 - x0 >= 1.0 && y1 - y0 >= 1.0).then(|| [x0 - window.x, y0 - window.y, x1 - x0, y1 - y0])
+    });
+    let visible = clipped.map_or(window.height, |[_, _, _, h]| h);
+    (clipped, visible)
+}
+
+/// A unit step from `(x, y)` toward the window's centre, so the pointer
+/// primer approaches the point from inside the window.
+fn toward_interior((x, y): (f64, f64), window: &WindowBounds) -> (f64, f64) {
+    let (cx, cy) = (window.x + window.width / 2.0, window.y + window.height / 2.0);
+    let sign = |from: f64, to: f64| if to >= from { 1.0 } else { -1.0 };
+    (sign(x, cx), sign(y, cy))
 }
 
 impl ScrollTool {
     async fn foreground(&self, request: Request, args: &Value) -> ToolResult {
         let Request { pid, wid, .. } = request;
         let k0 = self.state.scroll_calibrations.get(pid, wid).unwrap_or(1.0);
-        // The activation is the point of this route: allow it, and keep
-        // suppressing any other application a gesture might front.
-        let snapshot =
-            WindowChangeDetector::snapshot_allowing_activation(apps::frontmost_pid(), pid);
+        // The envelope owns activation and restoration; any suppressor would
+        // fight it, or undo the user's own switch mid-gesture.
+        let snapshot = WindowChangeDetector::snapshot_without_suppression(apps::frontmost_pid());
         let run = cua_driver_core::operation::spawn_blocking(move || {
             let (area, visible_height) = request.area();
             let requested = scroll_motion::requested_distance(
@@ -517,7 +542,7 @@ impl ScrollTool {
                 wid,
                 request.point.screen.0,
                 request.point.screen.1,
-                || pointer_scroll(request, area, requested, k0),
+                |envelope| pointer_scroll(request, area, requested, k0, envelope),
             )
             .map(|run| (run, requested))
         })
@@ -546,6 +571,7 @@ impl ScrollTool {
             total: run.summary.total_px,
             chunks: run.summary.chunks,
             verdict: run.verdict,
+            stopped: run.stopped,
         };
         report.result(&changes)
     }
@@ -554,40 +580,53 @@ impl ScrollTool {
 struct PointerRun {
     summary: LoopSummary,
     verdict: Verdict,
+    /// Why the gesture stopped before its distance, when something other
+    /// than the view did.
+    stopped: Option<String>,
 }
 
 /// Inside the raised envelope: prime the pointer, then scroll `requested_pt`
-/// in measured chunks.
+/// in measured chunks, re-checking ownership and destination before each.
 fn pointer_scroll(
     request: Request,
     area: Option<[f64; 4]>,
     requested_pt: f64,
     k0: f64,
+    envelope: &raised_pointer::Envelope,
 ) -> anyhow::Result<PointerRun> {
     let (x, y) = request.point.screen;
-    crate::input::mouse::prime_pointer_at(x, y)?;
+    crate::input::mouse::prime_pointer_at(x, y, toward_interior((x, y), envelope.bounds()))?;
     let sampler = FrameSampler::start(request.wid, area);
     let mut unmeasured = sampler.as_ref().err().cloned();
+    let mut stopped: Option<String> = None;
     let summary = scroll_motion::drive_chunks(requested_pt, k0, |px| {
+        if let Err(interruption) = envelope.check() {
+            stopped = Some(interruption.reason().to_owned());
+            return Ok(ChunkStep::Halted);
+        }
         let events = scroll_motion::wheel_events(px, request.direction);
         let Ok(sampler) = &sampler else {
-            crate::input::mouse::pixel_wheel_burst(x, y, &events, || {})?;
-            return Ok(None);
+            if let Err(error) = crate::input::mouse::pixel_wheel_burst(x, y, &events, || {}) {
+                stopped = Some(format!("input stopped: {error}"));
+            }
+            return Ok(ChunkStep::Unmeasured);
         };
         sampler.begin_chunk();
-        crate::input::mouse::pixel_wheel_burst(x, y, &events, || sampler.mark_event())?;
+        if let Err(error) =
+            crate::input::mouse::pixel_wheel_burst(x, y, &events, || sampler.mark_event())
+        {
+            stopped = Some(format!("input stopped: {error}"));
+            return Ok(ChunkStep::Unmeasured);
+        }
         Ok(match sampler.wait_settled() {
             Settle::Unmeasured(reason) => {
                 unmeasured = Some(reason);
-                None
+                ChunkStep::Unmeasured
             }
-            settle => {
-                unmeasured = None;
-                Some(ChunkMeasure {
-                    classified: scroll_motion::classify(&sampler.chunk_motion(), request.direction),
-                    settled: settle == Settle::Settled,
-                })
-            }
+            settle => ChunkStep::Measured(ChunkMeasure {
+                classified: scroll_motion::classify(&sampler.chunk_motion(), request.direction),
+                settled: settle == Settle::Settled,
+            }),
         })
     })?;
     let verdict = match (sampler, unmeasured) {
@@ -603,7 +642,11 @@ fn pointer_scroll(
         }
         (_, reason) => Verdict::Unmeasured(reason.unwrap_or_else(|| "no frame was captured".into())),
     };
-    Ok(PointerRun { summary, verdict })
+    Ok(PointerRun {
+        summary,
+        verdict,
+        stopped,
+    })
 }
 
 async fn background(request: Request, args: &Value) -> ToolResult {
@@ -671,6 +714,7 @@ async fn background(request: Request, args: &Value) -> ToolResult {
             total: ticks * lines,
             chunks: 1,
             verdict,
+            stopped: None,
         }
         .result(&changes),
         Ok(Err(e)) => ToolResult::error(format!("Wheel scroll failed: {e}")),
@@ -801,13 +845,17 @@ struct Report {
     total: u32,
     chunks: u32,
     verdict: Verdict,
+    /// Why the gesture stopped before its distance (the user took over, the
+    /// window was covered or moved, input failed); the measured result is
+    /// then partial.
+    stopped: Option<String>,
 }
 
-const BACKGROUND_RETRY: &str = "background wheels do not reach windows that only scroll under \
-     the real pointer — retry with delivery_mode:\"foreground\"";
-const FOREGROUND_NO_MOTION: &str = "the window was raised and uncovered at the point and the \
-     pointer primed there, so nothing under this point scrolls with a wheel — pick a point \
-     inside the scrolling content, or use a pager's own controls";
+const NO_MOTION: &str = "no displacement observed — the view may be at its end, or nothing \
+     under this point scrolls with the wheel";
+const BACKGROUND_RETRY: &str = "if it is not at its end, retry with \
+     delivery_mode:\"foreground\" (background wheels do not reach views that only scroll under \
+     the real pointer)";
 
 fn opposite(direction: ScrollDirection) -> ScrollDirection {
     match direction {
@@ -869,19 +917,33 @@ impl Report {
     }
 
     fn reason(&self) -> Option<String> {
-        match (&self.verdict, self.delivery) {
+        let base = match (&self.verdict, self.delivery) {
             (Verdict::Unmeasured(reason), _) => Some(format!("capture unavailable: {reason}")),
             (Verdict::Measured(c), ScrollDelivery::Background) if c.kind == OutcomeKind::NoMotion => {
-                Some(BACKGROUND_RETRY.to_owned())
+                Some(format!("{NO_MOTION}; {BACKGROUND_RETRY}"))
             }
             (Verdict::Measured(c), ScrollDelivery::Foreground) if c.kind == OutcomeKind::NoMotion => {
-                Some(FOREGROUND_NO_MOTION.to_owned())
+                Some(NO_MOTION.to_owned())
             }
             _ => None,
+        };
+        match (base, &self.stopped) {
+            (Some(base), Some(stop)) => Some(format!("{base}; stopped early: {stop}")),
+            (None, Some(stop)) => Some(format!("stopped early: {stop}")),
+            (base, None) => base,
         }
     }
 
     fn text(&self) -> String {
+        let stop = self
+            .stopped
+            .as_ref()
+            .map(|stop| format!(" Stopped early: {stop}."))
+            .unwrap_or_default();
+        format!("{}{stop}", self.verdict_text())
+    }
+
+    fn verdict_text(&self) -> String {
         let direction = self.direction.as_str();
         let at = self.at();
         let wheel = self.wheel();
@@ -925,13 +987,11 @@ impl Report {
                 }
                 OutcomeKind::NoMotion => match self.delivery {
                     ScrollDelivery::Background => format!(
-                        "✗ No motion at {at}: the view did not move ({wheel}); \
-                         {BACKGROUND_RETRY}."
+                        "✗ No motion at {at}: {NO_MOTION} ({wheel}); {BACKGROUND_RETRY}."
                     ),
-                    ScrollDelivery::Foreground => format!(
-                        "✗ No motion at {at}: the view under the pointer did not scroll \
-                         ({requested}{wheel}); {FOREGROUND_NO_MOTION}."
-                    ),
+                    ScrollDelivery::Foreground => {
+                        format!("✗ No motion at {at}: {NO_MOTION} ({requested}{wheel}).")
+                    }
                 },
                 OutcomeKind::ChangedInPlace => format!(
                     "? Changed in place at {at}: pixels changed but nothing shifted (a pager, \
@@ -1131,6 +1191,7 @@ mod tests {
             across: 0,
             confidence: matches!(kind, OutcomeKind::Moved | OutcomeKind::AtEnd).then_some(0.934),
             bounced,
+            ambiguous: false,
         })
     }
 
@@ -1145,6 +1206,7 @@ mod tests {
             total: 300,
             chunks: 2,
             verdict,
+            stopped: None,
         }
     }
 
@@ -1159,6 +1221,7 @@ mod tests {
             total: 3,
             chunks: 1,
             verdict,
+            stopped: None,
         }
     }
 
@@ -1198,7 +1261,8 @@ mod tests {
         let report = background(classified(OutcomeKind::NoMotion, 0, false));
         let text = report.text();
         assert!(text.starts_with("✗ No motion at (163, 400)"), "{text}");
-        assert!(text.contains("retry with delivery_mode:\"foreground\""), "{text}");
+        assert!(text.contains("the view may be at its end"), "{text}");
+        assert!(text.contains("if it is not at its end, retry with delivery_mode:\"foreground\""), "{text}");
         assert!(text.contains("background line wheel, 3 ticks = 3 lines"), "{text}");
         assert!(!text.contains("pixel"), "{text}");
         let structured = report.structured();
@@ -1246,5 +1310,60 @@ mod tests {
         let report = foreground(classified(OutcomeKind::Moved, -80, false));
         assert!(report.text().starts_with("? Moved the other way: the view scrolled up 80 pt"));
         assert_eq!(report.structured()["effect"], "unverifiable");
+    }
+
+    /// Live on TextEdit (700 pt window): `by:"page"` asked for 1603 pt
+    /// because the scroll area's frame ran past the window. A page is 0.8 of
+    /// what is visible.
+    #[test]
+    fn a_page_is_sized_from_the_scroll_area_clipped_to_the_window() {
+        let window = WindowBounds {
+            x: 100.0,
+            y: 50.0,
+            width: 600.0,
+            height: 700.0,
+        };
+        let (area, visible) = visible_area(Some([100.0, 78.0, 600.0, 2004.0]), &window);
+        assert_eq!(area, Some([0.0, 28.0, 600.0, 672.0]));
+        assert_eq!(visible, 672.0);
+        assert_eq!(visible_area(None, &window), (None, 700.0));
+        assert_eq!(visible_area(Some([900.0, 0.0, 50.0, 50.0]), &window), (None, 700.0));
+    }
+
+    #[test]
+    fn the_primer_approaches_an_edge_point_from_inside_the_window() {
+        let window = WindowBounds {
+            x: 716.0,
+            y: 193.0,
+            width: 326.0,
+            height: 720.0,
+        };
+        assert_eq!(toward_interior((717.0, 900.0), &window), (1.0, -1.0));
+        assert_eq!(toward_interior((1040.0, 200.0), &window), (-1.0, 1.0));
+    }
+
+    /// Reviewer M4: a view at its end holds still exactly like one that does
+    /// not take wheels, so the reply names both possibilities.
+    #[test]
+    fn foreground_no_motion_does_not_assert_a_cause() {
+        let report = foreground(classified(OutcomeKind::NoMotion, 0, false));
+        let text = report.text();
+        assert!(text.contains("no displacement observed"), "{text}");
+        assert!(text.contains("may be at its end"), "{text}");
+        assert!(!text.contains("so nothing under this point"), "{text}");
+        assert_eq!(report.structured()["scroll"]["reason"], NO_MOTION);
+    }
+
+    #[test]
+    fn a_stopped_gesture_reports_its_partial_distance_and_why() {
+        let mut report = foreground(classified(OutcomeKind::Moved, 120, false));
+        report.stopped = Some("the pointer moved to (10, 10) during the scroll; the user has it".into());
+        let text = report.text();
+        assert!(text.starts_with("✓ Scrolled down 120 pt"), "{text}");
+        assert!(text.ends_with("Stopped early: the pointer moved to (10, 10) during the scroll; the user has it."));
+        assert!(report.structured()["scroll"]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("stopped early:"));
     }
 }

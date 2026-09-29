@@ -87,23 +87,56 @@ pub enum Settle {
     Unmeasured(String),
 }
 
+/// Timing and health of the sample stream; registration lives behind its own
+/// lock so posting input never waits on it.
 struct State {
-    tracker: MotionTracker,
     stop: bool,
     last_event: Instant,
     last_change: Instant,
+    /// Successful frames captured since the last event.
     frames_since_event: usize,
-    error: Option<String>,
+    /// Successful frames captured since the sampler started.
+    frames: usize,
+    /// A capture failed after the first frame: the stream has a gap, so
+    /// nothing after it can be judged settled.
+    failure: Option<String>,
+}
+
+/// The settle decision over a snapshot of [`State`]; `None` = keep waiting.
+fn settle_decision(state: &State, now: Instant) -> Option<Settle> {
+    if let Some(failure) = &state.failure {
+        return Some(Settle::Unmeasured(format!("capture failed during the scroll: {failure}")));
+    }
+    let since_event = now.duration_since(state.last_event);
+    if state.frames_since_event > 0
+        && since_event >= SETTLE_AFTER_EVENT
+        && now.duration_since(state.last_change) >= SETTLE_QUIET
+    {
+        return Some(Settle::Settled);
+    }
+    if since_event >= SETTLE_CAP {
+        return Some(if state.frames_since_event > 0 {
+            Settle::Capped
+        } else {
+            Settle::Unmeasured("no frame arrived after the scroll".into())
+        });
+    }
+    None
 }
 
 struct Shared {
     state: Mutex<State>,
+    tracker: Mutex<MotionTracker>,
     wake: Condvar,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn tracker(&self) -> MutexGuard<'_, MotionTracker> {
+        self.tracker.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
@@ -113,23 +146,29 @@ pub struct FrameSampler {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Frames sampled before the first event, to tell whether the content was
+/// already moving.
+const BASELINE_FRAMES: usize = 2;
+
 impl FrameSampler {
-    /// Capture the first frame now and keep sampling until [`Self::finish`].
-    /// `area` is the scroll area in window points (`[x, y, w, h]`), when
-    /// accessibility exposes one.
+    /// Capture the first frame now, sample [`BASELINE_FRAMES`] more before
+    /// returning (so content already moving is known before any input), and
+    /// keep sampling until [`Self::finish`]. `area` is the region to register
+    /// on in window points (`[x, y, w, h]`).
     pub fn start(window_id: u32, area: Option<[f64; 4]>) -> Result<Self, String> {
         let first = capture_gray(window_id)?;
         let region = Region::within(first.width, first.height, area);
         let now = Instant::now();
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                tracker: MotionTracker::new(first, region),
                 stop: false,
                 last_event: now,
                 last_change: now,
                 frames_since_event: 0,
-                error: None,
+                frames: 0,
+                failure: None,
             }),
+            tracker: Mutex::new(MotionTracker::new(first, region)),
             wake: Condvar::new(),
         });
         let worker_shared = Arc::clone(&shared);
@@ -137,10 +176,30 @@ impl FrameSampler {
             .name("cua-scroll-sampler".into())
             .spawn(move || sample(window_id, &worker_shared))
             .map_err(|error| format!("sampler thread failed to start: {error}"))?;
-        Ok(Self {
+        let sampler = Self {
             shared,
             worker: Some(worker),
-        })
+        };
+        let deadline = Instant::now() + FRAME_INTERVAL * 8;
+        let mut state = sampler.shared.lock();
+        while state.frames < BASELINE_FRAMES && state.failure.is_none() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            state = sampler
+                .shared
+                .wake
+                .wait_timeout(state, Duration::from_millis(20))
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|poison| poison.into_inner().0);
+        }
+        let failure = state.failure.clone();
+        drop(state);
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        sampler.shared.tracker().begin_gesture();
+        Ok(sampler)
     }
 
     /// Record that an input event was just posted.
@@ -152,32 +211,20 @@ impl FrameSampler {
 
     /// Start measuring a new chunk from the latest frame.
     pub fn begin_chunk(&self) {
-        self.shared.lock().tracker.begin_chunk();
+        self.shared.tracker().begin_chunk();
     }
 
-    /// Block until the view settles after the last [`Self::mark_event`].
+    /// Block until the view settles after the last [`Self::mark_event`]: a
+    /// fresh successful frame after it, then quiet. A capture failure at any
+    /// point after the first frame, or a cancelled operation, is unmeasured.
     pub fn wait_settled(&self) -> Settle {
         let mut state = self.shared.lock();
         loop {
-            let now = Instant::now();
-            let since_event = now.duration_since(state.last_event);
-            if state.frames_since_event > 0
-                && since_event >= SETTLE_AFTER_EVENT
-                && now.duration_since(state.last_change) >= SETTLE_QUIET
-            {
-                return Settle::Settled;
+            if cua_driver_core::operation::check().is_err() {
+                return Settle::Unmeasured("the operation was cancelled".into());
             }
-            if since_event >= SETTLE_CAP {
-                return if state.frames_since_event > 0 {
-                    Settle::Capped
-                } else {
-                    Settle::Unmeasured(
-                        state
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "no frame arrived after the scroll".into()),
-                    )
-                };
+            if let Some(settle) = settle_decision(&state, Instant::now()) {
+                return settle;
             }
             state = self
                 .shared
@@ -190,13 +237,13 @@ impl FrameSampler {
 
     /// Motion since the last [`Self::begin_chunk`].
     pub fn chunk_motion(&self) -> Motion {
-        self.shared.lock().tracker.chunk_motion()
+        self.shared.tracker().chunk_motion()
     }
 
     /// Stop sampling and return the motion over the whole call.
     pub fn finish(mut self) -> Motion {
         self.stop();
-        self.shared.lock().tracker.call_motion()
+        self.shared.tracker().call_motion()
     }
 
     fn stop(&mut self) {
@@ -219,22 +266,62 @@ fn sample(window_id: u32, shared: &Shared) {
         if shared.lock().stop {
             return;
         }
-        let frame = capture_gray(window_id);
-        {
-            let mut state = shared.lock();
-            match frame {
-                Ok(frame) => {
-                    if state.tracker.push(frame) {
-                        state.last_change = Instant::now();
-                    }
-                    state.frames_since_event += 1;
+        match capture_gray(window_id) {
+            Ok(frame) => {
+                let changed = shared.tracker().push(frame);
+                let mut state = shared.lock();
+                if changed {
+                    state.last_change = Instant::now();
                 }
-                Err(error) => state.error = Some(error),
+                state.frames_since_event += 1;
+                state.frames += 1;
+            }
+            Err(error) => {
+                shared.lock().failure.get_or_insert(error);
             }
         }
         shared.wake.notify_all();
         if let Some(rest) = FRAME_INTERVAL.checked_sub(started.elapsed()) {
             std::thread::sleep(rest);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(frames_since_event: usize, event_ms: u64, change_ms: u64) -> (State, Instant) {
+        let now = Instant::now();
+        let state = State {
+            stop: false,
+            last_event: now - Duration::from_millis(event_ms),
+            last_change: now - Duration::from_millis(change_ms),
+            frames_since_event,
+            frames: 5,
+            failure: None,
+        };
+        (state, now)
+    }
+
+    /// Skeptic R4: frames that stopped arriving after the event used to read
+    /// as a quiet, settled view (a measured no-motion or move).
+    #[test]
+    fn a_capture_failure_after_the_baseline_is_unmeasured_not_settled() {
+        let (mut failed, now) = state(3, 900, 900);
+        failed.failure = Some("window 7 returned no image".into());
+        assert!(matches!(settle_decision(&failed, now), Some(Settle::Unmeasured(_))));
+    }
+
+    #[test]
+    fn settling_needs_a_fresh_frame_after_the_event_then_quiet() {
+        let (stale, now) = state(0, 400, 900);
+        assert_eq!(settle_decision(&stale, now), None, "no frame since the event yet");
+        let (fresh, now) = state(2, 400, 350);
+        assert_eq!(settle_decision(&fresh, now), Some(Settle::Settled));
+        let (busy, now) = state(9, 400, 10);
+        assert_eq!(settle_decision(&busy, now), None);
+        let (capped, now) = state(9, 1300, 10);
+        assert_eq!(settle_decision(&capped, now), Some(Settle::Capped));
     }
 }
