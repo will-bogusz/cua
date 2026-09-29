@@ -326,12 +326,19 @@ pub fn register(
     });
     candidates.truncate(REFINE_CANDIDATES);
 
+    // A scroll moves the content and leaves fixed chrome (a status bar, a
+    // tab bar, a margin) where it was. Under a video or compressed stream
+    // those fixed rows still differ by noise from frame to frame, so they
+    // count as changed — and compared against a shifted row they leave a
+    // large residual that is not the scroll's failure. Each row is explained
+    // by whichever fits better: the shift, or staying put.
     let pixel_residual = |shift: i32| -> Option<f32> {
         let mut sum = 0f32;
         let mut count = 0usize;
         for r in pairs(shift) {
             let source = (r as i32 + shift) as usize;
-            sum += row_diff(earlier, region.y0 + source, later, region.y0 + r, region);
+            let shifted = row_diff(earlier, region.y0 + source, later, region.y0 + r, region);
+            sum += shifted.min(still_diffs[r]);
             count += 1;
         }
         (count >= min_pairs).then(|| sum / count as f32 * changed_rows as f32 / rows as f32)
@@ -750,11 +757,30 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     if bounced && !motion.baseline_moving {
         return verdict(OutcomeKind::AtEnd, travel, step_confidence, false, true);
     }
+    // Two independent registrations agreeing: the tracked frame-to-frame
+    // travel (one direction, on the requested axis only) and a first-vs-last
+    // shift at that travel that explains most of the change. A noisy stream
+    // (video, compression, bursty frame delivery) keeps the residual above
+    // the strict rigid ratio and can drop a pair, but a pager or navigation
+    // never produces this agreement.
+    let monotonic = !steps.is_empty()
+        && motion.series.iter().all(|s| s.axis == axis)
+        && steps.iter().all(|s| s.shift.signum() == travel.signum() && !s.ambiguous);
+    if travel != 0
+        && monotonic
+        && !motion.baseline_moving
+        && (net.shift - travel).abs() <= TRACKED_AGREEMENT_PT
+        && net.is_rigid(PAIR_RIGID_RATIO)
+    {
+        return verdict(OutcomeKind::Moved, net.shift, Some(net.confidence()), false, false);
+    }
     // Tracked but not registered first-vs-last: accept a clean tracked
     // travel when the first and last frames share too little of the band for
-    // one comparison to be reliable.
+    // one comparison to be reliable, or so little that the shift at the
+    // travel cannot be scored at all.
     let band = overlap + MIN_OVERLAP_ROWS;
-    let little_overlap = f64::from(band - travel.abs()) < NET_RELIABLE_OVERLAP * f64::from(band);
+    let little_overlap = f64::from(band - travel.abs()) < NET_RELIABLE_OVERLAP * f64::from(band)
+        || at_travel.shift != travel;
     if travel != 0 && clean_steps && little_overlap {
         return verdict(OutcomeKind::Moved, travel, step_confidence, false, true);
     }
@@ -1589,6 +1615,42 @@ mod tests {
             overlap_h: 600,
         };
         assert_eq!(classify(&motion, ScrollDirection::Down).along, 246);
+    }
+
+    /// Live on iPhone Mirroring: every foreground scroll that moved read
+    /// "changed in place". The mirror is a compressed video: every pixel,
+    /// fixed chrome and black margin included, differs a little from frame
+    /// to frame, and the stream arrives in bursts. Chrome rows compared
+    /// against shifted rows kept the residual above the rigid ratio, and the
+    /// tracked travel was refused because first and last frames still shared
+    /// part of the band.
+    #[test]
+    fn a_bursty_move_through_codec_noise_and_fixed_chrome_is_moved() {
+        let noisy = |offset: i64, seed: u64| {
+            let mut f = frame(offset);
+            for (i, p) in f.pixels.iter_mut().enumerate() {
+                let mut v = (i as u64 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                v ^= v >> 31;
+                let n = (v % 9) as i16 - 4;
+                *p = (i16::from(*p) + n).clamp(0, 255) as u8;
+            }
+            // A black margin down both sides, as around a mirrored phone.
+            for y in 0..H {
+                for x in (0..10).chain(W - 10..W) {
+                    f.pixels[y * W + x] = (seed as u8) & 3;
+                }
+            }
+            f
+        };
+        for offsets in [[0i64, 12, 81, 93], [0, 13, 92, 230]] {
+            let frames = offsets.iter().enumerate().map(|(i, o)| noisy(*o, i as u64 + 1));
+            let verdict = classify(&track(frames).call_motion(), ScrollDirection::Down);
+            assert_eq!(
+                (verdict.kind, verdict.along),
+                (OutcomeKind::Moved, offsets[3] as i32),
+                "{offsets:?}"
+            );
+        }
     }
 
     /// Audit: a clean move followed by one navigation frame (unrelated
