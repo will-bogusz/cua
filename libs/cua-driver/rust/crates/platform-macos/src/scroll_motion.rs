@@ -71,6 +71,9 @@ const CLEAN_STEP_CONFIDENCE: f64 = 0.6;
 /// A net registration further than this from a clean tracked travel yields
 /// to the travel.
 const TRACKED_AGREEMENT_PT: i32 = 5;
+/// The residual at the tracked travel counts as competitive with the net's
+/// best within this factor.
+const TRAVEL_RESIDUAL_FACTOR: f32 = 1.3;
 
 /// One captured window frame: 8-bit gray, row-major, one pixel per point.
 #[derive(Clone, PartialEq, Eq)]
@@ -383,6 +386,8 @@ pub struct Step {
     pub axis: Axis,
     pub shift: i32,
     pub confidence: f64,
+    /// A repeated-row alias competed with this step's shift.
+    pub ambiguous: bool,
 }
 
 /// Frame-to-frame tracking state for one scroll call, fed by the sampler.
@@ -421,6 +426,11 @@ pub struct Motion {
     pub series: Vec<Step>,
     pub net_v: Registration,
     pub net_h: Registration,
+    /// The first-vs-last registration scored at exactly the tracked travel on
+    /// the vertical / horizontal axis (shift 0 when that shift cannot be
+    /// scored: too little overlap).
+    pub at_travel_v: Registration,
+    pub at_travel_h: Registration,
     /// The window's frame changed size between the two frames, so no shift
     /// between them can be registered.
     pub reshaped: bool,
@@ -495,6 +505,7 @@ impl MotionTracker {
                 axis: Axis::Vertical,
                 shift: vertical.shift,
                 confidence: vertical.confidence(),
+                ambiguous: vertical.ambiguous,
             });
         } else if vertical.diff > PAIR_FLOOR {
             let horizontal = register(
@@ -511,6 +522,7 @@ impl MotionTracker {
                     axis: Axis::Horizontal,
                     shift: horizontal.shift,
                     confidence: horizontal.confidence(),
+                    ambiguous: horizontal.ambiguous,
                 });
             } else if vertical.diff >= NO_MOTION_DIFF {
                 // A change above the no-motion floor that no shift explains:
@@ -575,12 +587,23 @@ impl MotionTracker {
             travel_h + NET_WINDOW_PT,
             travel_h,
         );
+        let at_travel_v = register(start, &self.prev, &self.region, travel_v, travel_v, travel_v);
+        let at_travel_h = register(
+            &start.transposed(),
+            &self.prev.transposed(),
+            &self.region.transposed(),
+            travel_h,
+            travel_h,
+            travel_h,
+        );
         Motion {
             travel_v,
             travel_h,
             series: series.to_vec(),
             net_v,
             net_h,
+            at_travel_v,
+            at_travel_h,
             reshaped: start.width != self.prev.width || start.height != self.prev.height,
             non_rigid_pairs,
             baseline_moving: self.baseline_moving,
@@ -633,9 +656,23 @@ fn axis_of(direction: ScrollDirection) -> (Axis, i32) {
 /// Classify `motion` for a scroll in `direction`.
 pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     let (axis, sign) = axis_of(direction);
-    let (net, travel, net_across, travel_across, overlap) = match axis {
-        Axis::Vertical => (motion.net_v, motion.travel_v, motion.net_h, motion.travel_h, motion.overlap_v),
-        Axis::Horizontal => (motion.net_h, motion.travel_h, motion.net_v, motion.travel_v, motion.overlap_h),
+    let (net, travel, net_across, travel_across, overlap, at_travel) = match axis {
+        Axis::Vertical => (
+            motion.net_v,
+            motion.travel_v,
+            motion.net_h,
+            motion.travel_h,
+            motion.overlap_v,
+            motion.at_travel_v,
+        ),
+        Axis::Horizontal => (
+            motion.net_h,
+            motion.travel_h,
+            motion.net_v,
+            motion.travel_v,
+            motion.overlap_h,
+            motion.at_travel_h,
+        ),
     };
     let steps: Vec<&Step> = motion.series.iter().filter(|s| s.axis == axis).collect();
     let bounced = steps.iter().any(|s| s.shift >= REVERSAL_MIN_PT)
@@ -666,12 +703,18 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     if diff < NO_MOTION_DIFF && motion.series.is_empty() {
         return verdict(OutcomeKind::NoMotion, 0, None, false, true);
     }
-    // A clean tracked series: every changed pair a confident rigid shift the
-    // same way, and nothing moving before the first event.
+    // A clean tracked series: every changed pair a confident, unambiguous
+    // rigid shift the same way on the requested axis only, and nothing
+    // moving before the first event.
     let clean_steps = !steps.is_empty()
         && !motion.baseline_moving
         && motion.non_rigid_pairs == 0
-        && steps.iter().all(|s| s.shift.signum() == travel.signum() && s.confidence >= CLEAN_STEP_CONFIDENCE);
+        && motion.series.iter().all(|s| s.axis == axis)
+        && steps.iter().all(|s| {
+            s.shift.signum() == travel.signum()
+                && s.confidence >= CLEAN_STEP_CONFIDENCE
+                && !s.ambiguous
+        });
     // Content that was already moving must agree with the tracked travel
     // before its shift is credited to the scroll.
     let attributable = !motion.baseline_moving || (net.shift - travel).abs() <= 8;
@@ -682,9 +725,18 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
             OutcomeKind::Moved
         };
         // Over repeated rows the first-vs-last search can settle on an alias
-        // a few line pitches from the travel every frame pair registered;
-        // a clean tracked series is the better witness then.
-        if clean_steps && !bounced && (net.shift - travel).abs() > TRACKED_AGREEMENT_PT {
+        // a few line pitches from the travel every frame pair registered.
+        // The tracked travel wins only where the net cannot be trusted over
+        // it: the shift at the travel is beyond what first and last frames
+        // can score, or scores about as well as the alias the net picked.
+        let travel_unscorable = at_travel.shift != travel;
+        let travel_competitive =
+            at_travel.residual <= net.residual * TRAVEL_RESIDUAL_FACTOR + 0.05 * net.diff;
+        if clean_steps
+            && !bounced
+            && (net.shift - travel).abs() > TRACKED_AGREEMENT_PT
+            && (travel_unscorable || travel_competitive)
+        {
             return verdict(kind, travel, step_confidence, false, true);
         }
         return verdict(
@@ -1456,18 +1508,23 @@ mod tests {
             axis: Axis::Vertical,
             shift,
             confidence: 0.97,
+            ambiguous: false,
+        };
+        let net = Registration {
+            shift: 495,
+            residual: 0.5,
+            diff: 20.0,
+            ambiguous: false,
         };
         let motion = Motion {
             travel_v: 534,
             travel_h: 0,
             series: vec![step(200), step(200), step(134)],
-            net_v: Registration {
-                shift: 495,
-                residual: 0.5,
-                diff: 20.0,
-                ambiguous: false,
-            },
+            net_v: net,
             net_h: Registration::still(20.0),
+            // 534 is past the overlap first and last frames can score.
+            at_travel_v: Registration::still(20.0),
+            at_travel_h: Registration::still(20.0),
             reshaped: false,
             non_rigid_pairs: 0,
             baseline_moving: false,
@@ -1478,13 +1535,60 @@ mod tests {
         assert_eq!((verdict.kind, verdict.along), (OutcomeKind::Moved, 534));
         assert!(verdict.uncalibrated);
 
-        // One pair that did not register rigidly withdraws the tracked
-        // travel's standing; the net registration stands.
+        // One pair that did not register rigidly, an aliased step, or a step
+        // on the other axis withdraws the tracked travel's standing.
         let dirty = Motion {
             non_rigid_pairs: 1,
-            ..motion
+            ..motion.clone()
         };
         assert_eq!(classify(&dirty, ScrollDirection::Down).along, 495);
+        let mut aliased = motion.clone();
+        aliased.series[1].ambiguous = true;
+        assert_eq!(classify(&aliased, ScrollDirection::Down).along, 495);
+        let mut sideways = motion.clone();
+        sideways.series.push(Step {
+            axis: Axis::Horizontal,
+            ..step(20)
+        });
+        assert_eq!(classify(&sideways, ScrollDirection::Down).along, 495);
+    }
+
+    /// Audit M2: per-frame steps that each round the same way drift from the
+    /// truth; where the net scores the travel clearly worse than its own
+    /// shift, the net stands.
+    #[test]
+    fn a_drifted_tracked_sum_yields_to_a_clearly_better_net() {
+        let step = |shift| Step {
+            axis: Axis::Vertical,
+            shift,
+            confidence: 0.97,
+            ambiguous: false,
+        };
+        let motion = Motion {
+            travel_v: 240,
+            travel_h: 0,
+            series: (0..20).map(|_| step(12)).collect(),
+            net_v: Registration {
+                shift: 246,
+                residual: 0.1,
+                diff: 20.0,
+                ambiguous: false,
+            },
+            net_h: Registration::still(20.0),
+            at_travel_v: Registration {
+                shift: 240,
+                residual: 6.0,
+                diff: 20.0,
+                ambiguous: false,
+            },
+            at_travel_h: Registration::still(20.0),
+            reshaped: false,
+            non_rigid_pairs: 0,
+            baseline_moving: false,
+            overlap_v: 632,
+            overlap_h: 600,
+        };
+        assert_eq!(classify(&motion, ScrollDirection::Down).along, 246);
     }
 
     /// Audit: a clean move followed by one navigation frame (unrelated

@@ -597,6 +597,7 @@ impl ScrollTool {
             chunks: run.summary.chunks,
             verdict: run.verdict,
             stopped: run.stopped,
+            from_accessibility: run.from_accessibility,
         };
         report.result(&changes)
     }
@@ -608,6 +609,9 @@ struct PointerRun {
     /// Why the gesture stopped before its distance, when something other
     /// than the view did.
     stopped: Option<String>,
+    /// The distance comes from the accessibility scroll position because the
+    /// window's pixels did not show the move.
+    from_accessibility: bool,
 }
 
 /// Inside the raised envelope: prime the pointer, then scroll `requested_pt`
@@ -623,8 +627,9 @@ fn pointer_scroll(
 ) -> anyhow::Result<PointerRun> {
     let (x, y) = request.point.screen;
     let mut stopped: Option<String> = None;
-    let sampler = FrameSampler::start(request.wid, area);
-    let mut unmeasured = sampler.as_ref().err().cloned();
+    // Prime before the sampler's baseline, so the redraw a pointer arriving
+    // causes (hover styling) settles before the first frame the gesture is
+    // measured against.
     let primed = match envelope.check() {
         Ok(()) => {
             crate::input::mouse::prime_pointer_at(x, y, toward_interior((x, y), envelope.bounds()))
@@ -635,6 +640,11 @@ fn pointer_scroll(
         }
     };
     primed?;
+    let sampler = FrameSampler::start(request.wid, area);
+    let mut unmeasured = sampler.as_ref().err().cloned();
+    let position = || scroll_position(request.pid, x, y);
+    let start_position = position();
+    let mut from_accessibility = false;
     let summary = scroll_motion::drive_chunks(requested_pt, k0, max_chunk_pt, |px| {
         let halted = |stop: &mut Option<String>, reason: String| {
             *stop = Some(reason);
@@ -655,6 +665,7 @@ fn pointer_scroll(
         if let Ok(sampler) = &sampler {
             sampler.begin_chunk();
         }
+        let chunk_position = position();
         let mut posted = 0usize;
         let mut takeover: Option<String> = None;
         let burst = crate::input::mouse::pixel_wheel_burst(
@@ -697,10 +708,20 @@ fn pointer_scroll(
                     unmeasured = Some(reason);
                     ChunkStep::Unmeasured
                 }
-                settle => ChunkStep::Measured(ChunkMeasure {
-                    classified: scroll_motion::classify(&sampler.chunk_motion(), request.direction),
-                    settled: settle == Settle::Settled,
-                }),
+                settle => {
+                    let mut classified =
+                        scroll_motion::classify(&sampler.chunk_motion(), request.direction);
+                    if let Some(moved) = position_moved(request.direction, chunk_position, position())
+                        .filter(|_| classified.kind == OutcomeKind::NoMotion)
+                    {
+                        classified = moved;
+                        from_accessibility = true;
+                    }
+                    ChunkStep::Measured(ChunkMeasure {
+                        classified,
+                        settled: settle == Settle::Settled,
+                    })
+                }
             },
         };
         Ok(ChunkRun {
@@ -716,6 +737,14 @@ fn pointer_scroll(
     let verdict = match (sampler, unmeasured) {
         (Ok(sampler), None) => {
             let mut classified = scroll_motion::classify(&sampler.finish(), request.direction);
+            match position_moved(request.direction, start_position, position()) {
+                Some(moved) if classified.kind == OutcomeKind::NoMotion => {
+                    classified = moved;
+                    from_accessibility = true;
+                }
+                _ if classified.kind != OutcomeKind::NoMotion => from_accessibility = false,
+                _ => {}
+            }
             if classified.kind == OutcomeKind::Moved
                 && summary.stalled
                 && f64::from(classified.along) < 0.8 * requested_pt
@@ -730,6 +759,60 @@ fn pointer_scroll(
         summary,
         verdict,
         stopped,
+        from_accessibility,
+    })
+}
+
+/// The on-screen origin of the document inside the scroll area under a
+/// point: the child of the nearest `AXScrollArea` on the hit-tested path.
+/// It moves exactly as far as the content scrolls. `None` when accessibility
+/// exposes no scroll area there (a pixel-only surface).
+fn scroll_position(pid: i32, x: f64, y: f64) -> Option<(f64, f64)> {
+    let _budget = crate::ax::budget::WalkBudget::new(std::time::Duration::from_millis(300));
+    unsafe {
+        let mut element = element_at_screen_position(pid, x, y)?;
+        for _ in 0..32 {
+            let Some(parent) = copy_element_attr(element, "AXParent") else {
+                CFRelease(element as CFTypeRef);
+                return None;
+            };
+            if copy_string_attr(parent, "AXRole").as_deref() == Some("AXScrollArea") {
+                let rect = element_screen_rect(element);
+                CFRelease(element as CFTypeRef);
+                CFRelease(parent as CFTypeRef);
+                return rect.map(|[x, y, _, _]| (x, y));
+            }
+            CFRelease(element as CFTypeRef);
+            element = parent;
+        }
+        CFRelease(element as CFTypeRef);
+        None
+    }
+}
+
+/// A move the accessibility scroll position shows (at least 1 pt the way
+/// asked) when the window's pixels did not: some windows do not paint the
+/// scrolled view into what captures see.
+fn position_moved(
+    direction: ScrollDirection,
+    before: Option<(f64, f64)>,
+    after: Option<(f64, f64)>,
+) -> Option<Classified> {
+    let ((bx, by), (ax, ay)) = (before?, after?);
+    let along = match direction {
+        ScrollDirection::Down => by - ay,
+        ScrollDirection::Up => ay - by,
+        ScrollDirection::Right => bx - ax,
+        ScrollDirection::Left => ax - bx,
+    };
+    (along >= 1.0).then(|| Classified {
+        kind: OutcomeKind::Moved,
+        along: along.round() as i32,
+        across: 0,
+        confidence: None,
+        bounced: false,
+        ambiguous: false,
+        uncalibrated: true,
     })
 }
 
@@ -799,6 +882,7 @@ async fn background(request: Request, args: &Value) -> ToolResult {
             chunks: 1,
             verdict,
             stopped: None,
+            from_accessibility: false,
         }
         .result(&changes),
         Ok(Err(e)) => ToolResult::error(format!("Wheel scroll failed: {e}")),
@@ -974,6 +1058,9 @@ struct Report {
     /// window was covered or moved, input failed); the measured result is
     /// then partial.
     stopped: Option<String>,
+    /// The distance was read from the accessibility scroll position; the
+    /// window's pixels did not show the move, so it is not frame evidence.
+    from_accessibility: bool,
 }
 
 const NO_MOTION: &str = "no displacement observed — the view may be at its end, or nothing \
@@ -1006,6 +1093,9 @@ impl Report {
 
     /// The scroll reached its postcondition: the content moved the way asked.
     fn confirmed(&self) -> bool {
+        if self.from_accessibility {
+            return false;
+        }
         match &self.verdict {
             Verdict::Measured(c) => match c.kind {
                 OutcomeKind::Moved => c.along > 0,
@@ -1065,7 +1155,13 @@ impl Report {
             .as_ref()
             .map(|stop| format!(" Stopped early: {stop}."))
             .unwrap_or_default();
-        format!("{}{stop}", self.verdict_text())
+        let witness = if self.from_accessibility {
+            " Measured from the accessibility scroll position: the window's pixels did not show \
+             the move."
+        } else {
+            ""
+        };
+        format!("{}{witness}{stop}", self.verdict_text())
     }
 
     fn verdict_text(&self) -> String {
@@ -1333,6 +1429,7 @@ mod tests {
             chunks: 2,
             verdict,
             stopped: None,
+            from_accessibility: false,
         }
     }
 
@@ -1348,6 +1445,7 @@ mod tests {
             chunks: 1,
             verdict,
             stopped: None,
+            from_accessibility: false,
         }
     }
 
@@ -1472,6 +1570,25 @@ mod tests {
         assert_eq!(visible_centre(text_view, Some(scroller), &window), Some((250.0, 160.0)));
         assert_eq!(visible_centre(text_view, None, &window), Some((250.0, 400.0)));
         assert_eq!(visible_centre([700.0, 0.0, 50.0, 50.0], None, &window), None);
+    }
+
+    /// AppKit harness (VM and local): the 120 pt scroller moved 72 pt
+    /// (`scroll_offset=72`) while the captured pixels of that window never
+    /// changed, and the reply said "No motion". The document's AX origin
+    /// moving up is the witness then, reported as such and never confirmed.
+    #[test]
+    fn a_scroll_the_pixels_miss_is_measured_from_the_document_position() {
+        let moved = position_moved(ScrollDirection::Down, Some((535.0, 572.0)), Some((535.0, 500.0)))
+            .unwrap();
+        assert_eq!((moved.kind, moved.along), (OutcomeKind::Moved, 72));
+        assert!(position_moved(ScrollDirection::Up, Some((535.0, 572.0)), Some((535.0, 500.0))).is_none());
+        assert!(position_moved(ScrollDirection::Down, None, Some((535.0, 500.0))).is_none());
+
+        let mut report = foreground(Verdict::Measured(moved));
+        report.from_accessibility = true;
+        assert!(report.text().contains("accessibility scroll position"));
+        assert_eq!(report.structured()["effect"], "unverifiable");
+        assert_eq!(report.structured()["scroll"]["outcome"], "moved");
     }
 
     #[test]
