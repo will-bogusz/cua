@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-use crate::{CaptureScope, EscalationReason, Platform};
+use crate::{CaptureScope, EscalationReason, Platform, ScrollDirection};
 use schemars::{generate::SchemaSettings, JsonSchema};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -535,13 +535,17 @@ pub struct ActionDelivery {
 /// `window_change`: the platform's post-dispatch probe saw the target react.
 /// The kind keeps its 0.8 name; which signal moved is `ActionEvidence.signal`,
 /// so a row without one is the 0.8 window poll and a row with one says exactly
-/// what was watched. (Variant docs are deliberately absent: they would turn
-/// the generated schema from the 0.8 `enum` into a `oneOf`.)
+/// what was watched. `frame_motion`: window frames captured while the action
+/// ran registered the content shifting rigidly the way the action asked — the
+/// postcondition of a scroll, not a reaction to it (see
+/// [`ActionResult::scroll`]). (Variant docs are deliberately absent: they
+/// would turn the generated schema from the 0.8 `enum` into a `oneOf`.)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionEvidenceKind {
     ValueReadback,
     WindowChange,
+    FrameMotion,
 }
 
 /// Which post-dispatch observation a platform probe named. The coarse
@@ -719,7 +723,89 @@ pub enum CaretAnchor {
     Before(String),
 }
 
+/// Which delivery a measured scroll used: `foreground` raised the window and
+/// scrolled under the real pointer; `background` posted wheels to the process.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollDelivery {
+    Foreground,
+    Background,
+}
+
+/// The unit of the wheel events a scroll posted.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollWheelUnit {
+    Pixel,
+    Line,
+}
+
+/// What window frames showed a scroll did. `moved`: the content shifted
+/// rigidly. `at_end`: it moved (possibly not at all on net) and bounced, or
+/// stopped short of the request with the view settled. `no_motion`: the frames
+/// held still. `changed_in_place`: pixels changed without any rigid shift (a
+/// pager, sheet or navigation). `unmeasured`: no frames could be captured.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollOutcomeKind {
+    Moved,
+    AtEnd,
+    NoMotion,
+    ChangedInPlace,
+    Unmeasured,
+}
+
+/// A point in the target window's screenshot pixels — the space of the
+/// `x`/`y` a window scroll accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct ScrollPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// The wheel events a scroll posted: `events` of them, `total` pixels or
+/// lines in all.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct ScrollWheel {
+    pub unit: ScrollWheelUnit,
+    pub events: u32,
+    pub total: u32,
+}
+
+/// A window scroll's measured result.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct ScrollOutcome {
+    pub delivery: ScrollDelivery,
+    pub direction: ScrollDirection,
+    /// Where the wheel was delivered. Null when an element target's point
+    /// could not be mapped into screenshot pixels.
+    pub point: Option<ScrollPoint>,
+    /// Foreground only: the distance asked for, window points. Null for
+    /// background delivery, whose line wheels have no point distance.
+    pub requested_pt: Option<u32>,
+    pub wheel: ScrollWheel,
+    /// Measured chunks the foreground loop posted; 1 for background.
+    pub chunks: u32,
+    pub outcome: ScrollOutcomeKind,
+    /// Displacement along the requested direction, window points; positive is
+    /// the way asked. Null when unmeasured.
+    pub moved_pt: Option<i32>,
+    /// Perpendicular displacement, window points; positive is content moving
+    /// toward the top (horizontal request) or the left (vertical request).
+    /// Null when unmeasured.
+    pub across_pt: Option<i32>,
+    /// `1 - residual/difference` of the registered shift the outcome rests
+    /// on. Null when no shift was registered.
+    pub confidence: Option<f64>,
+    /// Why the outcome is unmeasured, or what to try next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionResult {
     pub effect: ActionEffect,
@@ -751,6 +837,11 @@ pub struct ActionResult {
     /// requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caret_anchor: Option<CaretAnchor>,
+    /// `scroll` only: what window frames showed the scroll did (see
+    /// [`ScrollOutcome`]). Absent for other tools and for scroll routes that
+    /// measure nothing (the accessibility scroll-bar route, desktop scope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll: Option<ScrollOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -915,6 +1006,7 @@ mod tests {
             gained_windows: None,
             caret_index: None,
             caret_anchor: None,
+            scroll: None,
         }
     }
 
@@ -993,7 +1085,8 @@ mod tests {
                 "escalation",
                 "evidence",
                 "gained_windows",
-                "route"
+                "route",
+                "scroll"
             ]
         );
         assert_eq!(
@@ -1051,7 +1144,7 @@ mod tests {
         );
         assert_eq!(
             evidence["properties"]["kind"]["enum"],
-            json!(["value_readback", "window_change"])
+            json!(["value_readback", "window_change", "frame_motion"])
         );
         assert_eq!(
             evidence["properties"]["signal"]["enum"],
@@ -1089,6 +1182,13 @@ mod tests {
                 "suspected_noop",
                 "permission_required"
             ])
+        );
+
+        let scroll = object_variant(&properties["scroll"]);
+        assert_eq!(scroll["additionalProperties"], false);
+        assert_eq!(
+            scroll["properties"]["outcome"]["enum"],
+            json!(["moved", "at_end", "no_motion", "changed_in_place", "unmeasured"])
         );
     }
 

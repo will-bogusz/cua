@@ -312,7 +312,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -414,6 +415,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -863,7 +995,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -965,6 +1098,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -2700,7 +2964,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -2802,6 +3067,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -3016,7 +3412,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -3118,6 +3515,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -3929,7 +4457,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -4031,6 +4560,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -4294,7 +4954,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -4396,6 +5057,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -4679,7 +5471,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -4781,6 +5574,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -5308,7 +6232,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -5410,6 +6335,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [
@@ -5809,7 +6865,8 @@
                 "kind": {
                   "enum": [
                     "value_readback",
-                    "window_change"
+                    "window_change",
+                    "frame_motion"
                   ],
                   "type": "string"
                 },
@@ -5911,6 +6968,137 @@
               "trusted_input"
             ],
             "type": "string"
+          },
+          "scroll": {
+            "additionalProperties": false,
+            "properties": {
+              "across_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "chunks": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "confidence": {
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "enum": [
+                  "foreground",
+                  "background"
+                ],
+                "type": "string"
+              },
+              "direction": {
+                "enum": [
+                  "up",
+                  "down",
+                  "left",
+                  "right"
+                ],
+                "type": "string"
+              },
+              "moved_pt": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "moved",
+                  "at_end",
+                  "no_motion",
+                  "changed_in_place",
+                  "unmeasured"
+                ],
+                "type": "string"
+              },
+              "point": {
+                "additionalProperties": false,
+                "properties": {
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "requested_pt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wheel": {
+                "additionalProperties": false,
+                "properties": {
+                  "events": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "pixel",
+                      "line"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "unit",
+                  "events",
+                  "total"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "delivery",
+              "direction",
+              "wheel",
+              "chunks",
+              "outcome"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
           }
         },
         "required": [

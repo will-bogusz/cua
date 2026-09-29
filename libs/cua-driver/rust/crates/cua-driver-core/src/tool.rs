@@ -1617,15 +1617,16 @@ impl ToolRegistry {
                 );
             }
         }
-        // Appeared windows and a placed caret ride in the producer's
-        // structured payload whether the producer built its record itself or
-        // left it to the legacy normalizer.
+        // Appeared windows, a placed caret and a measured scroll ride in the
+        // producer's structured payload whether the producer built its record
+        // itself or left it to the legacy normalizer.
         if let (Some(record), Some(structured)) = (
             result.action_record.as_mut(),
             result.structured_content.as_ref(),
         ) {
             record.adopt_gained_windows(structured);
             record.adopt_caret_placement(structured);
+            record.adopt_scroll_outcome(structured);
         }
         if resolved_name == "launch_app" && result.is_error != Some(true) {
             if let (Some(before), Some(pid)) = (

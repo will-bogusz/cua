@@ -71,9 +71,14 @@ and `query_hidden_rows`, and `WindowElement` gained `element_id`
 (accessibility-object continuity within one driver process — not record
 identity, never an address); `ListWindowsOutput` gained `system_windows`;
 `ActionResult` gained `gained_windows`, `caret_index` and `caret_anchor`
-(`CaretAnchor`). The typed `query` input stays a
-string: the macOS runtime also accepts an array of literals (any-of), which
-the portable schema does not promise on every platform.
+(`CaretAnchor`), and `scroll` (`ScrollOutcome`: what window frames showed a
+window scroll did — `moved`, `at_end`, `no_motion`, `changed_in_place` or
+`unmeasured`, with the distance in window points), backed by the evidence kind
+`frame_motion` when the content moved the way asked. The typed `query` input
+stays a string: the macOS runtime also accepts an array of literals (any-of),
+which the portable schema does not promise on every platform. The macOS
+window `scroll` likewise accepts `by: "points"` (up to 5000) beyond the
+portable `line` / `page`.
 
 The canonical session-owned cursor slice is shared exactly by MCP and both
 generated SDKs:

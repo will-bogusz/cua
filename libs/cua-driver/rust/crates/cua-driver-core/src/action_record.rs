@@ -196,6 +196,10 @@ pub enum EvidenceKind {
     BrowserReadback,
     ValueReadback,
     WindowChange,
+    /// Window frames registered the content shifting the way the action
+    /// asked. Unlike a screenshot comparison ("pixels changed"), this is the
+    /// scroll's postcondition, so it may back a confirmed effect.
+    FrameMotion,
     NativeApiResult,
     ScreenshotComparison,
     EventReceipt,
@@ -244,7 +248,7 @@ pub enum EscalationKind {
 }
 
 /// Complete internal accounting for one action execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ActionExecutionRecord {
     pub effect: ActionEffect,
     pub transport: ActionTransport,
@@ -266,6 +270,8 @@ pub struct ActionExecutionRecord {
     /// at before typing, and the anchor it was resolved against.
     pub caret_index: Option<u64>,
     pub caret_anchor: Option<cua_driver_contract::CaretAnchor>,
+    /// `scroll` only: the measured outcome the platform published.
+    pub scroll: Option<cua_driver_contract::ScrollOutcome>,
 }
 
 impl ActionExecutionRecord {
@@ -289,6 +295,7 @@ impl ActionExecutionRecord {
             gained_windows: None,
             caret_index: None,
             caret_anchor: None,
+            scroll: None,
         }
     }
 
@@ -311,6 +318,15 @@ impl ActionExecutionRecord {
         self.caret_anchor = structured
             .get("caret_anchor")
             .and_then(|anchor| serde_json::from_value(anchor.clone()).ok());
+    }
+
+    /// Adopt the measured scroll outcome a platform producer published in its
+    /// structured payload (`scroll`). An absent or malformed object leaves the
+    /// record saying nothing about it.
+    pub fn adopt_scroll_outcome(&mut self, structured: &serde_json::Value) {
+        self.scroll = structured
+            .get("scroll")
+            .and_then(|scroll| serde_json::from_value(scroll.clone()).ok());
     }
 
     pub fn builder(
@@ -414,6 +430,9 @@ impl ActionExecutionRecord {
                                     &evidence.detail,
                                 ),
                             ),
+                            ProjectedEvidenceKind::FrameMotion => {
+                                (cua_driver_contract::ActionEvidenceKind::FrameMotion, None)
+                            }
                         };
                         cua_driver_contract::ActionEvidence { kind, signal }
                     })
@@ -483,6 +502,7 @@ impl ActionExecutionRecord {
             gained_windows: self.gained_windows.clone(),
             caret_index: self.caret_index,
             caret_anchor: self.caret_anchor.clone(),
+            scroll: self.scroll.clone(),
         })
     }
 
@@ -553,6 +573,14 @@ impl ActionExecutionRecord {
                 detail: signal.to_owned(),
             });
         }
+        // A scroll whose window frames registered the content moving the way
+        // it asked has observed its own postcondition.
+        if legacy_has_frame_motion(tool_name, structured) {
+            record.evidence.push(ActionEvidence {
+                kind: EvidenceKind::FrameMotion,
+                detail: FRAME_MOTION_KIND.to_owned(),
+            });
+        }
         if let Some(escalation) = structured.get("escalation") {
             let recommendation = escalation
                 .get("target")
@@ -592,6 +620,7 @@ impl ActionExecutionRecord {
                     EvidenceKind::AccessibilityReadback
                         | EvidenceKind::BrowserReadback
                         | EvidenceKind::ValueReadback
+                        | EvidenceKind::FrameMotion
                 )
             })
         {
@@ -756,6 +785,22 @@ fn legacy_observed_change_evidence(structured: &serde_json::Value) -> Vec<&str> 
         .unwrap_or_default()
 }
 
+/// The evidence kind a scroll producer publishes when its window frames
+/// registered the content moving the way it asked.
+const FRAME_MOTION_KIND: &str = "frame_motion";
+
+fn legacy_has_frame_motion(tool_name: &str, structured: &serde_json::Value) -> bool {
+    tool_name == "scroll"
+        && structured
+            .get("evidence")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|evidence| {
+                evidence.iter().any(|item| {
+                    item.get("kind").and_then(serde_json::Value::as_str) == Some(FRAME_MOTION_KIND)
+                })
+            })
+}
+
 /// Only a published reason spelling counts as an observation. Prose yields
 /// `None`, so the escalation target's own reason stands instead of the
 /// platform being credited with a delivery failure it never probed for.
@@ -808,9 +853,10 @@ fn transport_from_legacy(
         "cua_compositor_inject" | "wayland_cua_compositor" => {
             ActionTransport::LinuxCuaCompositorInject
         }
-        "hid" | "cgevent_hid" | "cgevent_fg" | "key_events_hid_fg" => {
+        "hid" | "cgevent_hid" | "cgevent_fg" | "key_events_hid_fg" | "hid_pointer_wheel" => {
             ActionTransport::MacosCgEventHid
         }
+        "pid_line_wheel" => ActionTransport::MacosCgEventPid,
         "cgevent" => {
             if args
                 .get("delivery_mode")
@@ -1035,6 +1081,7 @@ fn projected_evidence(evidence: &[ActionEvidence]) -> Option<Vec<ActionEvidenceP
                 EvidenceKind::BrowserReadback => ProjectedEvidenceKind::BrowserReadback,
                 EvidenceKind::ValueReadback => ProjectedEvidenceKind::ValueReadback,
                 EvidenceKind::WindowChange => ProjectedEvidenceKind::WindowChange,
+                EvidenceKind::FrameMotion => ProjectedEvidenceKind::FrameMotion,
                 EvidenceKind::NativeApiResult
                 | EvidenceKind::ScreenshotComparison
                 | EvidenceKind::EventReceipt
@@ -1093,6 +1140,7 @@ fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
         EvidenceKind::BrowserReadback => "browser_readback",
         EvidenceKind::ValueReadback => "value_readback",
         EvidenceKind::WindowChange => "window_change",
+        EvidenceKind::FrameMotion => "frame_motion",
         EvidenceKind::NativeApiResult => "native_api_result",
         EvidenceKind::ScreenshotComparison => "screenshot_comparison",
         EvidenceKind::EventReceipt => "event_receipt",
@@ -1248,6 +1296,7 @@ pub enum ProjectedEvidenceKind {
     BrowserReadback,
     ValueReadback,
     WindowChange,
+    FrameMotion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1703,6 +1752,49 @@ mod tests {
         assert!(!rendered.contains("\"window_id\""));
         assert!(!rendered.contains("\"x\""));
         assert!(!rendered.contains("\"y\""));
+    }
+
+    /// Before: the closed public projection dropped the producer's measured
+    /// scroll and demoted its "confirmed" (no read-back), so every client saw
+    /// `unverifiable` whatever the frames showed.
+    #[test]
+    fn a_measured_scroll_reaches_the_public_result_confirmed_by_frame_motion() {
+        let args = serde_json::json!({ "pid": 42, "window_id": 77, "delivery_mode": "foreground" });
+        let scroll = serde_json::json!({
+            "delivery": "foreground",
+            "direction": "down",
+            "point": { "x": 163.0, "y": 400.0 },
+            "requested_pt": 231,
+            "wheel": { "unit": "pixel", "events": 10, "total": 300 },
+            "chunks": 1,
+            "outcome": "moved",
+            "moved_pt": 231,
+            "across_pt": 0,
+            "confidence": 0.93,
+        });
+        let structured = serde_json::json!({
+            "path": "hid_pointer_wheel",
+            "delivery_mode": "foreground",
+            "verified": true,
+            "effect": "confirmed",
+            "evidence": [{ "kind": "frame_motion" }],
+            "scroll": scroll,
+        });
+        let mut record = ActionExecutionRecord::from_legacy("scroll", &args, &structured)
+            .expect("scroll normalizes");
+        record.adopt_scroll_outcome(&structured);
+        let public = serde_json::to_value(record.public_result().unwrap()).unwrap();
+        assert_eq!(public["effect"], "confirmed");
+        assert_eq!(public["route"], "global_input");
+        assert_eq!(public["delivery"]["mode"], "foreground");
+        assert_eq!(public["evidence"], serde_json::json!([{ "kind": "frame_motion" }]));
+        assert_eq!(public["scroll"], scroll);
+
+        // Frame motion is a scroll's postcondition only; another tool cannot
+        // borrow it to claim a confirmed effect.
+        let borrowed = ActionExecutionRecord::from_legacy("click", &args, &structured)
+            .expect("click normalizes");
+        assert_eq!(borrowed.effect, ActionEffect::Unverifiable);
     }
 
     /// The verdict is the only signal a caller has for "did the app take the
