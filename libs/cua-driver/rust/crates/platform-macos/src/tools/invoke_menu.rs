@@ -463,27 +463,6 @@ fn live_frontmost_pid(pid: i32, window_id: u32) -> Option<i32> {
     }
 }
 
-/// The application WindowServer currently fronts, identified through its
-/// topmost on-screen ordinary window.
-///
-/// Same reason as [`live_frontmost_pid`]: the workspace value this process
-/// caches may name whichever application was frontmost when it last serviced a
-/// run loop, and restoring against that would re-front the wrong application.
-/// Z-order alone is not enough either — a helper process can own the topmost
-/// on-screen window (completion popups, overlay panels) without being the front
-/// process — so each candidate is confirmed against WindowServer.
-fn live_frontmost_app() -> Option<i32> {
-    let mut windows = crate::windows::visible_windows();
-    windows.sort_by_key(|window| std::cmp::Reverse(window.z_index));
-    windows
-        .into_iter()
-        .find(|window| {
-            crate::input::skylight::front_process_matches(window.pid, window.window_id)
-                == Some(true)
-        })
-        .map(|window| window.pid)
-}
-
 /// Make one exact application window key before resolving focus-sensitive
 /// native menu state.
 ///
@@ -713,7 +692,8 @@ fn invoked(reaction: Option<super::delivery_probe::Evidence>) -> ToolResult {
 /// including across applications; app activation is the fallback for a
 /// prior app without an AX window.
 fn with_window_key<T>(pid: i32, window_id: u32, body: impl FnOnce() -> T) -> Result<T, String> {
-    let prior_frontmost = live_frontmost_app().or_else(crate::apps::frontmost_pid);
+    let prior_frontmost =
+        crate::input::skylight::frontmost_app_pid().or_else(crate::apps::frontmost_pid);
     let prior_frontmost_window =
         prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
     let needs_activation = prior_frontmost != Some(pid);

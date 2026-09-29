@@ -29,6 +29,8 @@ pub mod history;
 #[cfg(target_os = "macos")]
 pub mod input;
 #[cfg(target_os = "macos")]
+mod frame_sampler;
+#[cfg(target_os = "macos")]
 mod permission_observation;
 #[cfg(target_os = "macos")]
 pub mod permissions;
@@ -38,6 +40,8 @@ pub mod pip;
 pub mod recording_hooks;
 #[cfg(target_os = "macos")]
 pub mod session;
+#[cfg(target_os = "macos")]
+mod scroll_motion;
 #[cfg(target_os = "macos")]
 pub mod terminal;
 #[cfg(target_os = "macos")]

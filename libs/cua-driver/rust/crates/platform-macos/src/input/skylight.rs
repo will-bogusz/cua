@@ -593,6 +593,27 @@ pub fn front_process_matches(target_pid: libc::pid_t, target_wid: u32) -> Option
     Some(front_psn == target_psn)
 }
 
+/// The application WindowServer currently fronts, identified through its
+/// topmost on-screen ordinary window.
+///
+/// `NSWorkspace.frontmostApplication` (`crate::apps::frontmost_pid`) is an
+/// AppKit cached property that refreshes only when the reading process
+/// services a run loop, so a blocking path can read whichever application was
+/// frontmost when it last did — and restoring against that re-fronts the
+/// wrong one. Z-order alone is not enough either: a helper process can own
+/// the topmost on-screen window (completion popups, overlay panels) without
+/// being the front process, so each candidate is confirmed against
+/// WindowServer. `None` when no on-screen window's process is front (or the
+/// SPI is unavailable).
+pub fn frontmost_app_pid() -> Option<i32> {
+    let mut windows = crate::windows::visible_windows();
+    windows.sort_by_key(|window| std::cmp::Reverse(window.z_index));
+    windows
+        .into_iter()
+        .find(|window| front_process_matches(window.pid, window.window_id) == Some(true))
+        .map(|window| window.pid)
+}
+
 /// Make `target_pid` and `target_wid` WindowServer-frontmost and leave them
 /// there. Unlike [`with_foreground_assist`], this deliberately does not save or
 /// restore the previous process. It is the persistent counterpart required by

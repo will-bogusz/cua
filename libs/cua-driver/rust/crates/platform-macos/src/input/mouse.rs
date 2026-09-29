@@ -264,6 +264,84 @@ pub fn scroll_wheel_desktop(
     Ok(())
 }
 
+/// The real pointer's current position in global display points.
+pub fn cursor_location() -> anyhow::Result<CGPoint> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    Ok(CGEvent::new(source)
+        .map_err(|_| anyhow::anyhow!("CGEvent::new failed"))?
+        .location())
+}
+
+/// Park the real pointer on `(x, y)` and make the window under it track it
+/// there: warp, then three HID `mouseMoved` events 20 ms apart (the last
+/// exactly on the point), then 50 ms. A warp alone generates no
+/// `mouseMoved`, and a view that scrolls whatever sits under the pointer
+/// learns where the pointer is only from those events — after an activation
+/// change it drops the first wheel of a gesture that was not primed.
+pub fn prime_pointer_at(x: f64, y: f64) -> anyhow::Result<()> {
+    use core_graphics::event::CGEventTapLocation;
+
+    move_cursor_desktop(x, y)?;
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    for offset in [-2.0, -1.0, 0.0] {
+        let event = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::MouseMoved,
+            CGPoint::new(x + offset, y),
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow::anyhow!("mouseMoved event preparation failed"))?;
+        event.post(CGEventTapLocation::HID);
+        operation::sleep(std::time::Duration::from_millis(20))?;
+    }
+    operation::sleep(std::time::Duration::from_millis(30))?;
+    Ok(())
+}
+
+/// Post PIXEL-unit wheel events at `(x, y)` through the HID tap, 16 ms apart,
+/// calling `after_each` right after each one is posted. `events` are
+/// `(wheel1, wheel2)` deltas: negative wheel1 reveals content below, negative
+/// wheel2 content to the right. Nothing but the location is written on top
+/// of the constructor's fields — no phase, momentum or device fields.
+pub fn pixel_wheel_burst(
+    x: f64,
+    y: f64,
+    events: &[(i32, i32)],
+    mut after_each: impl FnMut(),
+) -> anyhow::Result<()> {
+    use core_graphics::event::{CGEventTapLocation, ScrollEventUnit};
+
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    for (index, &(wheel1, wheel2)) in events.iter().enumerate() {
+        if index > 0 {
+            operation::sleep(std::time::Duration::from_millis(16))?;
+        } else {
+            operation::check()?;
+        }
+        let event_ref = unsafe {
+            CGEventCreateScrollWheelEvent2(
+                source.as_ptr(),
+                ScrollEventUnit::PIXEL,
+                2,
+                wheel1,
+                wheel2,
+                0,
+            )
+        };
+        if event_ref.is_null() {
+            return Err(anyhow::anyhow!("CGEventCreateScrollWheelEvent2 failed"));
+        }
+        let event = unsafe { CGEvent::from_ptr(event_ref) };
+        unsafe { CGEventSetLocation(event.as_ptr() as *mut std::ffi::c_void, x, y) };
+        event.post(CGEventTapLocation::HID);
+        after_each();
+    }
+    Ok(())
+}
+
 /// Click one exact desktop point, then restore the user's cursor position.
 ///
 /// This is intentionally narrower than the public desktop click path. It is
@@ -274,9 +352,9 @@ pub fn click_at_xy_desktop_preserving_cursor(x: f64, y: f64) -> anyhow::Result<(
 }
 
 extern "C" {
-    /// Quartz's non-variadic scroll-event constructor. The public desktop
-    /// path intentionally passes a null source to match real mouse-controller
-    /// libraries such as pynput.
+    /// Quartz's non-variadic scroll-event constructor. The desktop path
+    /// passes a null source to match real mouse-controller libraries such as
+    /// pynput; the window pointer burst passes a HID-system-state source.
     fn CGEventCreateScrollWheelEvent2(
         source: core_graphics::sys::CGEventSourceRef,
         units: core_graphics::event::CGScrollEventUnit,
