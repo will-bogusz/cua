@@ -10,14 +10,14 @@
 //! Registration is generic — no hand-set content band. Rows that never change
 //! across a frame pair (fixed chrome: title bars, tab bars, a status line) drop
 //! out on their own; rows that change without matching any shift (a progress
-//! bar, a clock) stay in the comparison as unexplained residual. Across the
-//! shift, the comparison is confined to the strip of columns that changed
-//! under the pointer, so a carousel row or side list that moves alone is not
-//! outvoted by the static content beside it. The search runs on per-row
-//! block descriptors so a ±300 pt search stays cheap, then the chosen shift
-//! is refined on full pixels. Tracking frame to frame keeps a list
-//! with a constant row pitch from aliasing: the final first-vs-last shift is
-//! searched only within [`NET_WINDOW_PT`] of the tracked travel.
+//! bar, a clock) stay in the comparison as unexplained residual. When the
+//! change is confined to one strip under the pointer (a carousel row or a
+//! side list that moves alone), that strip is registered on its own as well,
+//! so the static content beside it cannot outvote it. The search runs on
+//! per-row block descriptors so a ±300 pt search stays cheap, then the
+//! chosen shift is refined on full pixels. Tracking frame to frame keeps a
+//! list with a constant row pitch from aliasing: the final first-vs-last
+//! shift is searched only within [`NET_WINDOW_PT`] of the tracked travel.
 //!
 //! Sign convention: a registered shift `s > 0` means row `r` of the later frame
 //! shows what row `r + s` of the earlier one did — the content moved up by `s`
@@ -77,11 +77,16 @@ const TRACKED_AGREEMENT_PT: i32 = 5;
 /// The residual at the tracked travel counts as competitive with the net's
 /// best within this factor.
 const TRAVEL_RESIDUAL_FACTOR: f32 = 1.3;
-/// A column counts toward the strip under the pointer when its change
-/// stands this many times above the frame pair's noise floor.
-const STRIP_NOISE: f32 = 3.0;
+/// A per-pixel difference at or below this is stream noise when finding the
+/// strip under the pointer.
+const PIXEL_NOISE: u8 = 8;
 /// Unchanged columns the strip under the pointer bridges.
 const STRIP_GAP: usize = 24;
+/// Least share of a frame pair's change the strip under the pointer holds.
+const STRIP_SHARE: f64 = 0.9;
+/// The strip's registration stands when its residual is below this share
+/// of the whole region's.
+const STRIP_ADVANTAGE: f32 = 0.5;
 
 /// One captured window frame: 8-bit gray, row-major, one pixel per point.
 #[derive(Clone, PartialEq, Eq)]
@@ -194,10 +199,8 @@ impl Region {
 /// The best rigid shift between two frames, with how well it explains them.
 ///
 /// Both numbers are mean absolute gray levels normalized over every row of
-/// the region, so `diff` is comparable across windows of any height.
-/// `residual / diff` is the share of the change the shift leaves
-/// unexplained, measured on the strip under the pointer when the change
-/// is confined to one ([`strip_under_pointer`]).
+/// the region, so `diff` is comparable across windows of any height and
+/// `residual / diff` is the share of the change the shift leaves unexplained.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Registration {
     pub shift: i32,
@@ -207,6 +210,12 @@ pub struct Registration {
     /// within noise of this one (repeated rows: a list, numbered text), so
     /// the distance may be off by that pitch.
     pub ambiguous: bool,
+    /// The shift was registered on the strip under the pointer, not the
+    /// whole region ([`strip_under_pointer`]). Pixels cannot tell a strip
+    /// the wheel scrolled from one that animates by itself (a banner, a
+    /// shimmer), so such a shift never calibrates and is never credited
+    /// when the view was already changing before the first event.
+    pub local: bool,
 }
 
 impl Registration {
@@ -216,6 +225,7 @@ impl Registration {
             residual: diff,
             diff,
             ambiguous: false,
+            local: false,
         }
     }
 
@@ -270,74 +280,88 @@ fn row_changes(earlier: &GrayFrame, later: &GrayFrame, region: &Region) -> (Vec<
     (still_diffs, diff)
 }
 
-/// The columns of `region` a frame pair changed in around the pointer.
+/// The strip of `region` a frame pair changed in under the pointer, when
+/// the rest of the region held still.
 ///
 /// A scroll can move one strip of the region only (a carousel row above a
 /// static list, a side list beside static content). Compared together with
 /// the static content across from it, no shift explains the strip: the
-/// shifted static part leaves as large a residual as staying put. So the
-/// pair registers on the run of changed columns that holds the pointer's,
-/// bridging unchanged gaps up to [`STRIP_GAP`] (the blank between a
-/// carousel's pictures and their captions). A column counts as changed when
-/// its mean difference stands [`STRIP_NOISE`] times above the pair's noise
-/// floor (its quietest tenth of columns, what a video stream changes
-/// everywhere) or half the largest column's, whichever is lower. When the
-/// pointer's column is in no run, or the run is too narrow to register, the
-/// whole region is read.
-fn strip_under_pointer(earlier: &GrayFrame, later: &GrayFrame, region: &Region) -> Region {
+/// shifted static part leaves as large a residual as staying put. The strip
+/// grows from the pointer's column through changed columns, bridging
+/// unchanged gaps up to [`STRIP_GAP`] (the blank between a carousel's
+/// pictures and their captions). A column counts as changed when its mean
+/// difference over pixels that differ by more than [`PIXEL_NOISE`] (a video
+/// stream's frame-to-frame noise) exceeds [`ROW_CHANGE`]. There is no strip
+/// when it is too narrow to register, spans the whole region, or holds less
+/// than [`STRIP_SHARE`] of the region's change: a strip that moved while
+/// the rest was replaced is a navigation, and a small change under the
+/// pointer while the whole view moved is not the scroll.
+fn strip_under_pointer(earlier: &GrayFrame, later: &GrayFrame, region: &Region) -> Option<Region> {
     let width = region.x1 - region.x0;
-    let Some(pointer) = region
+    let pointer = region
         .pointer
         .0
         .checked_sub(region.x0)
-        .filter(|p| *p < width)
-    else {
-        return *region;
-    };
-    let mut sums = vec![0u32; width];
+        .filter(|p| *p < width)?;
+    let mut change = vec![0u32; width];
     for y in region.y0..region.y1 {
         let start = y * earlier.width + region.x0;
         let (a, b) = (
             &earlier.pixels[start..start + width],
             &later.pixels[start..start + width],
         );
-        for (sum, (p, q)) in sums.iter_mut().zip(a.iter().zip(b)) {
-            *sum += u32::from(p.abs_diff(*q));
+        for (sum, (p, q)) in change.iter_mut().zip(a.iter().zip(b)) {
+            let d = p.abs_diff(*q);
+            if d > PIXEL_NOISE {
+                *sum += u32::from(d);
+            }
         }
     }
-    let change: Vec<f32> = sums
-        .iter()
-        .map(|s| *s as f32 / region.rows().max(1) as f32)
-        .collect();
-    let mut sorted = change.clone();
-    sorted.sort_by(f32::total_cmp);
-    let threshold = (STRIP_NOISE * sorted[width / 10])
-        .min(0.5 * sorted[width - 1])
-        .max(ROW_CHANGE);
-    let mut run: Option<(usize, usize)> = None;
-    for (x, c) in change.iter().enumerate() {
-        if *c <= threshold {
-            continue;
+    let floor = ROW_CHANGE * region.rows() as f32;
+    let changed = |x: usize| change[x] as f32 > floor;
+    let (mut start, mut end) = (pointer, pointer + 1);
+    let mut gap = 0;
+    for x in (0..pointer).rev() {
+        if changed(x) {
+            (start, gap) = (x, 0);
+        } else if gap == STRIP_GAP {
+            break;
+        } else {
+            gap += 1;
         }
-        run = match run {
-            Some((start, end)) if x - end <= STRIP_GAP => Some((start, x + 1)),
-            Some((start, end)) if (start..end).contains(&pointer) => break,
-            _ => Some((x, x + 1)),
-        };
     }
-    match run {
-        Some((start, end)) if (start..end).contains(&pointer) && end - start >= BLOCKS => Region {
+    gap = 0;
+    for x in pointer + 1..width {
+        if changed(x) {
+            (end, gap) = (x + 1, 0);
+        } else if gap == STRIP_GAP {
+            break;
+        } else {
+            gap += 1;
+        }
+    }
+    let total: u64 = change.iter().map(|c| u64::from(*c)).sum();
+    let inside: u64 = change[start..end].iter().map(|c| u64::from(*c)).sum();
+    (end - start >= BLOCKS && end - start < width && inside as f64 >= STRIP_SHARE * total as f64)
+        .then_some(Region {
             x0: region.x0 + start,
             x1: region.x0 + end,
             ..*region
-        },
-        _ => *region,
-    }
+        })
 }
 
 /// Register `later` against `earlier` over `region`, searching shifts in
 /// `lo..=hi`. A frame pair with too few changed rows, or no candidate with
 /// enough overlap, registers as still (shift 0).
+///
+/// The whole region is registered first. When the change is confined to
+/// the strip under the pointer ([`strip_under_pointer`]), the strip is
+/// registered on its own too, and stands only where it explains the change
+/// clearly better ([`STRIP_ADVANTAGE`]): a whole-region registration about
+/// as good keeps the answer, and with it the columns that tell repeated rows
+/// apart. `diff` is always the whole
+/// region's change, so the no-motion and pair floors read the same either
+/// way; a strip's residual is its unexplained share of that change.
 ///
 /// Block descriptors cannot tell apart two lines of text that differ only in
 /// a few glyphs (a numbered list aliases by one line pitch), so every shift
@@ -362,20 +386,39 @@ pub fn register(
     if region.rows() == 0 {
         return Registration::still(0.0);
     }
-    // `diff` stays the whole region's change, so the no-motion and pair
-    // floors read the same whichever columns the shift is scored on; the
-    // residual below is the strip's unexplained share of it.
-    let (whole_diffs, diff) = row_changes(earlier, later, region);
-    if whole_diffs.iter().filter(|d| **d > ROW_CHANGE).count() < MIN_BAND_ROWS {
+    let (still_diffs, diff) = row_changes(earlier, later, region);
+    if still_diffs.iter().filter(|d| **d > ROW_CHANGE).count() < MIN_BAND_ROWS {
         return Registration::still(diff);
     }
-    let strip = strip_under_pointer(earlier, later, region);
-    let still_diffs = if strip == *region {
-        whole_diffs
-    } else {
-        row_changes(earlier, later, &strip).0
+    let whole = register_rows(earlier, later, region, &still_diffs, diff, lo, hi, prefer);
+    let Some(strip) = strip_under_pointer(earlier, later, region) else {
+        return whole;
     };
-    let region = &strip;
+    let (strip_diffs, _) = row_changes(earlier, later, &strip);
+    let local = register_rows(earlier, later, &strip, &strip_diffs, diff, lo, hi, prefer);
+    if local.shift != 0 && local.residual < STRIP_ADVANTAGE * whole.residual {
+        Registration {
+            local: true,
+            ..local
+        }
+    } else {
+        whole
+    }
+}
+
+/// [`register`] on `region` alone, given its rows' differences in place and
+/// the whole region's change `diff` to scale the residual by.
+#[allow(clippy::too_many_arguments)]
+fn register_rows(
+    earlier: &GrayFrame,
+    later: &GrayFrame,
+    region: &Region,
+    still_diffs: &[f32],
+    diff: f32,
+    lo: i32,
+    hi: i32,
+    prefer: i32,
+) -> Registration {
     let rows = region.rows();
     let changed: Vec<bool> = still_diffs.iter().map(|d| *d > ROW_CHANGE).collect();
     let changed_rows = changed.iter().filter(|c| **c).count();
@@ -488,6 +531,7 @@ pub fn register(
             ambiguous: tried.iter().any(|(other, r)| {
                 other.abs_diff(shift) >= ALIAS_MIN_PT && *r <= residual * ALIAS_NOISE + 0.05 * diff
             }),
+            local: false,
         },
         None => Registration::still(diff),
     }
@@ -507,6 +551,8 @@ pub struct Step {
     pub confidence: f64,
     /// A repeated-row alias competed with this step's shift.
     pub ambiguous: bool,
+    /// Registered on the strip under the pointer ([`Registration::local`]).
+    pub local: bool,
 }
 
 /// Frame-to-frame tracking state for one scroll call, fed by the sampler.
@@ -625,6 +671,7 @@ impl MotionTracker {
                 shift: vertical.shift,
                 confidence: vertical.confidence(),
                 ambiguous: vertical.ambiguous,
+                local: vertical.local,
             });
         } else if vertical.diff > PAIR_FLOOR {
             let horizontal = register(
@@ -642,6 +689,7 @@ impl MotionTracker {
                     shift: horizontal.shift,
                     confidence: horizontal.confidence(),
                     ambiguous: horizontal.ambiguous,
+                    local: horizontal.local,
                 });
             } else if vertical.diff >= NO_MOTION_DIFF {
                 // A change above the no-motion floor that no shift explains:
@@ -819,7 +867,10 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     if motion.reshaped {
         return verdict(OutcomeKind::ChangedInPlace, 0, None, false, true);
     }
-    if diff < NO_MOTION_DIFF && motion.series.is_empty() {
+    // Steps registered on a strip under the pointer do not lift a change
+    // below the no-motion floor: a faint shimmer or a pointer disc moving
+    // there is not a scroll.
+    if diff < NO_MOTION_DIFF && motion.series.iter().all(|s| s.local) {
         return verdict(OutcomeKind::NoMotion, 0, None, false, true);
     }
     // A clean tracked series: every changed pair a confident, unambiguous
@@ -835,8 +886,10 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
                 && !s.ambiguous
         });
     // Content that was already moving must agree with the tracked travel
-    // before its shift is credited to the scroll.
-    let attributable = !motion.baseline_moving || (net.shift - travel).abs() <= 8;
+    // before its shift is credited to the scroll, and a strip under the
+    // pointer that was already moving (a banner, a marquee) never is.
+    let attributable =
+        !motion.baseline_moving || (!net.local && (net.shift - travel).abs() <= 8);
     if net.is_rigid(NET_RIGID_RATIO) && attributable {
         let kind = if bounced {
             OutcomeKind::AtEnd
@@ -863,7 +916,7 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
             net.shift,
             Some(net.confidence()),
             net.ambiguous,
-            motion.baseline_moving,
+            motion.baseline_moving || net.local,
         );
     }
     let unambiguous_steps = steps.iter().all(|s| !s.ambiguous);
@@ -897,7 +950,7 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
             net.shift,
             Some(net.confidence()),
             false,
-            motion.non_rigid_pairs > 0,
+            motion.non_rigid_pairs > 0 || net.local,
         );
     }
     // Tracked but not registered first-vs-last: accept a clean tracked
@@ -1514,20 +1567,146 @@ mod tests {
         }
     }
 
-    /// A strip that slides by itself away from the pointer (a marquee, a
-    /// banner rotating over static content) is not what the scroll moved.
+    /// A strip that slides by itself (a marquee, a rotating banner) is not
+    /// what the scroll moved: not away from the pointer, and not under it
+    /// when it was already moving before the first event.
     #[test]
-    fn a_strip_sliding_away_from_the_pointer_is_not_the_scroll() {
+    fn a_strip_sliding_by_itself_is_not_the_scroll() {
         let at = |dx: usize, seed: u64| {
             with_strip(150..210, seed, |x, y| texture(y, (x + dx + 700) as i64))
         };
-        let mut tracker = MotionTracker::new(at(0, 1), Region::within(W, H, None, (60.0, 300.0)));
-        tracker.begin_gesture(false);
-        for (i, dx) in [6, 14, 20, 25].into_iter().enumerate() {
-            tracker.push(at(dx, i as u64 + 2));
+        for (pointer, baseline_moving) in [((60.0, 300.0), false), ((60.0, 180.0), true)] {
+            let mut tracker = MotionTracker::new(at(0, 1), Region::within(W, H, None, pointer));
+            tracker.begin_gesture(baseline_moving);
+            for (i, dx) in [6, 14, 20, 25].into_iter().enumerate() {
+                tracker.push(at(dx, i as u64 + 2));
+            }
+            let verdict = classify(&tracker.call_motion(), ScrollDirection::Right);
+            assert_eq!(
+                verdict.kind,
+                OutcomeKind::ChangedInPlace,
+                "{pointer:?} {verdict:?}"
+            );
         }
+    }
+
+    /// Audit of 45d71f18b: a faint highlight sweeping across a strip under
+    /// the pointer (a skeleton loader's shimmer) changes less than a no-op
+    /// scroll's floor; the strip's rigid steps must not make it a move.
+    #[test]
+    fn a_shimmer_under_the_pointer_is_no_motion() {
+        let shimmer = |offset: i64| {
+            let mut f = frame(0);
+            for y in 180..222 {
+                for x in 0..W {
+                    let d = (x as i64 + offset - 60).abs() as f32 / 20.0;
+                    f.pixels[y * W + x] = 210 + (20.0 * (1.0 - d).max(0.0)) as u8;
+                }
+            }
+            f
+        };
+        let tracker = track([0, 12, 24, 36].map(shimmer));
         let verdict = classify(&tracker.call_motion(), ScrollDirection::Right);
+        assert_eq!(verdict.kind, OutcomeKind::NoMotion, "{verdict:?}");
+    }
+
+    /// Audit of 45d71f18b: a strip under the pointer that slides while the
+    /// rest of the window is replaced (a navigation carrying a shared
+    /// header) is not a scroll of the strip.
+    #[test]
+    fn a_strip_that_moves_while_the_rest_is_replaced_is_changed_in_place() {
+        let before = with_strip(150..210, 1, |x, y| texture(y, (x + 700) as i64));
+        let mut after = with_strip(150..210, 2, |x, y| texture(y, (x + 725) as i64));
+        for y in 250..360 {
+            for x in 0..W {
+                after.pixels[y * W + x] = texture(x + 500, y as i64 + 3000);
+            }
+        }
+        let verdict = classify(
+            &track([before, after]).call_motion(),
+            ScrollDirection::Right,
+        );
         assert_eq!(verdict.kind, OutcomeKind::ChangedInPlace, "{verdict:?}");
+    }
+
+    /// Audit of 45d71f18b: a pointer disc appearing over a blank margin
+    /// while the whole document scrolls must not narrow the measurement to
+    /// the disc.
+    #[test]
+    fn a_disc_appearing_at_the_pointer_does_not_hide_a_whole_view_scroll() {
+        let at = |offset: i64, disc: bool| {
+            let mut f = frame_with(offset, |x, y| if x < 80 { texture(x, y) } else { 250 });
+            if disc {
+                for y in 192..208 {
+                    for x in 92..108 {
+                        f.pixels[y * W + x] = 150;
+                    }
+                }
+            }
+            f
+        };
+        let mut tracker =
+            MotionTracker::new(at(0, false), Region::within(W, H, None, (100.0, 200.0)));
+        tracker.begin_gesture(false);
+        for offset in [20, 50, 93] {
+            tracker.push(at(offset, true));
+        }
+        let verdict = classify(&tracker.call_motion(), ScrollDirection::Down);
+        assert_eq!(
+            (verdict.kind, verdict.along),
+            (OutcomeKind::Moved, 93),
+            "{verdict:?}"
+        );
+    }
+
+    /// Audit of 45d71f18b: identical line bodies under the pointer, their
+    /// numbers more than a strip gap away. The bodies alone alias by one
+    /// pitch; the whole region, numbers included, does not.
+    #[test]
+    fn line_numbers_beyond_the_strip_gap_still_break_the_pitch_alias() {
+        const PITCH: i64 = 13;
+        let numbered = |x: usize, y: i64| {
+            let line = y.div_euclid(PITCH);
+            let row = y.rem_euclid(PITCH);
+            if row >= 10 || (14..44).contains(&x) {
+                250
+            } else if x < 14 {
+                ((line * 7919 + x as i64 * 31 + row * 17).rem_euclid(200)) as u8 + 30
+            } else {
+                ((x * 13 + row as usize * 29) % 190) as u8 + 40
+            }
+        };
+        let frames = (0..=10).map(|i| frame_with(i * 15, numbered));
+        let verdict = classify(&track(frames).call_motion(), ScrollDirection::Down);
+        assert_eq!(
+            (verdict.kind, verdict.along, verdict.ambiguous),
+            (OutcomeKind::Moved, 150, false),
+            "{verdict:?}"
+        );
+    }
+
+    /// Audit of 45d71f18b: a video stream whose static areas are partly
+    /// bit-for-bit still (a letterbox, codec skip blocks) and partly noisy.
+    #[test]
+    fn a_thin_strip_moves_under_partly_noise_free_static_content() {
+        let at = |dx: usize, seed: u64| {
+            let mut f = with_strip(150..210, seed, |x, y| texture(y, (x + dx + 700) as i64));
+            let clean = frame(0);
+            f.pixels[..100 * W].copy_from_slice(&clean.pixels[..100 * W]);
+            f
+        };
+        let tracker = track(
+            [0usize, 6, 14, 20, 25]
+                .into_iter()
+                .enumerate()
+                .map(|(i, dx)| at(dx, i as u64 + 1)),
+        );
+        let verdict = classify(&tracker.call_motion(), ScrollDirection::Right);
+        assert_eq!(
+            (verdict.kind, verdict.along),
+            (OutcomeKind::Moved, 25),
+            "{verdict:?}"
+        );
     }
 
     #[test]
@@ -1794,12 +1973,14 @@ mod tests {
             shift,
             confidence: 0.97,
             ambiguous: false,
+            local: false,
         };
         let net = Registration {
             shift: 495,
             residual: 0.5,
             diff: 20.0,
             ambiguous: false,
+            local: false,
         };
         let motion = Motion {
             travel_v: 534,
@@ -1848,6 +2029,7 @@ mod tests {
             shift,
             confidence: 0.97,
             ambiguous: false,
+            local: false,
         };
         let motion = Motion {
             travel_v: 240,
@@ -1858,6 +2040,7 @@ mod tests {
                 residual: 0.1,
                 diff: 20.0,
                 ambiguous: false,
+                local: false,
             },
             net_h: Registration::still(20.0),
             at_travel_v: Registration {
@@ -1865,6 +2048,7 @@ mod tests {
                 residual: 6.0,
                 diff: 20.0,
                 ambiguous: false,
+                local: false,
             },
             at_travel_h: Registration::still(20.0),
             reshaped: false,
