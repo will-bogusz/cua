@@ -9,14 +9,17 @@
 //! to front and raise in 13-21 ms, where the SkyLight front-process SPI
 //! activates without raising and `AXRaise` alone does nothing. So this
 //! envelope activates with `AXFrontmost`, waits for WindowServer to front the
-//! process, and refuses — before any input — when another window still covers
-//! the point. It arms no focus suppression: the activation is the point of the
-//! envelope, and a suppressor would undo it, or undo the user's own switch.
+//! process, and refuses — before any input — when another ordinary (layer-0)
+//! window still covers the point. Windows above layer 0 are not treated as
+//! covering: click-through status overlays live there, and window metadata
+//! cannot tell which of them intercept input. It arms no focus suppression:
+//! the activation is the point of the envelope, and a suppressor would undo
+//! it, or undo the user's own switch.
 //!
-//! The body must call [`Envelope::check`] before each burst of input: it stops
-//! the gesture when the user moved the pointer or fronted another app (then
-//! nothing is restored — the user owns both now), or when the destination
-//! stopped being the target window at the point.
+//! The body calls [`Envelope::takeover`] between input events and
+//! [`Envelope::check`] before each burst. After a takeover — the pointer left
+//! where it was parked, or another process came to the front — input stops and
+//! nothing is restored: the user owns both now.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -56,30 +59,14 @@ impl From<anyhow::Error> for RaisedPointerError {
     }
 }
 
-/// Why a raised gesture must stop sending input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Interruption {
-    /// The user moved the pointer or fronted another application.
-    TakenOver(String),
-    /// The target is no longer the window under the point, or moved.
-    DestinationChanged(String),
-}
-
-impl Interruption {
-    pub fn reason(&self) -> &str {
-        match self {
-            Self::TakenOver(reason) | Self::DestinationChanged(reason) => reason,
-        }
-    }
-}
-
 /// What the body can ask of the envelope.
 pub struct Envelope {
-    pid: i32,
     window_id: u32,
     point: (f64, f64),
     bounds: WindowBounds,
     own_pid: i32,
+    /// The front process right after the gate passed.
+    front: Option<[u8; 8]>,
     taken_over: AtomicBool,
 }
 
@@ -89,15 +76,24 @@ impl Envelope {
         &self.bounds
     }
 
-    /// `Err` when input must stop now. A takeover also cancels the restore.
-    pub fn check(&self) -> Result<(), Interruption> {
+    /// `Some(reason)` once the user moved the parked pointer or fronted
+    /// another process; from then on nothing is restored. Cheap: one event
+    /// read and one WindowServer call.
+    pub fn takeover(&self) -> Option<String> {
         let cursor = crate::input::mouse::cursor_location().ok().map(|p| (p.x, p.y));
-        let front = crate::input::skylight::front_process_matches(self.pid, self.window_id);
-        if let Some(reason) = takeover(self.point, cursor, front) {
-            self.taken_over.store(true, Ordering::SeqCst);
-            return Err(Interruption::TakenOver(reason));
+        let front = crate::input::skylight::front_process_serial();
+        let reason = takeover(self.point, cursor, self.front, front)?;
+        self.taken_over.store(true, Ordering::SeqCst);
+        Some(reason)
+    }
+
+    /// `Err(reason)` when input must stop now: a takeover, or the target is
+    /// no longer the topmost ordinary window at the point with its bounds.
+    pub fn check(&self) -> Result<(), String> {
+        if let Some(reason) = self.takeover() {
+            return Err(reason);
         }
-        let enumeration = crate::windows::visible_windows_any_layer();
+        let enumeration = crate::windows::visible_windows_with_space_snapshot();
         destination_holds(
             &enumeration.windows,
             &enumeration.alphas,
@@ -106,13 +102,17 @@ impl Envelope {
             self.window_id,
             &self.bounds,
         )
-        .map_err(Interruption::DestinationChanged)
     }
 }
 
-/// Whether the user took over: the parked cursor moved, or WindowServer
-/// fronts another process.
-fn takeover(parked: (f64, f64), cursor: Option<(f64, f64)>, front: Option<bool>) -> Option<String> {
+/// Whether the user took over: the parked cursor moved, or the front process
+/// is not the one observed right after the gate.
+fn takeover(
+    parked: (f64, f64),
+    cursor: Option<(f64, f64)>,
+    gate_front: Option<[u8; 8]>,
+    front: Option<[u8; 8]>,
+) -> Option<String> {
     if let Some((x, y)) = cursor {
         if (x - parked.0).abs() > CURSOR_SLACK || (y - parked.1).abs() > CURSOR_SLACK {
             return Some(format!(
@@ -120,10 +120,16 @@ fn takeover(parked: (f64, f64), cursor: Option<(f64, f64)>, front: Option<bool>)
             ));
         }
     }
-    (front == Some(false)).then(|| "another application came to the front during the scroll".into())
+    match (gate_front, front) {
+        (Some(before), Some(now)) if before != now => {
+            Some("another application came to the front during the scroll".into())
+        }
+        _ => None,
+    }
 }
 
-/// The target is still the topmost window at the point and has not moved.
+/// The target is still the topmost ordinary window at the point and has not
+/// moved.
 fn destination_holds(
     windows: &[WindowInfo],
     alphas: &[f64],
@@ -155,8 +161,8 @@ fn destination_holds(
 /// Raise `window_id` of `pid` so it is the topmost window at screen point
 /// `(x, y)`, park the real cursor there, and run `body`. Afterwards — also on
 /// error, refusal or cancellation — the cursor goes back where it was and the
-/// previously frontmost application is re-fronted, unless the user took over
-/// (see [`Envelope::check`]) or fronted a different application meanwhile.
+/// previously frontmost application is re-fronted, unless a takeover was seen
+/// at any point, including one last check right before restoring.
 pub fn with_raised_pointer<T>(
     pid: i32,
     window_id: u32,
@@ -173,7 +179,7 @@ pub fn with_raised_pointer<T>(
         set_app_frontmost(pid);
     }
     let bounds = loop {
-        let enumeration = crate::windows::visible_windows_any_layer();
+        let enumeration = crate::windows::visible_windows_with_space_snapshot();
         let top = topmost_window_at(&enumeration.windows, &enumeration.alphas, x, y, own_pid);
         let on_top = top.filter(|window| window.window_id == window_id);
         let front = crate::input::skylight::front_process_matches(pid, window_id) != Some(false);
@@ -192,20 +198,20 @@ pub fn with_raised_pointer<T>(
             return Err(RaisedPointerError::Failed(error.into()));
         }
     };
+    crate::input::mouse::move_cursor_desktop(x, y)?;
     let envelope = Envelope {
-        pid,
         window_id,
         point: (x, y),
         bounds,
         own_pid,
+        front: crate::input::skylight::front_process_serial(),
         taken_over: AtomicBool::new(false),
     };
     let _restore = operation::ReleaseOnDrop::new(|| {
-        if !envelope.taken_over.load(Ordering::SeqCst) {
+        if !envelope.taken_over.load(Ordering::SeqCst) && envelope.takeover().is_none() {
             restore(pid, window_id, prior_app, prior_cursor.map(|p| (p.x, p.y)));
         }
     });
-    crate::input::mouse::move_cursor_desktop(x, y)?;
     Ok(body(&envelope)?)
 }
 
@@ -235,10 +241,9 @@ fn set_app_frontmost(pid: i32) -> bool {
     }
 }
 
-/// The frontmost visible window on any layer containing `(x, y)`, skipping
-/// transparent windows and this process's own (the agent-cursor overlay
-/// ignores mouse events). A panel, menu or overlay above layer 0 covers the
-/// point like any window. `alphas` is parallel to `windows`.
+/// The frontmost visible layer-0 window containing `(x, y)`, skipping
+/// transparent windows and this process's own (the agent-cursor overlay).
+/// `alphas` is parallel to `windows`.
 fn topmost_window_at<'a>(
     windows: &'a [WindowInfo],
     alphas: &[f64],
@@ -251,7 +256,7 @@ fn topmost_window_at<'a>(
         .enumerate()
         .filter(|(index, window)| {
             let bounds = &window.bounds;
-            window.layer >= 0
+            window.layer == 0
                 && window.pid != own_pid
                 && alphas.get(*index).copied().unwrap_or(1.0) > 0.0
                 && x >= bounds.x
@@ -314,18 +319,29 @@ mod tests {
         );
     }
 
-    /// Between chunks a floating panel (layer 3) opened over the point, then
-    /// the target moved: each stops the gesture instead of wheeling on.
+    /// Audit N1: a click-through status overlay at layer 1000 over the point
+    /// refused every scroll there as covered.
     #[test]
-    fn a_panel_opening_or_the_window_moving_between_chunks_stops_the_gesture() {
+    fn an_overlay_above_layer_zero_does_not_cover_the_target() {
+        let target = window(1, 10, 1, 0.0, 400.0);
+        let bounds = target.bounds.clone();
+        let mut overlay = window(5, 50, 9, 0.0, 400.0);
+        overlay.layer = 1000;
+        assert!(destination_holds(&[target, overlay], &[1.0, 1.0], (100.0, 10.0), 99, 1, &bounds)
+            .is_ok());
+    }
+
+    /// Between chunks another window came over the point, then the target
+    /// moved: each stops the gesture instead of wheeling on.
+    #[test]
+    fn a_window_covering_or_the_target_moving_between_chunks_stops_the_gesture() {
         let target = window(1, 10, 1, 0.0, 400.0);
         let bounds = target.bounds.clone();
         assert!(destination_holds(&[target.clone()], &[1.0], (100.0, 10.0), 99, 1, &bounds).is_ok());
 
-        let mut panel = window(5, 50, 2, 50.0, 100.0);
-        panel.layer = 3;
+        let cover = window(5, 50, 2, 50.0, 100.0);
         let covered =
-            destination_holds(&[target.clone(), panel], &[1.0, 1.0], (100.0, 10.0), 99, 1, &bounds);
+            destination_holds(&[target.clone(), cover], &[1.0, 1.0], (100.0, 10.0), 99, 1, &bounds);
         assert!(covered.unwrap_err().contains("covered by app50"));
 
         let mut moved = target;
@@ -334,15 +350,20 @@ mod tests {
         assert!(moved.unwrap_err().contains("moved or resized"));
     }
 
+    /// Audit N2: a target that is on top but slow to become the front
+    /// process is not a takeover; only a change of front process after the
+    /// gate is.
     #[test]
-    fn a_moved_pointer_or_another_front_app_is_a_takeover() {
-        assert_eq!(takeover((100.0, 100.0), Some((101.0, 100.0)), Some(true)), None);
-        assert!(takeover((100.0, 100.0), Some((180.0, 90.0)), Some(true))
+    fn a_moved_pointer_or_a_changed_front_process_is_a_takeover() {
+        let a = Some([1u8; 8]);
+        let b = Some([2u8; 8]);
+        assert_eq!(takeover((100.0, 100.0), Some((101.0, 100.0)), a, a), None);
+        assert!(takeover((100.0, 100.0), Some((180.0, 90.0)), a, a)
             .unwrap()
             .contains("pointer moved"));
-        assert!(takeover((100.0, 100.0), Some((100.0, 100.0)), Some(false))
+        assert!(takeover((100.0, 100.0), Some((100.0, 100.0)), a, b)
             .unwrap()
             .contains("another application"));
-        assert_eq!(takeover((100.0, 100.0), None, None), None);
+        assert_eq!(takeover((100.0, 100.0), None, None, b), None);
     }
 }

@@ -14,13 +14,13 @@ use std::sync::Arc;
 use crate::apps;
 use crate::ax::bindings::{
     copy_children, copy_element_attr, copy_string_attr, element_at_screen_position,
-    element_screen_center, element_screen_rect, kAXErrorSuccess, perform_action, AXUIElementRef,
+    element_screen_rect, kAXErrorSuccess, perform_action, AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::frame_sampler::{FrameSampler, Settle};
 use crate::input::raised_pointer::{self, RaisedPointerError};
 use crate::scroll_motion::{
-    self, ChunkMeasure, ChunkStep, Classified, LoopSummary, OutcomeKind, ScrollUnit,
+    self, ChunkMeasure, ChunkRun, ChunkStep, Classified, LoopSummary, OutcomeKind, ScrollUnit,
     POINTS_AMOUNT_MAX,
 };
 use crate::window_change_detector::WindowChangeDetector;
@@ -84,9 +84,11 @@ fn def() -> &'static ToolDef {
             • delivery_mode:\"foreground\" — pointer-routed, for any app: the driver fronts the \
             window, refuses with `target_covered` before any input if another window still \
             covers the point, parks the real pointer there, posts pixel wheel events through \
-            the HID tap in measured chunks of at most 400 pt, then puts the pointer and the \
-            previously frontmost app back. Reaches views that scroll only under the real \
-            pointer (pixel-only surfaces, nested web scrollers).\n\
+            the HID tap in measured chunks (at most 400 pt and 0.6 of the scroll area), then \
+            puts the pointer and the previously frontmost app back. If the user moves the \
+            pointer or brings another app to the front during the scroll, it stops sending at \
+            once and restores nothing. Reaches views that scroll only under the real pointer \
+            (pixel-only surfaces, nested web scrollers).\n\
             • delivery_mode:\"background\" (default) — line wheel events posted to the pid at \
             the point: no activation, no pointer move. An AppKit text area addressed by \
             element scrolls through its scroll bar instead.\n\n\
@@ -337,12 +339,21 @@ impl Tool for ScrollTool {
                     )
                 })?;
                 std::thread::sleep(std::time::Duration::from_millis(40));
-                let Some((cx, cy)) =
-                    (unsafe { element_screen_center(element_ptr as AXUIElementRef) })
+                // Wheel at the centre of the part of the element that is on
+                // screen: a text view inside a short scroller reports a frame
+                // far taller than what it shows.
+                let Some(rect) = (unsafe { element_screen_rect(element_ptr as AXUIElementRef) })
                 else {
                     return Ok(None);
                 };
                 let Some(bounds) = crate::windows::window_bounds_by_id(wid) else {
+                    return Ok(None);
+                };
+                let area = unsafe {
+                    core_foundation::base::CFRetain(element_ptr as CFTypeRef);
+                    scroll_area_from(element_ptr as AXUIElementRef)
+                };
+                let Some((cx, cy)) = visible_centre(rect, area, &bounds) else {
                     return Ok(None);
                 };
                 let report = super::px_frame::resolve_window_px_frame(wid)
@@ -537,12 +548,20 @@ impl ScrollTool {
             )
             .round()
             .max(1.0);
+            let band = match request.direction {
+                ScrollDirection::Up | ScrollDirection::Down => visible_height,
+                ScrollDirection::Left | ScrollDirection::Right => area
+                    .map(|[_, _, w, _]| w)
+                    .or_else(|| crate::windows::window_bounds_by_id(wid).map(|b| b.width))
+                    .unwrap_or(0.0),
+            };
+            let max_chunk = scroll_motion::max_chunk_pt(band);
             raised_pointer::with_raised_pointer(
                 pid,
                 wid,
                 request.point.screen.0,
                 request.point.screen.1,
-                |envelope| pointer_scroll(request, area, requested, k0, envelope),
+                |envelope| pointer_scroll(request, area, requested, k0, max_chunk, envelope),
             )
             .map(|run| (run, requested))
         })
@@ -558,6 +577,12 @@ impl ScrollTool {
             }
             Err(error) => return ToolResult::error(format!("scroll task failed: {error}")),
         };
+        if run.summary.total_px == 0 {
+            let reason = run
+                .stopped
+                .unwrap_or_else(|| "no wheel event could be posted".to_owned());
+            return not_sent_refusal(&request, &reason);
+        }
         if let Some(k) = run.summary.calibration {
             self.state.scroll_calibrations.record(pid, wid, k);
         }
@@ -586,49 +611,108 @@ struct PointerRun {
 }
 
 /// Inside the raised envelope: prime the pointer, then scroll `requested_pt`
-/// in measured chunks, re-checking ownership and destination before each.
+/// in measured chunks. Destination and ownership are checked before each
+/// chunk, and ownership again before every wheel event.
 fn pointer_scroll(
     request: Request,
     area: Option<[f64; 4]>,
     requested_pt: f64,
     k0: f64,
+    max_chunk_pt: f64,
     envelope: &raised_pointer::Envelope,
 ) -> anyhow::Result<PointerRun> {
     let (x, y) = request.point.screen;
-    crate::input::mouse::prime_pointer_at(x, y, toward_interior((x, y), envelope.bounds()))?;
+    let mut stopped: Option<String> = None;
     let sampler = FrameSampler::start(request.wid, area);
     let mut unmeasured = sampler.as_ref().err().cloned();
-    let mut stopped: Option<String> = None;
-    let summary = scroll_motion::drive_chunks(requested_pt, k0, |px| {
-        if let Err(interruption) = envelope.check() {
-            stopped = Some(interruption.reason().to_owned());
-            return Ok(ChunkStep::Halted);
+    let primed = match envelope.check() {
+        Ok(()) => {
+            crate::input::mouse::prime_pointer_at(x, y, toward_interior((x, y), envelope.bounds()))
+        }
+        Err(reason) => {
+            stopped = Some(reason);
+            Ok(())
+        }
+    };
+    primed?;
+    let summary = scroll_motion::drive_chunks(requested_pt, k0, max_chunk_pt, |px| {
+        let halted = |stop: &mut Option<String>, reason: String| {
+            *stop = Some(reason);
+            Ok(ChunkRun {
+                step: ChunkStep::Unmeasured,
+                posted_px: 0,
+                posted_events: 0,
+                stop: true,
+            })
+        };
+        if let Some(reason) = stopped.clone() {
+            return halted(&mut stopped, reason);
+        }
+        if let Err(reason) = envelope.check() {
+            return halted(&mut stopped, reason);
         }
         let events = scroll_motion::wheel_events(px, request.direction);
-        let Ok(sampler) = &sampler else {
-            if let Err(error) = crate::input::mouse::pixel_wheel_burst(x, y, &events, || {}) {
-                stopped = Some(format!("input stopped: {error}"));
-            }
-            return Ok(ChunkStep::Unmeasured);
-        };
-        sampler.begin_chunk();
-        if let Err(error) =
-            crate::input::mouse::pixel_wheel_burst(x, y, &events, || sampler.mark_event())
-        {
-            stopped = Some(format!("input stopped: {error}"));
-            return Ok(ChunkStep::Unmeasured);
+        if let Ok(sampler) = &sampler {
+            sampler.begin_chunk();
         }
-        Ok(match sampler.wait_settled() {
-            Settle::Unmeasured(reason) => {
-                unmeasured = Some(reason);
-                ChunkStep::Unmeasured
-            }
-            settle => ChunkStep::Measured(ChunkMeasure {
-                classified: scroll_motion::classify(&sampler.chunk_motion(), request.direction),
-                settled: settle == Settle::Settled,
-            }),
+        let mut posted = 0usize;
+        let mut takeover: Option<String> = None;
+        let burst = crate::input::mouse::pixel_wheel_burst(
+            x,
+            y,
+            &events,
+            || match envelope.takeover() {
+                Some(reason) => {
+                    takeover = Some(reason);
+                    false
+                }
+                None => true,
+            },
+            || {
+                if let Ok(sampler) = &sampler {
+                    sampler.mark_event();
+                }
+            },
+            &mut posted,
+        );
+        let posted_px: u32 = events[..posted]
+            .iter()
+            .map(|(w1, w2)| w1.unsigned_abs() + w2.unsigned_abs())
+            .sum();
+        let mut stop = takeover.is_some();
+        if let Some(reason) = takeover {
+            stopped = Some(reason);
+        }
+        if let Err(error) = burst {
+            stopped = Some(format!("input stopped: {error}"));
+            unmeasured = Some(format!("input stopped mid-chunk: {error}"));
+            stop = true;
+        }
+        let step = match &sampler {
+            Err(_) => ChunkStep::Unmeasured,
+            Ok(_) if unmeasured.is_some() => ChunkStep::Unmeasured,
+            Ok(_) if posted == 0 => ChunkStep::Unmeasured,
+            Ok(sampler) => match sampler.wait_settled() {
+                Settle::Unmeasured(reason) => {
+                    unmeasured = Some(reason);
+                    ChunkStep::Unmeasured
+                }
+                settle => ChunkStep::Measured(ChunkMeasure {
+                    classified: scroll_motion::classify(&sampler.chunk_motion(), request.direction),
+                    settled: settle == Settle::Settled,
+                }),
+            },
+        };
+        Ok(ChunkRun {
+            step,
+            posted_px,
+            posted_events: posted as u32,
+            stop,
         })
     })?;
+    if stopped.is_none() {
+        stopped = summary.short.map(str::to_owned);
+    }
     let verdict = match (sampler, unmeasured) {
         (Ok(sampler), None) => {
             let mut classified = scroll_motion::classify(&sampler.finish(), request.direction);
@@ -782,21 +866,62 @@ fn screenshot_point(
 /// area there (a pixel-only surface).
 fn scroll_area_at(pid: i32, x: f64, y: f64) -> Option<[f64; 4]> {
     let _budget = crate::ax::budget::WalkBudget::new(std::time::Duration::from_millis(500));
-    unsafe {
-        let mut element = element_at_screen_position(pid, x, y)?;
-        for _ in 0..32 {
-            if copy_string_attr(element, "AXRole").as_deref() == Some("AXScrollArea") {
-                let rect = element_screen_rect(element);
-                CFRelease(element as CFTypeRef);
-                return rect;
-            }
-            let parent = copy_element_attr(element, "AXParent");
+    unsafe { scroll_area_from(element_at_screen_position(pid, x, y)?) }
+}
+
+/// The frame of `element` itself or its nearest `AXScrollArea` ancestor.
+/// Takes ownership of `element` (one reference) and releases it.
+unsafe fn scroll_area_from(mut element: AXUIElementRef) -> Option<[f64; 4]> {
+    for _ in 0..32 {
+        if copy_string_attr(element, "AXRole").as_deref() == Some("AXScrollArea") {
+            let rect = element_screen_rect(element);
             CFRelease(element as CFTypeRef);
-            element = parent?;
+            return rect;
         }
+        let parent = copy_element_attr(element, "AXParent");
         CFRelease(element as CFTypeRef);
-        None
+        element = parent?;
     }
+    CFRelease(element as CFTypeRef);
+    None
+}
+
+/// The centre of the part of `element` (screen `[x, y, w, h]`) that is
+/// visible: inside its enclosing scroll area and the window. `None` when
+/// nothing of it is visible.
+fn visible_centre(
+    element: [f64; 4],
+    area: Option<[f64; 4]>,
+    window: &WindowBounds,
+) -> Option<(f64, f64)> {
+    let mut rect = [
+        element[0],
+        element[1],
+        element[0] + element[2],
+        element[1] + element[3],
+    ];
+    let mut clip = |[x, y, w, h]: [f64; 4]| {
+        rect = [rect[0].max(x), rect[1].max(y), rect[2].min(x + w), rect[3].min(y + h)];
+    };
+    if let Some(area) = area {
+        clip(area);
+    }
+    clip([window.x, window.y, window.width, window.height]);
+    (rect[2] - rect[0] >= 1.0 && rect[3] - rect[1] >= 1.0)
+        .then(|| ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0))
+}
+
+fn not_sent_refusal(request: &Request, reason: &str) -> ToolResult {
+    let (x, y) = request.point.report.unwrap_or(request.point.local);
+    ToolResult::error(format!(
+        "scroll not sent at ({x:.0}, {y:.0}): {reason}; no wheel event was posted"
+    ))
+    .with_structured(serde_json::json!({
+        "code": "scroll_not_sent",
+        "window_id": request.wid,
+        "point": { "x": x, "y": y },
+        "reason": reason,
+    }))
 }
 
 fn covered_refusal(request: &Request, covered: &raised_pointer::Covered) -> ToolResult {
@@ -1192,6 +1317,7 @@ mod tests {
             confidence: matches!(kind, OutcomeKind::Moved | OutcomeKind::AtEnd).then_some(0.934),
             bounced,
             ambiguous: false,
+            uncalibrated: false,
         })
     }
 
@@ -1328,6 +1454,24 @@ mod tests {
         assert_eq!(visible, 672.0);
         assert_eq!(visible_area(None, &window), (None, 700.0));
         assert_eq!(visible_area(Some([900.0, 0.0, 50.0, 50.0]), &window), (None, 700.0));
+    }
+
+    /// AppKit harness: a 460×600 text view inside a 120 pt scroller. The
+    /// centre of the text view's own frame lies below the scroller, so the
+    /// wheel landed on whatever was under it.
+    #[test]
+    fn an_element_scrolls_at_the_centre_of_its_visible_part() {
+        let window = WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+        };
+        let text_view = [20.0, 100.0, 460.0, 600.0];
+        let scroller = [20.0, 100.0, 480.0, 120.0];
+        assert_eq!(visible_centre(text_view, Some(scroller), &window), Some((250.0, 160.0)));
+        assert_eq!(visible_centre(text_view, None, &window), Some((250.0, 400.0)));
+        assert_eq!(visible_centre([700.0, 0.0, 50.0, 50.0], None, &window), None);
     }
 
     #[test]

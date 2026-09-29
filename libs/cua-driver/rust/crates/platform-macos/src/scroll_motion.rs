@@ -397,6 +397,8 @@ pub struct MotionTracker {
     /// a video, a scroll still settling): pixels alone then cannot attribute
     /// a shift to the scroll.
     baseline_moving: bool,
+    /// Changed frame pairs that registered no rigid shift on either axis.
+    non_rigid: usize,
 }
 
 struct ChunkStart {
@@ -404,6 +406,7 @@ struct ChunkStart {
     series_len: usize,
     travel_v: i32,
     travel_h: i32,
+    non_rigid: usize,
 }
 
 /// What happened between two tracked frames: the tracked travel and steps,
@@ -418,6 +421,9 @@ pub struct Motion {
     /// The window's frame changed size between the two frames, so no shift
     /// between them can be registered.
     pub reshaped: bool,
+    /// Changed frame pairs in the span that registered no rigid shift (a
+    /// navigation, a sheet, an animation frame).
+    pub non_rigid_pairs: usize,
     /// The content was already changing before the first input event.
     pub baseline_moving: bool,
     /// Largest vertical / horizontal shift a single comparison can register
@@ -436,6 +442,7 @@ impl MotionTracker {
                 series_len: 0,
                 travel_v: 0,
                 travel_h: 0,
+                non_rigid: 0,
             },
             first,
             travel_v: 0,
@@ -443,17 +450,21 @@ impl MotionTracker {
             series: Vec::new(),
             gesture_started: false,
             baseline_moving: false,
+            non_rigid: 0,
         }
     }
 
     /// The gesture starts now: the latest frame becomes the call's first
-    /// frame, and whether anything changed before this is remembered.
-    pub fn begin_gesture(&mut self) {
+    /// frame. `baseline_moving`: the content was still changing when the
+    /// gesture started (the caller watched it before any input).
+    pub fn begin_gesture(&mut self, baseline_moving: bool) {
         self.gesture_started = true;
+        self.baseline_moving = baseline_moving;
         self.first = self.prev.clone();
         self.travel_v = 0;
         self.travel_h = 0;
         self.series.clear();
+        self.non_rigid = 0;
         self.begin_chunk();
     }
 
@@ -464,7 +475,6 @@ impl MotionTracker {
             return false;
         }
         if !self.gesture_started {
-            self.baseline_moving = true;
             self.prev = frame;
             return true;
         }
@@ -499,6 +509,12 @@ impl MotionTracker {
                     shift: horizontal.shift,
                     confidence: horizontal.confidence(),
                 });
+            } else if vertical.diff >= NO_MOTION_DIFF {
+                // A change above the no-motion floor that no shift explains:
+                // a navigation, a sheet, an animation frame. Fainter pairs (a
+                // scroller fading in) are below what the classifier counts
+                // as change at all.
+                self.non_rigid += 1;
             }
         }
         self.prev = frame;
@@ -512,6 +528,7 @@ impl MotionTracker {
             series_len: self.series.len(),
             travel_v: self.travel_v,
             travel_h: self.travel_h,
+            non_rigid: self.non_rigid,
         };
     }
 
@@ -522,15 +539,23 @@ impl MotionTracker {
             self.travel_v - self.chunk.travel_v,
             self.travel_h - self.chunk.travel_h,
             &self.series[self.chunk.series_len..],
+            self.non_rigid - self.chunk.non_rigid,
         )
     }
 
     /// Motion over the whole call.
     pub fn call_motion(&self) -> Motion {
-        self.motion_between(&self.first, self.travel_v, self.travel_h, &self.series)
+        self.motion_between(&self.first, self.travel_v, self.travel_h, &self.series, self.non_rigid)
     }
 
-    fn motion_between(&self, start: &GrayFrame, travel_v: i32, travel_h: i32, series: &[Step]) -> Motion {
+    fn motion_between(
+        &self,
+        start: &GrayFrame,
+        travel_v: i32,
+        travel_h: i32,
+        series: &[Step],
+        non_rigid_pairs: usize,
+    ) -> Motion {
         let net_v = register(
             start,
             &self.prev,
@@ -554,6 +579,7 @@ impl MotionTracker {
             net_v,
             net_h,
             reshaped: start.width != self.prev.width || start.height != self.prev.height,
+            non_rigid_pairs,
             baseline_moving: self.baseline_moving,
             overlap_v: self.region.rows() as i32 - MIN_OVERLAP_ROWS,
             overlap_h: (self.region.x1 - self.region.x0) as i32 - MIN_OVERLAP_ROWS,
@@ -585,8 +611,11 @@ pub struct Classified {
     /// The content moved one way and then the other (overshoot and bounce).
     pub bounced: bool,
     /// The distance rests on a registration a repeated-row alias competes
-    /// with, so it may be off by one pitch.
+    /// with, so it may be off by one pitch: never correct or calibrate by it.
     pub ambiguous: bool,
+    /// The distance stands (tracked-only, or content already moving) but must
+    /// not size later chunks.
+    pub uncalibrated: bool,
 }
 
 fn axis_of(direction: ScrollDirection) -> (Axis, i32) {
@@ -618,20 +647,21 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
     // The first-vs-last difference is read in the vertical orientation; it is
     // the same pixels whichever axis the request named.
     let diff = motion.net_v.diff;
-    let verdict = |kind, along: i32, confidence, ambiguous| Classified {
+    let verdict = |kind, along: i32, confidence, ambiguous, uncalibrated| Classified {
         kind,
         along: sign * along,
         across,
         confidence,
         bounced,
         ambiguous,
+        uncalibrated,
     };
 
     if motion.reshaped {
-        return verdict(OutcomeKind::ChangedInPlace, 0, None, false);
+        return verdict(OutcomeKind::ChangedInPlace, 0, None, false, true);
     }
     if diff < NO_MOTION_DIFF && motion.series.is_empty() {
-        return verdict(OutcomeKind::NoMotion, 0, None, false);
+        return verdict(OutcomeKind::NoMotion, 0, None, false, true);
     }
     // Content that was already moving must agree with the tracked travel
     // before its shift is credited to the scroll.
@@ -642,27 +672,33 @@ pub fn classify(motion: &Motion, direction: ScrollDirection) -> Classified {
         } else {
             OutcomeKind::Moved
         };
-        let ambiguous = net.ambiguous || motion.baseline_moving;
-        return verdict(kind, net.shift, Some(net.confidence()), ambiguous);
+        return verdict(
+            kind,
+            net.shift,
+            Some(net.confidence()),
+            net.ambiguous,
+            motion.baseline_moving,
+        );
     }
     if bounced && !motion.baseline_moving {
-        return verdict(OutcomeKind::AtEnd, travel, step_confidence, true);
+        return verdict(OutcomeKind::AtEnd, travel, step_confidence, false, true);
     }
     // Tracked but not registered first-vs-last: accept the travel when the
-    // frame-to-frame steps are clean (one direction, each a confident rigid
-    // shift, nothing moving beforehand) and the first and last frames share
-    // too little of the band for one comparison to be reliable.
+    // frame-to-frame series is clean (every changed pair a confident rigid
+    // shift the same way, nothing moving beforehand) and the first and last
+    // frames share too little of the band for one comparison to be reliable.
     let band = overlap + MIN_OVERLAP_ROWS;
     let clean_steps = !steps.is_empty()
+        && motion.non_rigid_pairs == 0
         && steps.iter().all(|s| s.shift.signum() == travel.signum() && s.confidence >= CLEAN_STEP_CONFIDENCE);
     let little_overlap = f64::from(band - travel.abs()) < NET_RELIABLE_OVERLAP * f64::from(band);
     if travel != 0 && clean_steps && little_overlap && !motion.baseline_moving {
-        return verdict(OutcomeKind::Moved, travel, step_confidence, true);
+        return verdict(OutcomeKind::Moved, travel, step_confidence, false, true);
     }
     if diff >= NO_MOTION_DIFF || travel != 0 {
-        return verdict(OutcomeKind::ChangedInPlace, 0, None, false);
+        return verdict(OutcomeKind::ChangedInPlace, 0, None, false, true);
     }
-    verdict(OutcomeKind::NoMotion, 0, None, false)
+    verdict(OutcomeKind::NoMotion, 0, None, false, true)
 }
 
 /// Scroll units a caller can ask for.
@@ -774,15 +810,25 @@ pub struct ChunkMeasure {
     pub settled: bool,
 }
 
-/// What one turn of the closed loop produced.
+/// What one turn of the closed loop measured.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChunkStep {
-    /// The chunk was posted and measured.
+    /// The frames were measured.
     Measured(ChunkMeasure),
-    /// The chunk was posted but the frames could not be measured.
+    /// The frames could not be measured (capture failure, cancel, input error).
     Unmeasured,
-    /// Nothing was posted: the gesture must stop (takeover, destination).
-    Halted,
+}
+
+/// One turn of the closed loop: what was posted and what it measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChunkRun {
+    pub step: ChunkStep,
+    /// Wheel pixels and events actually posted (fewer than asked when the
+    /// burst was stopped).
+    pub posted_px: u32,
+    pub posted_events: u32,
+    /// Input must stop after this turn (takeover, destination changed).
+    pub stop: bool,
 }
 
 /// What the closed loop did.
@@ -791,43 +837,52 @@ pub struct LoopSummary {
     pub chunks: u32,
     pub total_px: u32,
     pub events: u32,
-    /// Points per pixel, only from chunks that ran their whole course with
-    /// an unambiguous registration — followed by another full move, or
-    /// finishing the distance — and agreed with each other within 15%.
+    /// Points per pixel from a chunk whose successor's own ratio agreed with
+    /// it within 15% — evidence it ran its whole course.
     pub calibration: Option<f64>,
     /// The last chunk moved less than 20% of what it was expected to, with
     /// frames settled.
     pub stalled: bool,
-    /// A chunk was posted and could not be measured; the loop stopped there.
+    /// A chunk could not be measured; the loop stopped there.
     pub unmeasured: bool,
-    /// The loop stopped before posting a chunk (see [`ChunkStep::Halted`]).
+    /// The caller asked the loop to stop ([`ChunkRun::stop`]).
     pub halted: bool,
+    /// The loop stopped short for its own reason the outcome does not show.
+    pub short: Option<&'static str>,
 }
 
-fn chunk_px(remaining_pt: f64, k: f64) -> u32 {
-    (remaining_pt.min(CHUNK_MAX_PT) / k).round().max(1.0) as u32
+fn chunk_px(remaining_pt: f64, k: f64, max_chunk_pt: f64) -> u32 {
+    (remaining_pt.min(max_chunk_pt) / k).round().max(1.0) as u32
 }
 
 fn keep_going(remaining_pt: f64, requested_pt: f64) -> bool {
     remaining_pt > (0.05 * requested_pt).max(8.0)
 }
 
+/// Largest chunk for a registration band of `band_pt`: at most
+/// [`CHUNK_MAX_PT`] and 0.6 of the band, so first and last frame of a chunk
+/// keep enough in common to register.
+pub fn max_chunk_pt(band_pt: f64) -> f64 {
+    (0.6 * band_pt).clamp(40.0, CHUNK_MAX_PT)
+}
+
 /// Lowest registration confidence a chunk may calibrate from.
 const CALIBRATION_CONFIDENCE: f64 = 0.85;
-/// Largest spread between calibrating chunks of one call.
+/// Largest spread between a pending calibration and its successor's ratio.
 const CALIBRATION_AGREEMENT: f64 = 1.15;
 
-/// Scroll `requested_pt` in chunks of at most [`CHUNK_MAX_PT`], each sized
-/// from the points-per-pixel `k` (starting at `k0`) and re-sized from a chunk
-/// that measured cleanly. `run(px)` posts one chunk and says what it
+/// Scroll `requested_pt` in chunks of at most `max_chunk_pt`, each sized from
+/// the points-per-pixel `k` (starting at `k0`) and re-sized from a chunk that
+/// measured cleanly. `run(px)` posts one chunk and says what it posted and
 /// measured. The loop stops on a chunk that could not be measured, did not
 /// move the way asked, reached the end, changed in place, or rests on an
-/// ambiguous registration (a correction for a possibly aliased distance
-/// could overshoot by that alias), and before posting when `run` halts.
+/// alias-ambiguous registration (a correction for a possibly aliased
+/// distance could overshoot by that alias), and when `run` asks it to stop.
 pub fn drive_chunks(
     requested_pt: f64,
     k0: f64,
-    mut run: impl FnMut(u32) -> anyhow::Result<ChunkStep>,
+    max_chunk_pt: f64,
+    mut run: impl FnMut(u32) -> anyhow::Result<ChunkRun>,
 ) -> anyhow::Result<LoopSummary> {
     let mut k = k0.clamp(K_RANGE.0, K_RANGE.1);
     let mut remaining = requested_pt;
@@ -839,62 +894,74 @@ pub fn drive_chunks(
         stalled: false,
         unmeasured: false,
         halted: false,
+        short: None,
     };
-    // The latest clean chunk's k, committed once the chunk proves it ran its
-    // whole course.
+    // The latest clean chunk's k, committed once its successor agrees.
     let mut pending: Option<f64> = None;
-    let mut committed: Vec<f64> = Vec::new();
-    while summary.chunks < MAX_CHUNKS {
-        let px = chunk_px(remaining, k);
-        let expected = f64::from(px) * k;
-        let measure = match run(px)? {
-            ChunkStep::Halted => {
-                summary.halted = true;
+    loop {
+        if summary.chunks >= MAX_CHUNKS {
+            summary.short = Some("the chunk limit was reached");
+            break;
+        }
+        let px = chunk_px(remaining, k, max_chunk_pt);
+        let turn = run(px)?;
+        if turn.posted_px > 0 {
+            summary.chunks += 1;
+            summary.total_px += turn.posted_px;
+            summary.events += turn.posted_events;
+        }
+        if turn.stop && turn.posted_px == 0 {
+            summary.halted = true;
+            break;
+        }
+        let measure = match turn.step {
+            ChunkStep::Measured(measure) => measure,
+            ChunkStep::Unmeasured => {
+                summary.unmeasured = true;
+                summary.halted = turn.stop;
                 break;
             }
-            step => {
-                summary.chunks += 1;
-                summary.total_px += px;
-                summary.events += px.div_ceil(WHEEL_EVENT_MAX_PX);
-                match step {
-                    ChunkStep::Measured(measure) => measure,
-                    _ => {
-                        summary.unmeasured = true;
-                        break;
-                    }
-                }
-            }
         };
+        let expected = f64::from(turn.posted_px) * k;
         let c = measure.classified;
         let moved = f64::from(c.along);
         summary.stalled = measure.settled && moved < 0.2 * expected;
         let full_move = c.kind == OutcomeKind::Moved && moved > 0.0 && !summary.stalled;
+        if turn.stop {
+            summary.halted = true;
+            break;
+        }
         if !full_move {
             break;
         }
-        committed.extend(pending.take());
         remaining -= moved;
+        let own = (moved / f64::from(turn.posted_px)).clamp(K_RANGE.0, K_RANGE.1);
+        let ratio = moved / expected;
+        let clean = !c.ambiguous
+            && !c.uncalibrated
+            && !c.bounced
+            && c.confidence.is_some_and(|confidence| confidence >= CALIBRATION_CONFIDENCE)
+            && (0.5..=2.0).contains(&ratio);
+        if let Some(previous) = pending.take() {
+            if clean && own.max(previous) <= own.min(previous) * CALIBRATION_AGREEMENT {
+                summary.calibration = Some(previous);
+            }
+        }
         if c.ambiguous {
+            summary.short = Some(
+                "the distance registered ambiguously (repeated rows), so no correcting chunk \
+                 was sent",
+            );
             break;
         }
-        let ratio = moved / expected;
-        pending = (!c.bounced
-            && c.confidence.is_some_and(|confidence| confidence >= CALIBRATION_CONFIDENCE)
-            && (0.5..=2.0).contains(&ratio))
-        .then(|| (moved / f64::from(px)).clamp(K_RANGE.0, K_RANGE.1));
-        if let Some(measured) = pending {
-            k = measured;
+        if clean {
+            pending = Some(own);
+            k = own;
         }
         if !keep_going(remaining, requested_pt) {
-            committed.extend(pending.take());
             break;
         }
     }
-    let spread = committed.iter().copied().reduce(f64::max).zip(committed.iter().copied().reduce(f64::min));
-    summary.calibration = match spread {
-        Some((max, min)) if max <= min * CALIBRATION_AGREEMENT => committed.last().copied(),
-        _ => None,
-    };
     Ok(summary)
 }
 
@@ -972,7 +1039,7 @@ mod tests {
     fn track(frames: impl IntoIterator<Item = GrayFrame>) -> MotionTracker {
         let mut frames = frames.into_iter();
         let mut tracker = MotionTracker::new(frames.next().unwrap(), region());
-        tracker.begin_gesture();
+        tracker.begin_gesture(false);
         for frame in frames {
             tracker.push(frame);
         }
@@ -1084,7 +1151,7 @@ mod tests {
             let offsets: Vec<i64> = (0..=10).map(|i| i * total / 10).collect();
             let verdict = down(&offsets);
             assert_eq!((verdict.kind, verdict.along), (OutcomeKind::Moved, total as i32));
-            assert!(verdict.ambiguous, "tracked-only distances never calibrate");
+            assert!(verdict.uncalibrated && !verdict.ambiguous, "tracked-only distances never calibrate");
         }
     }
 
@@ -1147,32 +1214,38 @@ mod tests {
         assert_eq!(wheel_events(31, ScrollDirection::Left), vec![(0, 30), (0, 1)]);
     }
 
-    fn moved(along: i32, confidence: f64, ambiguous: bool) -> ChunkStep {
+    fn measured(px: u32, along: i32, confidence: f64, ambiguous: bool, settled: bool) -> ChunkRun {
         let kind = if along == 0 {
             OutcomeKind::NoMotion
         } else {
             OutcomeKind::Moved
         };
-        ChunkStep::Measured(ChunkMeasure {
-            classified: Classified {
-                kind,
-                along,
-                across: 0,
-                confidence: (along != 0).then_some(confidence),
-                bounced: false,
-                ambiguous,
-            },
-            settled: true,
-        })
+        ChunkRun {
+            step: ChunkStep::Measured(ChunkMeasure {
+                classified: Classified {
+                    kind,
+                    along,
+                    across: 0,
+                    confidence: (along != 0).then_some(confidence),
+                    bounced: false,
+                    ambiguous,
+                    uncalibrated: false,
+                },
+                settled,
+            }),
+            posted_px: px,
+            posted_events: px.div_ceil(WHEEL_EVENT_MAX_PX),
+            stop: false,
+        }
     }
 
     /// A view that moves `k` pt per wheel pixel and ends after `room` pt.
-    fn view(k: f64, room: f64) -> impl FnMut(u32) -> anyhow::Result<ChunkStep> {
+    fn view(k: f64, room: f64) -> impl FnMut(u32) -> anyhow::Result<ChunkRun> {
         let mut position = 0.0f64;
         move |px| {
             let before = position;
             position = (position + f64::from(px) * k).min(room);
-            Ok(moved((position - before).round() as i32, 0.95, false))
+            Ok(measured(px, (position - before).round() as i32, 0.95, false, true))
         }
     }
 
@@ -1180,7 +1253,7 @@ mod tests {
     fn the_loop_calibrates_from_its_first_chunk_and_lands_on_the_distance() {
         let mut sizes = Vec::new();
         let mut inner = view(0.771, 10_000.0);
-        let summary = drive_chunks(600.0, 1.0, |px| {
+        let summary = drive_chunks(600.0, 1.0, 400.0, |px| {
             sizes.push(px);
             inner(px)
         })
@@ -1196,7 +1269,7 @@ mod tests {
     fn a_cached_calibration_sizes_the_first_chunk() {
         let mut sizes = Vec::new();
         let mut inner = view(0.771, 10_000.0);
-        drive_chunks(231.0, 0.771, |px| {
+        drive_chunks(231.0, 0.771, 400.0, |px| {
             sizes.push(px);
             inner(px)
         })
@@ -1204,11 +1277,28 @@ mod tests {
         assert_eq!(sizes, vec![300]);
     }
 
+    /// Audit N3: in a 300 pt scroll area a 400 pt chunk leaves first and last
+    /// frame too little in common; chunks stay at 0.6 of the band.
+    #[test]
+    fn chunks_stay_within_six_tenths_of_the_registration_band() {
+        assert_eq!(max_chunk_pt(300.0), 180.0);
+        assert_eq!(max_chunk_pt(900.0), CHUNK_MAX_PT);
+        let mut sizes = Vec::new();
+        let mut inner = view(1.0, 10_000.0);
+        drive_chunks(1000.0, 1.0, max_chunk_pt(300.0), |px| {
+            sizes.push(px);
+            inner(px)
+        })
+        .unwrap();
+        assert!(sizes.iter().all(|px| *px <= 180), "{sizes:?}");
+        assert_eq!(sizes.iter().sum::<u32>(), 1000);
+    }
+
     #[test]
     fn the_loop_stops_at_the_end_and_reports_the_stall() {
         let mut calls = 0;
         let mut inner = view(1.0, 450.0);
-        let summary = drive_chunks(1200.0, 1.0, |px| {
+        let summary = drive_chunks(1200.0, 1.0, 400.0, |px| {
             calls += 1;
             inner(px)
         })
@@ -1222,9 +1312,14 @@ mod tests {
     #[test]
     fn an_unmeasured_chunk_stops_the_loop_and_counts_what_was_sent() {
         let mut sizes = Vec::new();
-        let summary = drive_chunks(900.0, 1.0, |px| {
+        let summary = drive_chunks(900.0, 1.0, 400.0, |px| {
             sizes.push(px);
-            Ok(ChunkStep::Unmeasured)
+            Ok(ChunkRun {
+                step: ChunkStep::Unmeasured,
+                posted_px: px,
+                posted_events: 14,
+                stop: false,
+            })
         })
         .unwrap();
         assert_eq!(sizes, vec![400]);
@@ -1233,52 +1328,123 @@ mod tests {
     }
 
     #[test]
-    fn a_halt_before_a_chunk_posts_nothing_more() {
+    fn a_stop_counts_only_what_was_posted() {
         let mut inner = view(1.0, 10_000.0);
         let mut calls = 0;
-        let summary = drive_chunks(1000.0, 1.0, |px| {
+        let summary = drive_chunks(1000.0, 1.0, 400.0, |px| {
             calls += 1;
             if calls == 2 {
-                return Ok(ChunkStep::Halted);
+                let mut partial = measured(90, 90, 0.95, false, true);
+                partial.stop = true;
+                return Ok(partial);
             }
             inner(px)
         })
         .unwrap();
         assert!(summary.halted);
-        assert_eq!((summary.chunks, summary.total_px), (1, 400));
+        assert_eq!((summary.chunks, summary.total_px), (2, 490));
     }
 
     /// Reviewer M3: a first chunk cut short by the end (240 of 400 pt, inside
     /// the 0.5..2 ratio filter) must not become the window's calibration.
     #[test]
     fn a_chunk_that_may_have_hit_the_end_never_calibrates() {
-        let summary = drive_chunks(1200.0, 1.0, view(1.0, 240.0)).unwrap();
+        let summary = drive_chunks(1200.0, 1.0, 400.0, view(1.0, 240.0)).unwrap();
+        assert_eq!(summary.calibration, None);
+    }
+
+    /// Audit M3 residual: chunk A moves 240 of 400 pt; chunk B trickles 10 pt
+    /// without settling (a loading feed). B's own ratio is far from A's, so
+    /// A's calibration is never committed.
+    #[test]
+    fn a_successor_that_barely_moves_does_not_confirm_the_calibration() {
+        let mut calls = 0;
+        let summary = drive_chunks(1200.0, 1.0, 400.0, |px| {
+            calls += 1;
+            Ok(match calls {
+                1 => measured(px, 240, 0.95, false, true),
+                _ => measured(px, 10, 0.95, false, false),
+            })
+        })
+        .unwrap();
         assert_eq!(summary.calibration, None);
     }
 
     /// Skeptic R5: an aliased distance must neither calibrate nor trigger a
-    /// correction chunk that would overshoot by the alias.
+    /// correction chunk that would overshoot by the alias; the reply says the
+    /// loop stopped short.
     #[test]
     fn an_ambiguous_chunk_ends_the_loop_without_calibrating() {
         let mut calls = 0;
-        let summary = drive_chunks(300.0, 1.0, |_| {
+        let summary = drive_chunks(300.0, 1.0, 400.0, |px| {
             calls += 1;
-            Ok(moved(287, 0.98, true))
+            Ok(measured(px, 287, 0.98, true, true))
         })
         .unwrap();
         assert_eq!(calls, 1);
+        assert_eq!(summary.calibration, None);
+        assert!(summary.short.is_some());
+    }
+
+    /// Audit N3: a tracked-only distance stands but never stops the loop.
+    #[test]
+    fn a_tracked_only_chunk_continues_without_calibrating() {
+        let summary = drive_chunks(600.0, 1.0, 400.0, |px| {
+            let mut run = measured(px, px as i32, 0.95, false, true);
+            if let ChunkStep::Measured(m) = &mut run.step {
+                m.classified.uncalibrated = true;
+            }
+            Ok(run)
+        })
+        .unwrap();
+        assert_eq!((summary.chunks, summary.total_px), (2, 600));
         assert_eq!(summary.calibration, None);
     }
 
     #[test]
     fn chunks_that_disagree_leave_the_calibration_unset() {
         let mut ratios = [0.5, 1.0, 1.0].into_iter();
-        let summary = drive_chunks(1000.0, 1.0, |px| {
+        let summary = drive_chunks(1000.0, 1.0, 400.0, |px| {
             let k = ratios.next().unwrap_or(1.0);
-            Ok(moved((f64::from(px) * k).round() as i32, 0.95, false))
+            Ok(measured(px, (f64::from(px) * k).round() as i32, 0.95, false, true))
         })
         .unwrap();
         assert_eq!(summary.calibration, None);
+    }
+
+    /// Audit R6: content already moving before the first event never sizes a
+    /// chunk, and its shift must agree with the tracked travel.
+    #[test]
+    fn content_moving_before_the_gesture_is_never_calibrated_from() {
+        let with_progress = |offset: i64, progress: usize| {
+            let mut f = frame(offset);
+            for y in H - 30..H - 27 {
+                for x in 0..W {
+                    f.pixels[y * W + x] = if x < progress { 20 } else { 230 };
+                }
+            }
+            f
+        };
+        let mut tracker = MotionTracker::new(with_progress(0, 10), region());
+        tracker.push(with_progress(0, 30));
+        tracker.begin_gesture(true);
+        for (i, offset) in [30, 60, 90].into_iter().enumerate() {
+            tracker.push(with_progress(offset, 50 + i * 20));
+        }
+        let verdict = classify(&tracker.call_motion(), ScrollDirection::Down);
+        assert_eq!((verdict.kind, verdict.along), (OutcomeKind::Moved, 90));
+        assert!(verdict.uncalibrated);
+    }
+
+    /// Audit: a clean move followed by one navigation frame (unrelated
+    /// content) read as a confirmed move of the tracked distance.
+    #[test]
+    fn a_move_then_a_navigation_is_changed_in_place() {
+        let navigated = frame_with(0, |x, y| texture(x + 1000, y + 5000));
+        let mut frames: Vec<GrayFrame> = [0, 100, 200, 280].map(frame).to_vec();
+        frames.push(navigated);
+        let verdict = classify(&track(frames).call_motion(), ScrollDirection::Down);
+        assert_eq!(verdict.kind, OutcomeKind::ChangedInPlace);
     }
 
     /// Measured on TextEdit: a numbered document whose lines differ only in
@@ -1312,14 +1478,13 @@ mod tests {
     fn a_chunk_that_hits_the_end_does_not_recalibrate() {
         let mut sizes = Vec::new();
         let mut inner = view(1.0, 500.0);
-        let summary = drive_chunks(5000.0, 1.0, |px| {
+        let summary = drive_chunks(5000.0, 1.0, 400.0, |px| {
             sizes.push(px);
             inner(px)
         })
         .unwrap();
         assert_eq!(sizes, vec![400, 400, 400], "chunks keep the full chunk's size");
         assert!(summary.stalled);
-        assert_eq!(summary.calibration, Some(1.0), "the full chunk's k stands");
+        assert_eq!(summary.calibration, None, "the end-cut chunk disagrees, so nothing commits");
     }
-
 }

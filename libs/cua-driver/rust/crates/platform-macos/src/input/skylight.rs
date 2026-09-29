@@ -593,6 +593,14 @@ pub fn front_process_matches(target_pid: libc::pid_t, target_wid: u32) -> Option
     Some(front_psn == target_psn)
 }
 
+/// WindowServer's current front process serial number, or `None` when the SPI
+/// is unavailable. One call, cheap enough to sample between input events.
+pub fn front_process_serial() -> Option<[u8; 8]> {
+    let get_front = get_front_process_fn()?;
+    let mut psn = [0u8; 8];
+    (unsafe { get_front(psn.as_mut_ptr() as *mut c_void) } == 0).then_some(psn)
+}
+
 /// The application WindowServer currently fronts, identified through its
 /// topmost on-screen ordinary window.
 ///

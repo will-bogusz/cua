@@ -97,26 +97,36 @@ struct State {
     frames_since_event: usize,
     /// Successful frames captured since the sampler started.
     frames: usize,
+    /// When the latest successful frame arrived.
+    last_success: Instant,
     /// A capture failed after the first frame: the stream has a gap, so
     /// nothing after it can be judged settled.
     failure: Option<String>,
 }
 
 /// The settle decision over a snapshot of [`State`]; `None` = keep waiting.
+/// Quiet is only evidence while frames keep arriving: settling needs a
+/// successful frame after the last event and a latest frame within the quiet
+/// window, and a stream that stalled without failing is unmeasured.
 fn settle_decision(state: &State, now: Instant) -> Option<Settle> {
     if let Some(failure) = &state.failure {
         return Some(Settle::Unmeasured(format!("capture failed during the scroll: {failure}")));
     }
     let since_event = now.duration_since(state.last_event);
-    if state.frames_since_event > 0
+    let fresh = state.frames_since_event > 0
+        && state.last_success > state.last_event
+        && now.duration_since(state.last_success) <= SETTLE_QUIET;
+    if fresh
         && since_event >= SETTLE_AFTER_EVENT
         && now.duration_since(state.last_change) >= SETTLE_QUIET
     {
         return Some(Settle::Settled);
     }
     if since_event >= SETTLE_CAP {
-        return Some(if state.frames_since_event > 0 {
+        return Some(if fresh {
             Settle::Capped
+        } else if state.frames_since_event > 0 {
+            Settle::Unmeasured("frame capture stalled during the scroll".into())
         } else {
             Settle::Unmeasured("no frame arrived after the scroll".into())
         });
@@ -149,6 +159,10 @@ pub struct FrameSampler {
 /// Frames sampled before the first event, to tell whether the content was
 /// already moving.
 const BASELINE_FRAMES: usize = 2;
+/// The view must hold still this long before the first event...
+const BASELINE_QUIET: Duration = Duration::from_millis(150);
+/// ...or the gesture starts anyway after this, with a moving baseline.
+const BASELINE_QUIET_CAP: Duration = Duration::from_millis(700);
 
 impl FrameSampler {
     /// Capture the first frame now, sample [`BASELINE_FRAMES`] more before
@@ -166,6 +180,7 @@ impl FrameSampler {
                 last_change: now,
                 frames_since_event: 0,
                 frames: 0,
+                last_success: now,
                 failure: None,
             }),
             tracker: Mutex::new(MotionTracker::new(first, region)),
@@ -180,11 +195,24 @@ impl FrameSampler {
             shared,
             worker: Some(worker),
         };
-        let deadline = Instant::now() + FRAME_INTERVAL * 8;
+        // Wait for the view to hold still before the first event: a window
+        // just raised redraws as it becomes key, and those frames would read
+        // as motion. Content still changing at the deadline is recorded as a
+        // moving baseline.
+        let deadline = Instant::now() + BASELINE_QUIET_CAP;
         let mut state = sampler.shared.lock();
-        while state.frames < BASELINE_FRAMES && state.failure.is_none() {
-            if Instant::now() >= deadline {
-                break;
+        let moving = loop {
+            if state.failure.is_some() {
+                break true;
+            }
+            let now = Instant::now();
+            if state.frames >= BASELINE_FRAMES
+                && now.duration_since(state.last_change) >= BASELINE_QUIET
+            {
+                break false;
+            }
+            if now >= deadline {
+                break true;
             }
             state = sampler
                 .shared
@@ -192,13 +220,13 @@ impl FrameSampler {
                 .wait_timeout(state, Duration::from_millis(20))
                 .map(|(guard, _)| guard)
                 .unwrap_or_else(|poison| poison.into_inner().0);
-        }
+        };
         let failure = state.failure.clone();
         drop(state);
         if let Some(failure) = failure {
             return Err(failure);
         }
-        sampler.shared.tracker().begin_gesture();
+        sampler.shared.tracker().begin_gesture(moving);
         Ok(sampler)
     }
 
@@ -275,6 +303,7 @@ fn sample(window_id: u32, shared: &Shared) {
                 }
                 state.frames_since_event += 1;
                 state.frames += 1;
+                state.last_success = Instant::now();
             }
             Err(error) => {
                 shared.lock().failure.get_or_insert(error);
@@ -299,6 +328,7 @@ mod tests {
             last_change: now - Duration::from_millis(change_ms),
             frames_since_event,
             frames: 5,
+            last_success: now - Duration::from_millis(5),
             failure: None,
         };
         (state, now)
@@ -323,5 +353,17 @@ mod tests {
         assert_eq!(settle_decision(&busy, now), None);
         let (capped, now) = state(9, 1300, 10);
         assert_eq!(settle_decision(&capped, now), Some(Settle::Capped));
+    }
+
+    /// Audit R4: one frame after the event, then a capture that stalls
+    /// without failing, read as a quiet, settled view.
+    #[test]
+    fn a_stalled_capture_is_unmeasured_not_settled() {
+        let (mut stalled, now) = state(1, 1300, 1250);
+        stalled.last_success = now - Duration::from_millis(1250);
+        assert!(matches!(settle_decision(&stalled, now), Some(Settle::Unmeasured(_))));
+        let (mut early, now) = state(1, 600, 590);
+        early.last_success = now - Duration::from_millis(590);
+        assert_eq!(settle_decision(&early, now), None, "stale quiet is not settled");
     }
 }

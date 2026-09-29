@@ -117,15 +117,6 @@ pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
     )
 }
 
-/// On-screen windows on every layer (desktop elements excluded), front to
-/// back in one enumeration, with their alphas.
-pub(crate) fn visible_windows_any_layer() -> WindowEnumeration {
-    enumerate_windows(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        LayerFilter::AnyLayer,
-    )
-}
-
 /// What `list_windows` reports: every layer-0 window plus each display's
 /// desktop surface, from one enumeration so every `z_index` in the listing
 /// comes from the same WindowServer order (on screen, the desktop sits behind
