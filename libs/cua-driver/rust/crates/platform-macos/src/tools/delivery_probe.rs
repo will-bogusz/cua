@@ -805,9 +805,12 @@ pub fn apply_evidence(
         Evidence::Unchanged if outcome.remote_screen => {
             msg.push_str(&format!(
                 "\n❔ Delivery unverified: this window shows another device's screen, and \
-                 {} on this Mac's side read the same for {waited_ms} ms after the dispatch. \
-                 Accessibility cannot see the other device: check the result on a screenshot.",
-                compared.join(", ")
+                 {} on this Mac's side read the same for {waited_ms} ms after the dispatch{}. \
+                 Accessibility cannot see the other device: check the result on a screenshot \
+                 before repeating.{}",
+                compared.join(", "),
+                unread_clause(&unread),
+                noop.advice
             ));
         }
         Evidence::Unchanged => {
@@ -819,14 +822,7 @@ pub fn apply_evidence(
             // what was compared, and what a change would have gone unseen in.
             // A per-tool list of what that tool usually watches named signals
             // this call never read.
-            let unread = if unread.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; {} could not be read, so a change there would not have been seen",
-                    unread.join(", ")
-                )
-            };
+            let unread = unread_clause(&unread);
             msg.push_str(&format!(
                 "\n⚠️ Unverified: the target was watched for {waited_ms} ms after the \
                  dispatch and {} read the same{unread}. Re-observe before repeating — the \
@@ -842,6 +838,19 @@ pub fn apply_evidence(
                  unreadable or changes on its own). Confirm the postcondition yourself.",
             );
         }
+    }
+}
+
+/// The part of a "nothing changed" claim it cannot cover: signals that were
+/// not read.
+fn unread_clause(unread: &[&str]) -> String {
+    if unread.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} could not be read, so a change there would not have been seen",
+            unread.join(", ")
+        )
     }
 }
 
@@ -1062,7 +1071,7 @@ mod tests {
         assert_eq!(structured["effect"], "unverifiable");
         assert!(structured["escalation"].is_null(), "{structured}");
         assert!(msg.contains("another device's screen"), "{msg}");
-        assert!(!msg.contains("pixel centre"), "{msg}");
+        assert!(!msg.contains("suspected"), "{msg}");
     }
 
     fn noop(polled: bool) -> NoopReport<'static> {
