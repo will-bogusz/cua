@@ -1098,6 +1098,9 @@ pub const STROKE_EVENT_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Share of the stroke's expected travel the view must have followed before
 /// a settle back short of it is a snap rather than the end's spring.
 const SNAP_FOLLOW: f64 = 0.8;
+/// Longest distance one stroke posts: the most a stepped call can (its
+/// chunk limit times the largest chunk).
+pub const STROKE_MAX_PT: f64 = MAX_CHUNKS as f64 * CHUNK_MAX_PT;
 
 /// The wheel events of one stroke: `requested_pt` at `k` points per pixel,
 /// in deltas of at most [`STROKE_EVENT_PX`].
@@ -1113,28 +1116,33 @@ pub fn stroke_events(requested_pt: f64, k: f64, direction: ScrollDirection) -> V
 pub struct StrokeVerdict {
     pub classified: Classified,
     /// The view followed the stroke to this many points the way asked, then
-    /// settled at `classified.along` (a page or card snap). `None` when the
-    /// view came to rest where it travelled.
+    /// settled back at `classified.along`: a snap point, or the view's end
+    /// springing back. `None` when the view came to rest where it travelled.
     pub snapped_from: Option<i32>,
     /// The frames tracked the move frame to frame but the first and last
     /// frames do not register as one shift: part of the view (a large title
     /// collapsing or expanding, a bar fading in) changed shape while the
-    /// content moved. `along` is the tracked travel.
+    /// content moved. `along` is the tracked travel, which is short by any
+    /// frame pair that failed to register.
     pub reshaped_header: bool,
 }
 
 /// Classify one stroke's `motion` for a scroll in `direction` that was
-/// expected to move `expected_pt` (the pixels posted times the calibration).
+/// expected to move `expected_pt` (the pixels posted times the calibration;
+/// `calibrated` when that calibration was measured, not the 1.0 default).
 ///
-/// On top of [`classify`]: a view that followed the stroke to at least
-/// [`SNAP_FOLLOW`] of its distance and settled somewhere else snapped, so it
-/// is `Moved` to where it landed rather than `AtEnd`; and a tracked series
-/// that moved one way on the requested axis is `Moved` by its travel even
-/// when the first-vs-last comparison fails on a reshaped header.
+/// On top of [`classify`]: with a measured calibration, a view that followed
+/// the stroke to at least [`SNAP_FOLLOW`] of its distance and settled back
+/// is `Moved` to where it landed rather than `AtEnd` (with the default, a
+/// short expectation cannot tell a snap from the end's spring, so it stays
+/// `AtEnd`); and a tracked series that moved the way asked, with at most one
+/// frame pair that did not register, is `Moved` by its travel even when the
+/// first-vs-last comparison fails on a reshaped header.
 pub fn classify_stroke(
     motion: &Motion,
     direction: ScrollDirection,
     expected_pt: f64,
+    calibrated: bool,
 ) -> StrokeVerdict {
     let mut classified = classify(motion, direction);
     let (axis, sign) = axis_of(direction);
@@ -1145,7 +1153,7 @@ pub fn classify_stroke(
         position += sign * step.shift;
         peak = peak.max(position);
     }
-    let followed = f64::from(peak) >= SNAP_FOLLOW * expected_pt && peak > 0;
+    let followed = calibrated && f64::from(peak) >= SNAP_FOLLOW * expected_pt && peak > 0;
     let mut verdict = StrokeVerdict {
         classified,
         snapped_from: None,
@@ -1163,6 +1171,8 @@ pub fn classify_stroke(
                 Axis::Horizontal => motion.travel_h,
             };
             let one_way = travel != 0
+                && sign * travel > 0
+                && motion.non_rigid_pairs <= 1
                 && motion.series.iter().all(|s| s.axis == axis)
                 && steps.iter().all(|s| {
                     s.shift.signum() == travel.signum()
@@ -2321,8 +2331,15 @@ mod tests {
     }
 
     fn stroke_down(offsets: &[i64], expected_pt: f64) -> (Classified, StrokeVerdict) {
+        stroke_down_with(offsets, expected_pt, true)
+    }
+
+    fn stroke_down_with(offsets: &[i64], expected_pt: f64, calibrated: bool) -> (Classified, StrokeVerdict) {
         let motion = track(offsets.iter().map(|o| frame(*o))).call_motion();
-        (classify(&motion, ScrollDirection::Down), classify_stroke(&motion, ScrollDirection::Down, expected_pt))
+        (
+            classify(&motion, ScrollDirection::Down),
+            classify_stroke(&motion, ScrollDirection::Down, expected_pt, calibrated),
+        )
     }
 
     /// A card rail that snaps: the stroke carried the view 210 pt, then it
@@ -2362,6 +2379,46 @@ mod tests {
             (OutcomeKind::AtEnd, 40)
         );
         assert_eq!(stroke.snapped_from, None);
+    }
+
+    /// StrokeReview D2: the end reached after 85% of a measured expectation
+    /// springs back exactly like a snap. It stays a move to the landing (the
+    /// reply leaves it unconfirmed and names both readings); with the 1.0
+    /// default nothing says the expectation was right, so it stays at the end.
+    #[test]
+    fn a_spring_at_the_end_after_most_of_the_stroke_is_a_snap_only_with_a_measured_calibration() {
+        let offsets = [0, 48, 96, 144, 192, 240, 288, 336, 350, 365, 370, 360, 350, 350];
+        let (stepped, measured) = stroke_down_with(&offsets, 400.0, true);
+        assert_eq!((stepped.kind, stepped.along), (OutcomeKind::AtEnd, 350));
+        assert_eq!((measured.classified.kind, measured.classified.along), (OutcomeKind::Moved, 350));
+        assert_eq!(measured.snapped_from, Some(370));
+        let (_, default) = stroke_down_with(&offsets, 400.0, false);
+        assert_eq!((default.classified.kind, default.classified.along), (OutcomeKind::AtEnd, 350));
+        assert_eq!(default.snapped_from, None);
+
+        // Already at the end: the rubber band reaches 85 of an expected 100.
+        let band = [0, 30, 60, 85, 60, 30, 0, 0];
+        let (_, default) = stroke_down_with(&band, 100.0, false);
+        assert_eq!((default.classified.kind, default.classified.along), (OutcomeKind::AtEnd, 0));
+        let (_, measured) = stroke_down_with(&band, 100.0, true);
+        assert_eq!((measured.classified.kind, measured.classified.along), (OutcomeKind::Moved, 0));
+        assert_eq!(measured.snapped_from, Some(85));
+    }
+
+    /// StrokeReview D1: one blank capture mid-stroke loses 320 pt of a 560 pt
+    /// move from the tracked travel; it must not read as a reshaped header.
+    #[test]
+    fn a_stroke_with_a_lost_frame_is_not_a_move_by_its_tracked_travel() {
+        let blank = || GrayFrame::new(W, H, vec![0u8; W * H]);
+        let frames = [0i64, 40, 80, 120, 160]
+            .map(frame)
+            .into_iter()
+            .chain([blank()])
+            .chain([480i64, 520, 560, 560].map(frame));
+        let motion = track(frames).call_motion();
+        let stroke = classify_stroke(&motion, ScrollDirection::Down, 560.0, true);
+        assert_eq!(stroke.classified.kind, OutcomeKind::ChangedInPlace, "{motion:?}");
+        assert!(!stroke.reshaped_header);
     }
 
     #[test]
@@ -2404,12 +2461,14 @@ mod tests {
         let offsets = [0i64, 20, 40, 60, 80, 100, 120, 140, 160];
         let motion = track(offsets.map(titled)).call_motion();
         let stepped = classify(&motion, ScrollDirection::Down);
-        let stroke = classify_stroke(&motion, ScrollDirection::Down, 160.0);
+        let stroke = classify_stroke(&motion, ScrollDirection::Down, 160.0, true);
         assert_eq!(stepped.kind, OutcomeKind::ChangedInPlace, "{motion:?}");
         assert_eq!(stroke.classified.kind, OutcomeKind::Moved, "{motion:?}");
         assert!(stroke.reshaped_header);
         assert!(stroke.classified.along > 0 && stroke.classified.along <= 160, "{stroke:?}");
         assert_eq!(stroke_calibration(&stroke.classified, 160, 1.0), None);
+        let up = classify_stroke(&motion, ScrollDirection::Up, 160.0, true);
+        assert!(!up.reshaped_header, "travel against the request is never a reshaped-header move");
     }
 
     #[test]
