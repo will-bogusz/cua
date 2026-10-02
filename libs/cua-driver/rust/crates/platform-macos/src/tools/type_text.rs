@@ -145,26 +145,27 @@ fn def() -> &'static ToolDef {
     })
 }
 
-fn screen_sharing_delivery_error(
-    is_screen_sharing: bool,
+fn key_forwarding_delivery_error(
+    key_forwarding: bool,
     foreground: bool,
     window_id: Option<u32>,
 ) -> Option<ToolResult> {
-    if !is_screen_sharing || (foreground && window_id.is_some()) {
+    if !key_forwarding || (foreground && window_id.is_some()) {
         return None;
     }
     Some(
         ToolResult::error(
-            "Screen Sharing text input requires delivery_mode:\"foreground\" and window_id \
-             so Cua Driver can deliver physical HID key transitions safely.",
+            "Text input to a key-forwarding app (Screen Sharing, iPhone Mirroring) requires \
+             delivery_mode:\"foreground\" and window_id so Cua Driver can deliver physical \
+             HID key transitions safely.",
         )
         .with_structured(serde_json::json!({
             "code": "SCREEN_SHARING_REQUIRES_FOREGROUND_HID",
             "effect": "refused",
             "escalation": {
                 "recommended": "foreground",
-                "reason": "Screen Sharing forwards physical keycodes; background PID-routed \
-                           Unicode events can corrupt guest text.",
+                "reason": "The app forwards physical keycodes to another device; background \
+                           PID-routed Unicode events arrive there as the A key.",
                 "requires": ["window_id"]
             }
         })),
@@ -249,8 +250,8 @@ impl Tool for TypeTextTool {
         };
         let delay_ms = args.u64_or("delay_ms", 30);
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
-        if let Some(error) = screen_sharing_delivery_error(
-            crate::input::keyboard::is_screen_sharing_pid(pid),
+        if let Some(error) = key_forwarding_delivery_error(
+            crate::input::keyboard::is_key_forwarding_pid(pid),
             delivery_mode.is_foreground(),
             window_id,
         ) {
@@ -2012,9 +2013,9 @@ fn type_text_blocking(
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
-        let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
+        let key_forwarding_target = crate::input::keyboard::is_key_forwarding_pid(pid);
         if let Some(refusal) = synthesis_preflight(
-            if screen_sharing_target {
+            if key_forwarding_target {
                 TextDeliveryRoute::PhysicalSynthesis
             } else {
                 TextDeliveryRoute::UnicodeSynthesis
@@ -2063,13 +2064,13 @@ fn type_text_blocking(
             )
         };
         let (rung, fronted) = match window_id {
-            Some(wid) if screen_sharing_target => {
-                // Screen Sharing forwards physical HID transitions to the
-                // guest. PID-routed Unicode events all carry keycode 0 (the A
-                // key), so a guest sees "aaaa"; modifier flags alone likewise
-                // turn Cmd+V into plain "v". The explicit foreground rung may
-                // safely use the global HID queue while the exact target is
-                // guarded and restored.
+            Some(wid) if key_forwarding_target => {
+                // Screen Sharing and iPhone Mirroring forward physical HID
+                // transitions to the other device. PID-routed Unicode events
+                // all carry keycode 0 (the A key), so the device sees "aaaa";
+                // modifier flags alone likewise turn Cmd+V into plain "v". The
+                // explicit foreground rung may safely use the global HID queue
+                // while the exact target is guarded and restored.
                 crate::input::skylight::with_foreground_hid_activation(
                     pid as libc::pid_t,
                     wid,
@@ -3220,10 +3221,10 @@ mod tests {
     }
 
     #[test]
-    fn screen_sharing_text_fails_closed_without_foreground_window() {
+    fn key_forwarding_text_fails_closed_without_foreground_window() {
         for (foreground, window_id) in [(false, None), (false, Some(7)), (true, None)] {
-            let result = screen_sharing_delivery_error(true, foreground, window_id)
-                .expect("unsafe Screen Sharing route must be refused");
+            let result = key_forwarding_delivery_error(true, foreground, window_id)
+                .expect("unsafe key-forwarding route must be refused");
             assert_eq!(result.is_error, Some(true));
             let structured = result.structured_content.unwrap();
             assert_eq!(structured["code"], "SCREEN_SHARING_REQUIRES_FOREGROUND_HID");
@@ -3231,8 +3232,8 @@ mod tests {
             assert_eq!(structured["escalation"]["recommended"], "foreground");
             assert_eq!(structured["escalation"]["requires"][0], "window_id");
         }
-        assert!(screen_sharing_delivery_error(true, true, Some(7)).is_none());
-        assert!(screen_sharing_delivery_error(false, false, None).is_none());
+        assert!(key_forwarding_delivery_error(true, true, Some(7)).is_none());
+        assert!(key_forwarding_delivery_error(false, false, None).is_none());
     }
 
     /// Font Book's search field held "PapyrusPapyrus" with its whole value
