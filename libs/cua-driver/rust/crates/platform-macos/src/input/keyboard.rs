@@ -12,23 +12,30 @@ use core_graphics::{
 use cua_driver_core::operation;
 use foreign_types::ForeignType;
 
-const SCREEN_SHARING_BUNDLE_ID: &str = "com.apple.ScreenSharing";
+/// Apple's remote-input clients that relay physical virtual-key transitions to
+/// another device instead of consuming text: Screen Sharing (a remote Mac) and
+/// iPhone Mirroring (the paired iPhone).
+const KEY_FORWARDING_BUNDLE_IDS: &[&str] =
+    &["com.apple.ScreenSharing", "com.apple.ScreenContinuity"];
 const SHIFT_KEY_CODE: u16 = 56;
 
-fn is_screen_sharing_bundle_id(bundle_id: &str) -> bool {
-    bundle_id == SCREEN_SHARING_BUNDLE_ID
+fn is_key_forwarding_bundle_id(bundle_id: &str) -> bool {
+    KEY_FORWARDING_BUNDLE_IDS.contains(&bundle_id)
 }
 
-/// Whether `pid` is Apple's Screen Sharing client.
+/// Whether `pid` is a key-forwarding client (Screen Sharing or iPhone
+/// Mirroring).
 ///
-/// Screen Sharing is an input forwarder rather than a text consumer: it relays
-/// physical virtual-key transitions to the guest and ignores the Unicode string
-/// attached to a synthetic keycode-0 event. Keep that special case explicit so
-/// ordinary PID-routed text input retains its layout-independent Unicode path.
-pub fn is_screen_sharing_pid(pid: i32) -> bool {
+/// Such a client is an input forwarder rather than a text consumer: it relays
+/// physical virtual-key transitions to the other device and ignores the Unicode
+/// string attached to a synthetic keycode-0 event, so ordinary text synthesis
+/// arrives as "aaaa" (keycode 0 is the A key). Keep that special case explicit
+/// so ordinary PID-routed text input retains its layout-independent Unicode
+/// path.
+pub fn is_key_forwarding_pid(pid: i32) -> bool {
     crate::apps::bundle_id_for_pid(pid)
         .as_deref()
-        .is_some_and(is_screen_sharing_bundle_id)
+        .is_some_and(is_key_forwarding_bundle_id)
 }
 
 /// Press and release a single key, delivered to `pid` without stealing focus.
@@ -449,7 +456,7 @@ enum PhysicalEventType {
 fn physical_text_events(ch: char) -> anyhow::Result<Vec<PhysicalTextEvent>> {
     let (key_code, shift) = physical_key_for_char(ch).ok_or_else(|| {
         anyhow::anyhow!(
-            "Screen Sharing physical text delivery does not support character U+{:04X}",
+            "physical key delivery types US-layout ASCII only; character U+{:04X} has no key",
             ch as u32
         )
     })?;
@@ -490,7 +497,7 @@ fn physical_text_events(ch: char) -> anyhow::Result<Vec<PhysicalTextEvent>> {
 }
 
 /// Map printable ASCII to the physical key that produces it on the standard US
-/// layout. The Screen Sharing path intentionally sends only the returned
+/// layout. The key-forwarding path intentionally sends only the returned
 /// keycode and the required bare Shift transitions.
 fn physical_key_for_char(ch: char) -> Option<(u16, bool)> {
     let lower = ch.to_ascii_lowercase();
@@ -835,10 +842,12 @@ mod tests {
     }
 
     #[test]
-    fn screen_sharing_detection_is_exact_and_case_sensitive() {
-        assert!(is_screen_sharing_bundle_id("com.apple.ScreenSharing"));
-        assert!(!is_screen_sharing_bundle_id("com.apple.screensharing"));
-        assert!(!is_screen_sharing_bundle_id("com.microsoft.rdc.macos"));
+    fn key_forwarding_detection_is_exact_and_case_sensitive() {
+        assert!(is_key_forwarding_bundle_id("com.apple.ScreenSharing"));
+        assert!(is_key_forwarding_bundle_id("com.apple.ScreenContinuity"));
+        assert!(!is_key_forwarding_bundle_id("com.apple.screensharing"));
+        assert!(!is_key_forwarding_bundle_id("com.apple.screencontinuity"));
+        assert!(!is_key_forwarding_bundle_id("com.microsoft.rdc.macos"));
     }
 }
 
