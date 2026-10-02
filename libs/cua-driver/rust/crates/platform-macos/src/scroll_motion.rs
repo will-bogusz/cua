@@ -1020,7 +1020,8 @@ pub const NOTCH_AMOUNT_MAX: u64 = 50;
 pub const POINTS_AMOUNT_MAX: u64 = 5000;
 /// Points one `line` asks for.
 pub const LINE_PT: f64 = 40.0;
-/// Share of the visible height one `page` asks for.
+/// Share of the visible extent along the scroll (height, or width sideways)
+/// one `page` asks for.
 pub const PAGE_FRACTION: f64 = 0.8;
 /// Largest distance one measured chunk asks for.
 pub const CHUNK_MAX_PT: f64 = 400.0;
@@ -1032,12 +1033,12 @@ const MAX_CHUNKS: u32 = 24;
 const K_RANGE: (f64, f64) = (0.05, 20.0);
 
 /// The distance a foreground scroll asks for, in window points.
-pub fn requested_distance(unit: ScrollUnit, amount: u32, visible_height: f64) -> f64 {
+pub fn requested_distance(unit: ScrollUnit, amount: u32, visible_extent: f64) -> f64 {
     let amount = f64::from(amount);
     match unit {
         ScrollUnit::Points => amount,
         ScrollUnit::Line => amount * LINE_PT,
-        ScrollUnit::Page => amount * PAGE_FRACTION * visible_height.max(1.0),
+        ScrollUnit::Page => amount * PAGE_FRACTION * visible_extent.max(1.0),
     }
 }
 

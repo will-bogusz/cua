@@ -94,7 +94,8 @@ fn def() -> &'static ToolDef {
             element scrolls through its scroll bar instead.\n\n\
             Distance: by='points' → `amount` points; by='line' → `amount` × 40 pt (background: \
             `amount` line ticks); by='page' → `amount` × 0.8 × the visible height of the scroll \
-            area under the point (background: 5 lines per page).\n\n\
+            area under the point, or its width when scrolling sideways (background: 5 lines per \
+            page).\n\n\
             Every wheel reply is measured from window frames — moved N pt, at end, no motion, \
             changed in place, or unmeasured — and the structured `scroll` object carries the \
             numbers. The AppKit text-area scroll-bar route (background, element target) is \
@@ -541,13 +542,8 @@ impl ScrollTool {
         let snapshot = WindowChangeDetector::snapshot_without_suppression(apps::frontmost_pid());
         let run = cua_driver_core::operation::spawn_blocking(move || {
             let (area, visible_height) = request.area();
-            let requested = scroll_motion::requested_distance(
-                request.unit,
-                request.amount,
-                visible_height,
-            )
-            .round()
-            .max(1.0);
+            // The extent along the scroll: a page and the chunk cap are both
+            // sized from it, so a sideways page is 0.8 of the visible width.
             let band = match request.direction {
                 ScrollDirection::Up | ScrollDirection::Down => visible_height,
                 ScrollDirection::Left | ScrollDirection::Right => area
@@ -555,6 +551,9 @@ impl ScrollTool {
                     .or_else(|| crate::windows::window_bounds_by_id(wid).map(|b| b.width))
                     .unwrap_or(0.0),
             };
+            let requested = scroll_motion::requested_distance(request.unit, request.amount, band)
+                .round()
+                .max(1.0);
             let max_chunk = scroll_motion::max_chunk_pt(band);
             raised_pointer::with_raised_pointer(
                 pid,

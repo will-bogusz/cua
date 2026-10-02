@@ -283,6 +283,9 @@ pub struct ProbeOutcome {
     /// Which signals this verdict is a verdict over. A "nothing reacted"
     /// report names them, so the claim cannot be read wider than it is.
     pub watched: Watched,
+    /// The window shows another device's screen (a key-forwarding client), so
+    /// "nothing changed" covers only this Mac's side of it.
+    pub remote_screen: bool,
 }
 
 /// Pre-dispatch capture. Hold it across the action, then `compare()`.
@@ -425,6 +428,7 @@ impl DeliveryProbe {
             probe: self.elapsed + waited,
             waited,
             watched: Watched::over(&self.before, after, self.quiescent),
+            remote_screen: self.remote_screen,
         }
     }
 
@@ -436,6 +440,7 @@ impl DeliveryProbe {
             probe: self.elapsed,
             waited: Duration::ZERO,
             watched: Watched::offered(&self.before, self.quiescent),
+            remote_screen: self.remote_screen,
         }
     }
 }
@@ -795,6 +800,16 @@ pub fn apply_evidence(
                 reaction_phrase(outcome.evidence)
             ));
         }
+        // A remote screen's own content never reaches this Mac's tree, so an
+        // unchanged Mac side is no evidence of a no-op and earns no escalation.
+        Evidence::Unchanged if outcome.remote_screen => {
+            msg.push_str(&format!(
+                "\n❔ Delivery unverified: this window shows another device's screen, and \
+                 {} on this Mac's side read the same for {waited_ms} ms after the dispatch. \
+                 Accessibility cannot see the other device: check the result on a screenshot.",
+                compared.join(", ")
+            ));
+        }
         Evidence::Unchanged => {
             structured["effect"] = serde_json::json!("suspected_noop");
             if let Some(escalation) = noop.escalation {
@@ -998,6 +1013,7 @@ mod tests {
                     tree: true,
                     accessory: true,
                 },
+                remote_screen: false,
             },
             NoopReport {
                 polled: false,
@@ -1024,7 +1040,29 @@ mod tests {
             probe: Duration::from_millis(waited_ms + 70),
             waited: Duration::from_millis(waited_ms),
             watched,
+            remote_screen: false,
         }
+    }
+
+    #[test]
+    fn an_unchanged_remote_screen_is_unverified_not_a_suspected_noop() {
+        let mut msg = "✅ Performed AXPress on [5] AXButton \"Home Screen\".".to_owned();
+        let mut structured = serde_json::json!({ "path": "ax", "effect": "unverifiable" });
+        let watched = Watched { element: true, focus: true, tree: true, accessory: true };
+        apply_evidence(
+            &mut msg,
+            &mut structured,
+            ProbeOutcome { remote_screen: true, ..unchanged(watched, 500) },
+            NoopReport {
+                polled: false,
+                escalation: Some(serde_json::json!({ "target": "foreground" })),
+                advice: " To deliver a real click, click its pixel centre.",
+            },
+        );
+        assert_eq!(structured["effect"], "unverifiable");
+        assert!(structured["escalation"].is_null(), "{structured}");
+        assert!(msg.contains("another device's screen"), "{msg}");
+        assert!(!msg.contains("pixel centre"), "{msg}");
     }
 
     fn noop(polled: bool) -> NoopReport<'static> {

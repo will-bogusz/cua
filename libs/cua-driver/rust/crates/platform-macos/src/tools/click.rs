@@ -2546,6 +2546,7 @@ mod tests {
                 tree: true,
                 accessory: true,
             },
+            remote_screen: false,
         }
     }
 
