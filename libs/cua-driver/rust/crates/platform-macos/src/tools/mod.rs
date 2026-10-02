@@ -1161,6 +1161,9 @@ pub struct ToolState {
     /// Points-per-wheel-pixel learned per `(pid, window_id)` by measured
     /// foreground scrolls.
     pub(crate) scroll_calibrations: Arc<crate::scroll_motion::ScrollCalibrations>,
+    /// The same, learned by `motion:"stroke"` scrolls only, so a stroke never
+    /// resizes a stepped scroll's chunks.
+    pub(crate) stroke_calibrations: Arc<crate::scroll_motion::ScrollCalibrations>,
     /// Global, disk-persisted config — the base layer and the only one the
     /// anonymous session / CLI writes.
     pub config: Arc<std::sync::RwLock<DriverConfig>>,
@@ -1202,6 +1205,7 @@ impl ToolState {
             cursor_registry: Arc::new(CursorRegistry::new()),
             zoom_registry: Arc::new(ZoomRegistry::new()),
             scroll_calibrations: Arc::default(),
+            stroke_calibrations: Arc::default(),
             resize_registry: Arc::new(ResizeRegistry::new()),
             // Load persisted config from ~/.cua-driver/config.json so that
             // `cua-driver config set` changes carry over into MCP sessions.

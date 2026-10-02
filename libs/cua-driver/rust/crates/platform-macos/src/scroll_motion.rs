@@ -730,6 +730,15 @@ impl MotionTracker {
         self.motion_between(&self.first, self.travel_v, self.travel_h, &self.series, self.non_rigid)
     }
 
+    /// Points tracked frame to frame since the gesture began, along the axis
+    /// and signed for `direction` (positive is the way asked).
+    pub fn tracked_along(&self, direction: ScrollDirection) -> i32 {
+        match axis_of(direction) {
+            (Axis::Vertical, sign) => sign * self.travel_v,
+            (Axis::Horizontal, sign) => sign * self.travel_h,
+        }
+    }
+
     fn motion_between(
         &self,
         start: &GrayFrame,
@@ -1027,6 +1036,8 @@ pub const PAGE_FRACTION: f64 = 0.8;
 pub const CHUNK_MAX_PT: f64 = 400.0;
 /// Largest delta of one pixel wheel event (one event saturates near 99 pt).
 pub const WHEEL_EVENT_MAX_PX: u32 = 30;
+/// Spacing of the wheel events inside one measured chunk.
+pub const WHEEL_EVENT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 /// Chunks one call may run before it stops regardless.
 const MAX_CHUNKS: u32 = 24;
 /// Accepted range of the points-per-pixel calibration.
@@ -1056,9 +1067,13 @@ pub fn background_ticks(unit: ScrollUnit, amount: u32) -> (u32, u32) {
 /// wheel2)` with down → wheel1 negative, up → positive, right → wheel2
 /// negative, left → positive.
 pub fn wheel_events(px: u32, direction: ScrollDirection) -> Vec<(i32, i32)> {
-    let full = px / WHEEL_EVENT_MAX_PX;
-    let rest = px % WHEEL_EVENT_MAX_PX;
-    let sizes = std::iter::repeat_n(WHEEL_EVENT_MAX_PX, full as usize)
+    wheel_events_of(px, WHEEL_EVENT_MAX_PX, direction)
+}
+
+fn wheel_events_of(px: u32, max_px: u32, direction: ScrollDirection) -> Vec<(i32, i32)> {
+    let full = px / max_px;
+    let rest = px % max_px;
+    let sizes = std::iter::repeat_n(max_px, full as usize)
         .chain((rest > 0).then_some(rest))
         .map(|size| size as i32);
     sizes
@@ -1069,6 +1084,127 @@ pub fn wheel_events(px: u32, direction: ScrollDirection) -> Vec<(i32, i32)> {
             ScrollDirection::Left => (0, size),
         })
         .collect()
+}
+
+/// Delta of one stroke wheel event.
+pub const STROKE_EVENT_PX: u32 = 48;
+/// Spacing of stroke wheel events. Measured on iPhone Mirroring (macOS 26.1,
+/// 2026-10-02): at 40 ms the mirrored view follows the stream about 180 pt
+/// behind and at most 119 pt between sampled frames; at 33 ms and faster the
+/// lag grows through the stream and the view lands in one late jump of up to
+/// 495 pt; a pause of 60 ms or more ends the phone's gesture, and the next
+/// event loses about 40 pt to touch slop.
+pub const STROKE_EVENT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+/// Share of the stroke's expected travel the view must have followed before
+/// a settle back short of it is a snap rather than the end's spring.
+const SNAP_FOLLOW: f64 = 0.8;
+
+/// The wheel events of one stroke: `requested_pt` at `k` points per pixel,
+/// in deltas of at most [`STROKE_EVENT_PX`].
+pub fn stroke_events(requested_pt: f64, k: f64, direction: ScrollDirection) -> Vec<(i32, i32)> {
+    let k = k.clamp(K_RANGE.0, K_RANGE.1);
+    let px = (requested_pt / k).round().max(1.0) as u32;
+    wheel_events_of(px, STROKE_EVENT_PX, direction)
+}
+
+/// A stroke's verdict: the classified landing, and where the view went
+/// before it settled when that differs from the landing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrokeVerdict {
+    pub classified: Classified,
+    /// The view followed the stroke to this many points the way asked, then
+    /// settled at `classified.along` (a page or card snap). `None` when the
+    /// view came to rest where it travelled.
+    pub snapped_from: Option<i32>,
+    /// The frames tracked the move frame to frame but the first and last
+    /// frames do not register as one shift: part of the view (a large title
+    /// collapsing or expanding, a bar fading in) changed shape while the
+    /// content moved. `along` is the tracked travel.
+    pub reshaped_header: bool,
+}
+
+/// Classify one stroke's `motion` for a scroll in `direction` that was
+/// expected to move `expected_pt` (the pixels posted times the calibration).
+///
+/// On top of [`classify`]: a view that followed the stroke to at least
+/// [`SNAP_FOLLOW`] of its distance and settled somewhere else snapped, so it
+/// is `Moved` to where it landed rather than `AtEnd`; and a tracked series
+/// that moved one way on the requested axis is `Moved` by its travel even
+/// when the first-vs-last comparison fails on a reshaped header.
+pub fn classify_stroke(
+    motion: &Motion,
+    direction: ScrollDirection,
+    expected_pt: f64,
+) -> StrokeVerdict {
+    let mut classified = classify(motion, direction);
+    let (axis, sign) = axis_of(direction);
+    let steps: Vec<&Step> = motion.series.iter().filter(|s| s.axis == axis).collect();
+    let mut position = 0i32;
+    let mut peak = 0i32;
+    for step in &steps {
+        position += sign * step.shift;
+        peak = peak.max(position);
+    }
+    let followed = f64::from(peak) >= SNAP_FOLLOW * expected_pt && peak > 0;
+    let mut verdict = StrokeVerdict {
+        classified,
+        snapped_from: None,
+        reshaped_header: false,
+    };
+    match classified.kind {
+        OutcomeKind::AtEnd if followed && classified.along > -REVERSAL_MIN_PT => {
+            classified.kind = OutcomeKind::Moved;
+            classified.uncalibrated = true;
+            verdict.snapped_from = (peak != classified.along).then_some(peak);
+        }
+        OutcomeKind::ChangedInPlace if !motion.reshaped && !motion.baseline_moving => {
+            let travel = match axis {
+                Axis::Vertical => motion.travel_v,
+                Axis::Horizontal => motion.travel_h,
+            };
+            let one_way = travel != 0
+                && motion.series.iter().all(|s| s.axis == axis)
+                && steps.iter().all(|s| {
+                    s.shift.signum() == travel.signum()
+                        && s.confidence >= CLEAN_STEP_CONFIDENCE
+                        && !s.ambiguous
+                });
+            if one_way {
+                classified.kind = OutcomeKind::Moved;
+                classified.along = sign * travel;
+                classified.confidence = Some(
+                    steps.iter().map(|s| s.confidence).sum::<f64>() / steps.len() as f64,
+                );
+                classified.uncalibrated = true;
+                verdict.reshaped_header = true;
+            }
+        }
+        _ => {}
+    }
+    verdict.classified = classified;
+    verdict
+}
+
+/// The points-per-pixel a finished stroke measured: its landing over the
+/// pixels posted, from a clean, confident move that came to rest where it
+/// travelled and landed within a factor of two of what `k` predicted.
+/// `None` for anything else (a snap, an end, a reshaped header, an alias).
+pub fn stroke_calibration(classified: &Classified, posted_px: u32, k: f64) -> Option<f64> {
+    if posted_px == 0
+        || classified.kind != OutcomeKind::Moved
+        || classified.along <= 0
+        || classified.ambiguous
+        || classified.uncalibrated
+        || classified.bounced
+        || !classified
+            .confidence
+            .is_some_and(|confidence| confidence >= CALIBRATION_CONFIDENCE)
+    {
+        return None;
+    }
+    let measured = f64::from(classified.along) / f64::from(posted_px);
+    let ratio = measured / k;
+    ((0.5..=2.0).contains(&ratio)).then(|| measured.clamp(K_RANGE.0, K_RANGE.1))
 }
 
 /// One measured chunk as the loop sees it.
@@ -2184,4 +2320,105 @@ mod tests {
         assert_eq!(summary.calibration, None, "the end-cut chunk disagrees, so nothing commits");
     }
 
+    fn stroke_down(offsets: &[i64], expected_pt: f64) -> (Classified, StrokeVerdict) {
+        let motion = track(offsets.iter().map(|o| frame(*o))).call_motion();
+        (classify(&motion, ScrollDirection::Down), classify_stroke(&motion, ScrollDirection::Down, expected_pt))
+    }
+
+    /// A card rail that snaps: the stroke carried the view 210 pt, then it
+    /// settled back to the card edge at 151. A stepped chunk reads that as
+    /// the end; a stroke reports where the view landed.
+    #[test]
+    fn a_stroke_that_snaps_short_reports_its_landing_not_the_end() {
+        let offsets = [0, 40, 80, 120, 160, 200, 210, 190, 170, 151, 151];
+        let (stepped, stroke) = stroke_down(&offsets, 210.0);
+        assert_eq!((stepped.kind, stepped.along), (OutcomeKind::AtEnd, 151));
+        assert_eq!(
+            (stroke.classified.kind, stroke.classified.along),
+            (OutcomeKind::Moved, 151)
+        );
+        assert_eq!(stroke.snapped_from, Some(210));
+        assert_eq!(stroke_calibration(&stroke.classified, 210, 1.0), None, "a snap never calibrates");
+    }
+
+    #[test]
+    fn a_stroke_that_snaps_back_to_its_start_is_a_move_of_zero_from_its_peak() {
+        let offsets = [0, 40, 80, 120, 160, 200, 150, 100, 50, 0, 0];
+        let (_, stroke) = stroke_down(&offsets, 210.0);
+        assert_eq!(
+            (stroke.classified.kind, stroke.classified.along),
+            (OutcomeKind::Moved, 0)
+        );
+        assert_eq!(stroke.snapped_from, Some(200));
+    }
+
+    /// The end's spring: the view stopped following the stroke long before
+    /// its distance, overshot a little and came back.
+    #[test]
+    fn a_stroke_that_springs_at_the_end_stays_at_end() {
+        let (_, stroke) = stroke_down(&[0, 20, 40, 60, 50, 40, 40], 300.0);
+        assert_eq!(
+            (stroke.classified.kind, stroke.classified.along),
+            (OutcomeKind::AtEnd, 40)
+        );
+        assert_eq!(stroke.snapped_from, None);
+    }
+
+    #[test]
+    fn a_clean_stroke_lands_on_its_distance_and_calibrates() {
+        let offsets: Vec<i64> = (0..=10).map(|i| i * 24).collect();
+        let (_, stroke) = stroke_down(&offsets, 240.0);
+        assert_eq!(
+            (stroke.classified.kind, stroke.classified.along),
+            (OutcomeKind::Moved, 240)
+        );
+        assert_eq!((stroke.snapped_from, stroke.reshaped_header), (None, false));
+        assert_eq!(stroke_calibration(&stroke.classified, 480, 0.5), Some(0.5));
+        assert_eq!(stroke_calibration(&stroke.classified, 480, 2.0), None, "4x off the prediction");
+    }
+
+    /// A large title above the list collapses while the list scrolls: it
+    /// shrinks with the scroll, then swaps for the bar's small title in one
+    /// frame pair, so that pair registers no shift and the first and last
+    /// frames do not register as one.
+    #[test]
+    fn a_stroke_under_a_collapsing_title_is_a_move_by_its_tracked_travel() {
+        const TITLE: usize = 260;
+        let titled = |offset: i64| {
+            let mut f = frame(offset);
+            let large = offset < 80;
+            let height = if large { TITLE - offset as usize } else { 30 };
+            for y in CHROME_TOP..CHROME_TOP + TITLE {
+                for x in 0..W {
+                    f.pixels[y * W + x] = if y >= CHROME_TOP + height {
+                        texture(x, y as i64 + offset)
+                    } else if large {
+                        texture(x + 500, (y - CHROME_TOP) as i64 + offset)
+                    } else {
+                        90
+                    };
+                }
+            }
+            f
+        };
+        let offsets = [0i64, 20, 40, 60, 80, 100, 120, 140, 160];
+        let motion = track(offsets.map(titled)).call_motion();
+        let stepped = classify(&motion, ScrollDirection::Down);
+        let stroke = classify_stroke(&motion, ScrollDirection::Down, 160.0);
+        assert_eq!(stepped.kind, OutcomeKind::ChangedInPlace, "{motion:?}");
+        assert_eq!(stroke.classified.kind, OutcomeKind::Moved, "{motion:?}");
+        assert!(stroke.reshaped_header);
+        assert!(stroke.classified.along > 0 && stroke.classified.along <= 160, "{stroke:?}");
+        assert_eq!(stroke_calibration(&stroke.classified, 160, 1.0), None);
+    }
+
+    #[test]
+    fn a_stroke_posts_the_distance_over_its_calibration_in_capped_events() {
+        let events = stroke_events(500.0, 1.0, ScrollDirection::Down);
+        assert_eq!(events.len(), 11);
+        assert!(events.iter().all(|&(w1, w2)| w2 == 0 && -w1 <= STROKE_EVENT_PX as i32));
+        assert_eq!(events.iter().map(|e| -e.0).sum::<i32>(), 500);
+        let half = stroke_events(500.0, 2.0, ScrollDirection::Left);
+        assert_eq!(half.iter().map(|e| e.1).sum::<i32>(), 250);
+    }
 }

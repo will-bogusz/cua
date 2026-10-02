@@ -273,6 +273,12 @@ impl FrameSampler {
         self.shared.tracker().chunk_motion()
     }
 
+    /// Points tracked so far the way `direction` asks (see
+    /// [`MotionTracker::tracked_along`]).
+    pub fn tracked_along(&self, direction: cua_driver_contract::ScrollDirection) -> i32 {
+        self.shared.tracker().tracked_along(direction)
+    }
+
     /// Stop sampling and return the motion over the whole call.
     pub fn finish(mut self) -> Motion {
         self.stop();

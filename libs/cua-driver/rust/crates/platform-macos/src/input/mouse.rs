@@ -302,17 +302,19 @@ pub fn prime_pointer_at(x: f64, y: f64, interior: (f64, f64)) -> anyhow::Result<
     Ok(())
 }
 
-/// Post PIXEL-unit wheel events at `(x, y)` through the HID tap, 16 ms apart.
-/// `proceed` runs before each event and stops the burst when it answers
-/// `false`; `after_each` runs right after each post; `posted` counts the
-/// events actually posted, also when the burst ends early or fails. `events`
-/// are `(wheel1, wheel2)` deltas: negative wheel1 reveals content below,
-/// negative wheel2 content to the right. Nothing but the location is written
-/// on top of the constructor's fields — no phase, momentum or device fields.
+/// Post PIXEL-unit wheel events at `(x, y)` through the HID tap, `interval`
+/// apart. `proceed` runs before each event and stops the burst when it
+/// answers `false`; `after_each` runs right after each post; `posted` counts
+/// the events actually posted, also when the burst ends early or fails.
+/// `events` are `(wheel1, wheel2)` deltas: negative wheel1 reveals content
+/// below, negative wheel2 content to the right. Nothing but the location is
+/// written on top of the constructor's fields — no phase, momentum or device
+/// fields.
 pub fn pixel_wheel_burst(
     x: f64,
     y: f64,
     events: &[(i32, i32)],
+    interval: std::time::Duration,
     mut proceed: impl FnMut() -> bool,
     mut after_each: impl FnMut(),
     posted: &mut usize,
@@ -323,7 +325,7 @@ pub fn pixel_wheel_burst(
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     for (index, &(wheel1, wheel2)) in events.iter().enumerate() {
         if index > 0 {
-            operation::sleep(std::time::Duration::from_millis(16))?;
+            operation::sleep(interval)?;
         } else {
             operation::check()?;
         }

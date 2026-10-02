@@ -88,7 +88,10 @@ fn def() -> &'static ToolDef {
             puts the pointer and the previously frontmost app back. If the user moves the \
             pointer or brings another app to the front during the scroll, it stops sending at \
             once and restores nothing. Reaches views that scroll only under the real pointer \
-            (pixel-only surfaces, nested web scrollers).\n\
+            (pixel-only surfaces, nested web scrollers). motion:\"stroke\" sends the whole \
+            distance as one continuous wheel stream instead (48 px every 40 ms, sized by the \
+            window's measured points per pixel, stopped early when tracked travel reaches the \
+            distance) and settles once: no correcting chunk, so the reply states the error.\n\
             • delivery_mode:\"background\" (default) — line wheel events posted to the pid at \
             the point: no activation, no pointer move. An AppKit text area addressed by \
             element scrolls through its scroll bar instead.\n\n\
@@ -133,6 +136,12 @@ fn def() -> &'static ToolDef {
                 "y": { "type": "number", "description": "Window-local screenshot Y. See `x`." },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Use desktop with x,y and no pid/window_id for native get_desktop_state screenshot coordinates." },
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema(),
+                "motion": {
+                    "type": "string",
+                    "enum": ["stepped", "stroke"],
+                    "default": "stepped",
+                    "description": "Foreground only. stepped (default): measured chunks, each settled and corrected. stroke: one continuous wheel stream for the whole distance, one settle at the end, no correction."
+                },
                 "detect_window_change": { "type": "boolean", "description": "Default true: after the action the driver polls WindowServer for up to one second so the reply can name a window the action opened. Pass false when you enumerate windows yourself — the poll is then skipped (roughly a second off this call) and the reply carries no opened-window evidence." },
             },
             "additionalProperties": false
@@ -195,6 +204,20 @@ impl Tool for ScrollTool {
         let by = args.str_or("by", "line");
         let Some(unit) = ScrollUnit::parse(&by) else {
             return ToolResult::error(format!("by must be line, page or points (got {by:?})"));
+        };
+        let stroke = match args.opt_str("motion").as_deref() {
+            None | Some("stepped") => false,
+            Some("stroke") if foreground => true,
+            Some("stroke") => {
+                return ToolResult::error(
+                    "motion:\"stroke\" needs delivery_mode:\"foreground\"".to_owned(),
+                )
+            }
+            Some(other) => {
+                return ToolResult::error(format!(
+                    "motion must be stepped or stroke (got {other:?})"
+                ))
+            }
         };
         if unit == ScrollUnit::Points && args.get("amount").is_none() {
             return ToolResult::error(
@@ -480,7 +503,7 @@ impl Tool for ScrollTool {
             amount,
         };
         if foreground {
-            self.foreground(request, &args).await
+            self.foreground(request, stroke, &args).await
         } else {
             background(request, &args).await
         }
@@ -534,9 +557,15 @@ fn toward_interior((x, y): (f64, f64), window: &WindowBounds) -> (f64, f64) {
 }
 
 impl ScrollTool {
-    async fn foreground(&self, request: Request, args: &Value) -> ToolResult {
+    async fn foreground(&self, request: Request, stroke: bool, args: &Value) -> ToolResult {
         let Request { pid, wid, .. } = request;
-        let k0 = self.state.scroll_calibrations.get(pid, wid).unwrap_or(1.0);
+        let stepped_k = self.state.scroll_calibrations.get(pid, wid);
+        let k0 = if stroke {
+            self.state.stroke_calibrations.get(pid, wid).or(stepped_k)
+        } else {
+            stepped_k
+        }
+        .unwrap_or(1.0);
         // The envelope owns activation and restoration; any suppressor would
         // fight it, or undo the user's own switch mid-gesture.
         let snapshot = WindowChangeDetector::snapshot_without_suppression(apps::frontmost_pid());
@@ -560,7 +589,13 @@ impl ScrollTool {
                 wid,
                 request.point.screen.0,
                 request.point.screen.1,
-                |envelope| pointer_scroll(request, area, requested, k0, max_chunk, envelope),
+                |envelope| {
+                    if stroke {
+                        pointer_stroke(request, area, requested, k0, envelope)
+                    } else {
+                        pointer_scroll(request, area, requested, k0, max_chunk, envelope)
+                    }
+                },
             )
             .map(|run| (run, requested))
         })
@@ -583,7 +618,11 @@ impl ScrollTool {
             return not_sent_refusal(&request, &reason);
         }
         if let Some(k) = run.summary.calibration {
-            self.state.scroll_calibrations.record(pid, wid, k);
+            if stroke {
+                self.state.stroke_calibrations.record(pid, wid, k);
+            } else {
+                self.state.scroll_calibrations.record(pid, wid, k);
+            }
         }
         let report = Report {
             delivery: ScrollDelivery::Foreground,
@@ -597,6 +636,7 @@ impl ScrollTool {
             verdict: run.verdict,
             stopped: run.stopped,
             from_accessibility: run.from_accessibility,
+            stroke: run.stroke,
         };
         report.result(&changes)
     }
@@ -611,6 +651,17 @@ struct PointerRun {
     /// The distance comes from the accessibility scroll position because the
     /// window's pixels did not show the move.
     from_accessibility: bool,
+    /// Set for a `motion:"stroke"` scroll.
+    stroke: Option<StrokeShape>,
+}
+
+/// What a stroke's frames showed beyond the landing.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct StrokeShape {
+    /// See [`scroll_motion::StrokeVerdict::snapped_from`].
+    snapped_from: Option<i32>,
+    /// See [`scroll_motion::StrokeVerdict::reshaped_header`].
+    reshaped_header: bool,
 }
 
 /// Inside the raised envelope: prime the pointer, then scroll `requested_pt`
@@ -671,6 +722,7 @@ fn pointer_scroll(
             x,
             y,
             &events,
+            scroll_motion::WHEEL_EVENT_INTERVAL,
             || match envelope.takeover() {
                 Some(reason) => {
                     takeover = Some(reason);
@@ -759,6 +811,115 @@ fn pointer_scroll(
         verdict,
         stopped,
         from_accessibility,
+        stroke: None,
+    })
+}
+
+/// Inside the raised envelope: prime the pointer, then post the whole
+/// `requested_pt` (at `k0` points per pixel) as one stream of wheel events
+/// [`scroll_motion::STROKE_EVENT_INTERVAL`] apart, stopping early once the
+/// travel tracked frame to frame reaches the distance; then settle once and
+/// measure the landing. Ownership is checked before every wheel event.
+fn pointer_stroke(
+    request: Request,
+    area: Option<[f64; 4]>,
+    requested_pt: f64,
+    k0: f64,
+    envelope: &raised_pointer::Envelope,
+) -> anyhow::Result<PointerRun> {
+    let (x, y) = request.point.screen;
+    let mut stopped: Option<String> = None;
+    match envelope.check() {
+        Ok(()) => {
+            crate::input::mouse::prime_pointer_at(x, y, toward_interior((x, y), envelope.bounds()))?
+        }
+        Err(reason) => stopped = Some(reason),
+    }
+    let sampler = FrameSampler::start(request.wid, area, request.point.local);
+    let mut unmeasured = sampler.as_ref().err().cloned();
+    let position = || scroll_position(request.pid, x, y);
+    let start_position = position();
+    let events = scroll_motion::stroke_events(requested_pt, k0, request.direction);
+    let mut posted = 0usize;
+    if stopped.is_none() {
+        let burst = crate::input::mouse::pixel_wheel_burst(
+            x,
+            y,
+            &events,
+            scroll_motion::STROKE_EVENT_INTERVAL,
+            || {
+                if let Some(reason) = envelope.takeover() {
+                    stopped = Some(reason);
+                    return false;
+                }
+                !matches!(&sampler, Ok(s) if f64::from(s.tracked_along(request.direction)) >= requested_pt)
+            },
+            || {
+                if let Ok(sampler) = &sampler {
+                    sampler.mark_event();
+                }
+            },
+            &mut posted,
+        );
+        if let Err(error) = burst {
+            stopped = Some(format!("input stopped: {error}"));
+            unmeasured = Some(format!("input stopped mid-stroke: {error}"));
+        }
+    }
+    let posted_px: u32 = events[..posted]
+        .iter()
+        .map(|(w1, w2)| w1.unsigned_abs() + w2.unsigned_abs())
+        .sum();
+    let expected_pt = f64::from(posted_px) * k0;
+    let mut from_accessibility = false;
+    let mut shape = StrokeShape::default();
+    let mut calibration = None;
+    let verdict = match (sampler, unmeasured) {
+        (Ok(_), None) if posted == 0 => {
+            Verdict::Unmeasured("no wheel event was posted".into())
+        }
+        (Ok(sampler), None) => match sampler.wait_settled() {
+            Settle::Unmeasured(reason) => Verdict::Unmeasured(reason),
+            _ => {
+                let stroke = scroll_motion::classify_stroke(
+                    &sampler.finish(),
+                    request.direction,
+                    expected_pt,
+                );
+                let mut classified = stroke.classified;
+                shape = StrokeShape {
+                    snapped_from: stroke.snapped_from,
+                    reshaped_header: stroke.reshaped_header,
+                };
+                if let Some(moved) = position_moved(request.direction, start_position, position())
+                    .filter(|_| classified.kind == OutcomeKind::NoMotion)
+                {
+                    classified = moved;
+                    from_accessibility = true;
+                }
+                if stopped.is_none() && !from_accessibility {
+                    calibration = scroll_motion::stroke_calibration(&classified, posted_px, k0);
+                }
+                Verdict::Measured(classified)
+            }
+        },
+        (_, reason) => Verdict::Unmeasured(reason.unwrap_or_else(|| "no frame was captured".into())),
+    };
+    Ok(PointerRun {
+        summary: LoopSummary {
+            chunks: u32::from(posted > 0),
+            total_px: posted_px,
+            events: posted as u32,
+            calibration,
+            stalled: false,
+            unmeasured: matches!(verdict, Verdict::Unmeasured(_)),
+            halted: stopped.is_some(),
+            short: None,
+        },
+        verdict,
+        stopped,
+        from_accessibility,
+        stroke: Some(shape),
     })
 }
 
@@ -882,6 +1043,7 @@ async fn background(request: Request, args: &Value) -> ToolResult {
             verdict,
             stopped: None,
             from_accessibility: false,
+            stroke: None,
         }
         .result(&changes),
         Ok(Err(e)) => ToolResult::error(format!("Wheel scroll failed: {e}")),
@@ -1060,6 +1222,8 @@ struct Report {
     /// The distance was read from the accessibility scroll position; the
     /// window's pixels did not show the move, so it is not frame evidence.
     from_accessibility: bool,
+    /// Set for a `motion:"stroke"` scroll.
+    stroke: Option<StrokeShape>,
 }
 
 const NO_MOTION: &str = "no displacement observed — the view may be at its end, or nothing \
@@ -1114,6 +1278,9 @@ impl Report {
 
     fn wheel(&self) -> String {
         match self.delivery {
+            ScrollDelivery::Foreground if self.stroke.is_some() => {
+                format!("foreground pointer stroke, {} px", self.total)
+            }
             ScrollDelivery::Foreground => format!(
                 "foreground pointer wheel, {} chunk{}, {} px",
                 self.chunks,
@@ -1143,13 +1310,32 @@ impl Report {
                 "measured from the accessibility scroll position: the window's pixels did not show the move"
                     .to_owned(),
             ),
-            _ => None,
+            _ => self.shape_reason(),
         };
         match (base, &self.stopped) {
             (Some(base), Some(stop)) => Some(format!("{base}; stopped early: {stop}")),
             (None, Some(stop)) => Some(format!("stopped early: {stop}")),
             (base, None) => base,
         }
+    }
+
+    /// What a stroke's frames showed beyond its landing, for `reason`.
+    fn shape_reason(&self) -> Option<String> {
+        let shape = self.stroke?;
+        let Verdict::Measured(c) = &self.verdict else {
+            return None;
+        };
+        if let Some(peak) = shape.snapped_from {
+            return Some(format!(
+                "the view followed the stroke {peak} pt, then snapped to rest at {} pt",
+                c.along
+            ));
+        }
+        shape.reshaped_header.then(|| {
+            "distance tracked frame to frame: the first and last frames do not register as one \
+             shift (part of the view, such as a large title, changed shape)"
+                .to_owned()
+        })
     }
 
     fn text(&self) -> String {
@@ -1164,7 +1350,31 @@ impl Report {
         } else {
             ""
         };
-        format!("{}{witness}{stop}", self.verdict_text())
+        let shape = match self.stroke {
+            Some(StrokeShape { snapped_from: Some(peak), .. }) if self.snapped_back().is_none() => {
+                format!(" The view followed the stroke {peak} pt, then snapped to rest here.")
+            }
+            Some(StrokeShape { reshaped_header: true, .. }) => {
+                " Tracked frame to frame: part of the view (a large title) changed shape while \
+                 it moved."
+                    .to_owned()
+            }
+            _ => String::new(),
+        };
+        format!("{}{shape}{witness}{stop}", self.verdict_text())
+    }
+
+    /// A stroke the view followed and then settled back from to where it
+    /// started: `(peak, landing)`.
+    fn snapped_back(&self) -> Option<(i32, i32)> {
+        match (&self.verdict, self.stroke?.snapped_from) {
+            (Verdict::Measured(c), Some(peak))
+                if c.kind == OutcomeKind::Moved && c.along <= 0 =>
+            {
+                Some((peak, c.along))
+            }
+            _ => None,
+        }
     }
 
     fn verdict_text(&self) -> String {
@@ -1175,6 +1385,12 @@ impl Report {
             .requested_pt
             .map(|pt| format!("requested {pt}; "))
             .unwrap_or_default();
+        if let Some((peak, landing)) = self.snapped_back() {
+            return format!(
+                "? Snapped back at {at}: the view followed the stroke {peak} pt {direction}, \
+                 then settled where it started ({landing} pt; {requested}{wheel})"
+            );
+        }
         match &self.verdict {
             Verdict::Unmeasured(reason) => {
                 let asked = self
@@ -1433,6 +1649,7 @@ mod tests {
             verdict,
             stopped: None,
             from_accessibility: false,
+            stroke: None,
         }
     }
 
@@ -1449,6 +1666,7 @@ mod tests {
             verdict,
             stopped: None,
             from_accessibility: false,
+            stroke: None,
         }
     }
 
@@ -1481,6 +1699,51 @@ mod tests {
             .text()
             .starts_with("✓ At end: scrolled down 58 of 231 pt at (163, 400), then the view bounced"));
         assert_eq!(report.structured()["effect"], "confirmed");
+    }
+
+    fn stroke(verdict: Verdict, shape: StrokeShape) -> Report {
+        Report {
+            chunks: 1,
+            stroke: Some(shape),
+            ..foreground(verdict)
+        }
+    }
+
+    /// A snapping rail: the reply states where the view landed and keeps the
+    /// grammar a stepped move has, so callers parsing `✓ Scrolled` and
+    /// `moved_pt` read the landing.
+    #[test]
+    fn a_snapped_stroke_reads_as_a_move_to_where_it_landed() {
+        let shape = StrokeShape { snapped_from: Some(210), reshaped_header: false };
+        let report = stroke(classified(OutcomeKind::Moved, 151, false), shape);
+        assert_eq!(
+            report.text(),
+            "✓ Scrolled down 151 pt at (163, 400) (requested 231; foreground pointer stroke, 300 \
+             px) The view followed the stroke 210 pt, then snapped to rest here."
+        );
+        let scroll: cua_driver_contract::ScrollOutcome =
+            serde_json::from_value(report.structured()["scroll"].clone()).expect("contract shape");
+        assert_eq!((scroll.outcome, scroll.moved_pt, scroll.chunks), (ScrollOutcomeKind::Moved, Some(151), 1));
+        assert_eq!(
+            scroll.reason.as_deref(),
+            Some("the view followed the stroke 210 pt, then snapped to rest at 151 pt")
+        );
+    }
+
+    #[test]
+    fn a_stroke_that_snapped_back_is_neither_at_end_nor_confirmed() {
+        let shape = StrokeShape { snapped_from: Some(200), reshaped_header: false };
+        let report = stroke(classified(OutcomeKind::Moved, 0, false), shape);
+        let text = report.text();
+        assert!(
+            text.starts_with("? Snapped back at (163, 400): the view followed the stroke 200 pt down"),
+            "{text}"
+        );
+        assert!(!text.contains("At end"), "{text}");
+        let structured = report.structured();
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["scroll"]["outcome"], "moved");
+        assert_eq!(structured["scroll"]["moved_pt"], 0);
     }
 
     #[test]
