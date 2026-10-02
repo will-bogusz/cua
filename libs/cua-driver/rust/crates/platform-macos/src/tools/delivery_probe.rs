@@ -81,6 +81,13 @@ const SETTLE_BUDGET: Duration = Duration::from_secs(2);
 /// chord nothing reacted to pays a quarter of the full budget instead of all
 /// of it. Lowering it further is a `SETTLE_POLL` question, not this one: the
 /// loop returns on the first sample that differs.
+///
+/// A key-forwarding client's window (Screen Sharing, iPhone Mirroring) shows
+/// another device's screen: what an action does there never reaches this
+/// Mac's accessibility tree, so a readable element there is no better than
+/// none and pays this budget too. Measured on iPhone Mirroring: every key
+/// press and toolbar AX press waited out the full 2 s and still reported
+/// nothing.
 const BLIND_SETTLE_BUDGET: Duration = Duration::from_millis(500);
 /// Gap between post-dispatch samples. Each sample already costs one or more
 /// native AX reads, so this only keeps a cheap sample set from spinning.
@@ -296,6 +303,8 @@ pub struct DeliveryProbe {
     /// The window has no accessibility content, so its subtree is never
     /// sampled (see [`window_has_no_ax_content`]).
     tree_skipped: bool,
+    /// The target is a key-forwarding client (see [`BLIND_SETTLE_BUDGET`]).
+    remote_screen: bool,
     elapsed: Duration,
 }
 
@@ -336,6 +345,7 @@ impl DeliveryProbe {
             },
             quiescent,
             tree_skipped,
+            remote_screen: crate::input::keyboard::is_key_forwarding_pid(pid),
             elapsed: start.elapsed(),
         }
     }
@@ -371,7 +381,7 @@ impl DeliveryProbe {
     /// application pays only its own latency; only a target that never
     /// reacts pays the whole budget.
     pub fn compare(self) -> ProbeOutcome {
-        let budget = settle_budget(&self.before);
+        let budget = settle_budget(&self.before, self.remote_screen);
         self.compare_within(budget)
     }
 
@@ -542,8 +552,8 @@ fn answer_within(
     }
 }
 
-fn settle_budget(before: &Signals) -> Duration {
-    if before.element.state().is_some() {
+fn settle_budget(before: &Signals, remote_screen: bool) -> Duration {
+    if before.element.state().is_some() && !remote_screen {
         SETTLE_BUDGET
     } else {
         BLIND_SETTLE_BUDGET
@@ -867,6 +877,7 @@ mod tests {
             before: Signals::default(),
             quiescent: false,
             tree_skipped: false,
+            remote_screen: false,
             elapsed: Duration::ZERO,
         }
     }
@@ -888,22 +899,30 @@ mod tests {
     #[test]
     fn a_readable_element_state_is_what_buys_the_full_settle_budget() {
         assert_eq!(
-            settle_budget(&signals(state("AXButton|New Item||"), None, None)),
+            settle_budget(&signals(state("AXButton|New Item||"), None, None), false),
             SETTLE_BUDGET
         );
         assert_eq!(
-            settle_budget(&signals(state("AXButton|New Item||"), Some("f"), Some(3))),
+            settle_budget(&signals(state("AXButton|New Item||"), Some("f"), Some(3)), false),
             SETTLE_BUDGET
         );
         assert_eq!(
-            settle_budget(&signals(ElementRead::Unreadable, Some("f"), Some(3))),
+            settle_budget(&signals(ElementRead::Unreadable, Some("f"), Some(3)), false),
             BLIND_SETTLE_BUDGET
         );
         assert_eq!(
-            settle_budget(&signals(ElementRead::Gone, Some("f"), Some(3))),
+            settle_budget(&signals(ElementRead::Gone, Some("f"), Some(3)), false),
             BLIND_SETTLE_BUDGET
         );
-        assert_eq!(settle_budget(&Signals::default()), BLIND_SETTLE_BUDGET);
+        assert_eq!(settle_budget(&Signals::default(), false), BLIND_SETTLE_BUDGET);
+    }
+
+    #[test]
+    fn a_key_forwarding_window_never_buys_the_full_settle_budget() {
+        assert_eq!(
+            settle_budget(&signals(state("AXButton|Home Screen||"), Some("f"), Some(3)), true),
+            BLIND_SETTLE_BUDGET
+        );
     }
 
     #[test]
