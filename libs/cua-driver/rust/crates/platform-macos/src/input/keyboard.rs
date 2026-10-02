@@ -340,10 +340,7 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
         .collect::<anyhow::Result<Vec<_>>>()?;
     for events in event_groups {
         operation::check()?;
-        let native_events = events
-            .iter()
-            .map(|event| create_bare_keyboard_event(event.key_code, event.key_down))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let native_events = physical_native_events(&events)?;
         for cg_event in native_events {
             cg_event.post(CGEventTapLocation::HID);
             std::thread::sleep(std::time::Duration::from_millis(8));
@@ -353,6 +350,26 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
         }
     }
     Ok(())
+}
+
+/// The CGEvents for one character's physical transitions. Each carries Shift
+/// explicitly, as the chord path does: a default-source key event created
+/// before the Shift-down is posted has no flags, and a forwarder that reads
+/// modifier state from the events (iPhone Mirroring) must see Shift on the
+/// shifted key, not only on the Shift transition.
+fn physical_native_events(events: &[PhysicalTextEvent]) -> anyhow::Result<Vec<CGEvent>> {
+    events
+        .iter()
+        .map(|event| {
+            let native = create_bare_keyboard_event(event.key_code, event.key_down)?;
+            native.set_flags(if event.shift {
+                CGEventFlags::CGEventFlagShift
+            } else {
+                CGEventFlags::CGEventFlagNull
+            });
+            Ok(native)
+        })
+        .collect()
 }
 
 /// Send a physical key chord as the virtual-key transition sequence Apple
@@ -727,6 +744,20 @@ mod tests {
         assert_eq!(physical_key_for_char('!'), Some((18, true)));
         assert_eq!(physical_key_for_char('/'), Some((44, false)));
         assert_eq!(physical_key_for_char('?'), Some((44, true)));
+    }
+
+    #[test]
+    fn a_shifted_character_carries_shift_on_its_key_events_until_shift_is_released() {
+        let shift = |c| {
+            physical_native_events(&physical_text_events(c).unwrap())
+                .unwrap()
+                .iter()
+                .map(|event| event.get_flags().contains(CGEventFlags::CGEventFlagShift))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shift('T'), vec![true, true, true, false]);
+        assert_eq!(shift('!'), vec![true, true, true, false]);
+        assert_eq!(shift('t'), vec![false, false]);
     }
 
     #[test]

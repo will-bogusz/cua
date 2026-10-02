@@ -2010,9 +2010,13 @@ fn ax_click_record(
     };
     // The probe's silence outranks the dispatch's own verdict: a press the
     // element never advertised and a press nothing reacted to are the same
-    // suspected no-op, escalated to the rung that can still deliver.
-    let silent = probe
-        .filter(|report| matches!(report.outcome.evidence, delivery_probe::Evidence::Unchanged));
+    // suspected no-op, escalated to the rung that can still deliver. On a
+    // window showing another device's screen the probe sees only this Mac's
+    // side, so its silence is no evidence either way.
+    let silent = probe.filter(|report| {
+        matches!(report.outcome.evidence, delivery_probe::Evidence::Unchanged)
+            && !report.outcome.remote_screen
+    });
     let (effect, escalation) = if outcome.selection_verified {
         (ActionEffect::Confirmed, None)
     } else if let Some(report) = silent {
@@ -2927,6 +2931,21 @@ mod tests {
             public(&silent)["escalation"],
             serde_json::json!({"target": "foreground", "reason": "suspected_noop"})
         );
+
+        let remote = ax_click_record(
+            &AxClickOutcome::default(),
+            false,
+            Some(report(
+                delivery_probe::ProbeOutcome {
+                    remote_screen: true,
+                    ..outcome(delivery_probe::Evidence::Unchanged, 500)
+                },
+                NextRung::PixelForeground,
+                false,
+            )),
+        );
+        assert_eq!(remote.effect, ActionEffect::Unverifiable, "{remote:?}");
+        assert!(remote.escalation.is_none(), "{remote:?}");
     }
 
     /// A reply the framework produced rather than an application answering an
